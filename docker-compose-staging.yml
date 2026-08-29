@@ -1,0 +1,144 @@
+# Loopd staging stack: web (ASGI), Postgres, Redis, Celery worker, Celery beat.
+#
+# Redis does double duty - it is the Channels layer that carries realtime
+# chat between workers, and the Celery broker. They use different database
+# numbers so the two cannot tread on each other.
+#
+#   docker compose -f docker-compose-staging.yml up --build
+#
+# Copy .env.staging.example to .env.staging first; every service reads it.
+#
+# Two different mechanisms, easily confused:
+#   env_file:  passes variables INTO the containers  (.env.staging)
+#   ${VAR}     substituted INTO this file, and read only from the shell or
+#              a plain `.env` beside it - never from env_file
+# So the host-port overrides below go in `.env` or on the command line:
+#
+#   WEB_PORT=8010 docker compose -f docker-compose-staging.yml up -d
+
+name: loopd-staging
+
+# Shared by the three services that run Django code. Deliberately no
+# `build:` here - only `web` builds the image, and the workers reuse the tag
+# it produces. Three services declaring the same build target and the same
+# tag makes buildx race itself ("image already exists").
+x-django: &django
+  image: loopd-api:staging
+  env_file:
+    - .env.staging
+  volumes:
+    # Source is bind-mounted so a staging box can be updated with a restart
+    # rather than a rebuild. Drop this line to run purely from the image.
+    - .:/app
+  networks:
+    - loopd-net
+  restart: unless-stopped
+
+services:
+  web:
+    <<: *django
+    # The only service that builds. `docker compose up --build` tags
+    # loopd-api:staging here, and celery/celery_beat pick it up.
+    build:
+      context: .
+      dockerfile: ./docker_context/staging/Dockerfile
+    container_name: loopd_web
+    # Migrate and collect static before serving, so a fresh box comes up
+    # ready. With more than one replica, run migrations as a separate step
+    # instead - concurrent migrate calls race each other.
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             daphne -b 0.0.0.0 -p 8000 loopd.asgi:application"
+    ports:
+      # Host port is configurable: 8000 is a popular port and colliding with
+      # another project's runserver produces a confusing half-working stack
+      # (Docker binds IPv6, the other process holds IPv4).
+      - "${WEB_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    container_name: loopd_db
+    volumes:
+      - postgres_volume:/var/lib/postgresql/data
+    env_file:
+      - .env.staging
+    ports:
+      # Handy for connecting a GUI to staging. Remove it if the host is
+      # reachable from anywhere untrusted.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      # web and celery wait on this, so they never start against a database
+      # that is still initialising.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-loopd} -d $${POSTGRES_DB:-loopd}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - loopd-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: loopd_redis
+    # appendonly keeps queued Celery tasks across a restart. /data is where
+    # redis actually writes - mounting anywhere else persists nothing.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_volume:/data
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - loopd-net
+    restart: unless-stopped
+
+  celery:
+    <<: *django
+    container_name: loopd_celery
+    command: celery -A loopd worker --loglevel=info
+    # The tag only ever exists locally, so never try to pull it.
+    pull_policy: never
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Also guarantees the image has been built.
+      web:
+        condition: service_started
+
+  celery_beat:
+    <<: *django
+    container_name: loopd_celery_beat
+    # DatabaseScheduler keeps schedules in Postgres and editable from the
+    # Django admin, so changing one does not need a deploy.
+    command: >
+      celery -A loopd beat --loglevel=info
+      --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    pull_policy: never
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Beat only writes schedule rows; it relies on web having migrated.
+      web:
+        condition: service_started
+
+networks:
+  loopd-net:
+    driver: bridge
+
+volumes:
+  postgres_volume:
+  redis_volume:

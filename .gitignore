@@ -1,0 +1,132 @@
+# ---------------------------------------------------------------------------
+# Loopd'n — repository ignore rules
+#
+# This file lives in backend/, so every rule below is scoped to the Django
+# project and matches relative to this directory. Rules are left unanchored
+# (no leading slash) so they also apply in nested app packages.
+# ---------------------------------------------------------------------------
+
+# --- Secrets -------------------------------------------------------------
+# .env holds SECRET_KEY, JWT_SIGNING_KEY, MEDIA_URL_SIGNING_KEY and the
+# database URL. .env.example is the documented template and IS committed.
+.env
+.env.*
+!.env.example
+# Per-environment templates are committed; the real .env.<name> is not.
+!.env.*.example
+*.pem
+*.key
+!**/migrations/*.py
+
+# --- User-uploaded media -------------------------------------------------
+# backend/var/media/ is the local-disk attachment store. Never commit it:
+# it is other people's photos, files and message attachments.
+var/
+media/
+!apps/media/
+staticfiles/
+
+# --- Python --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtualenvs / dependency tooling ------------------------------------
+# uv.lock IS committed - CI runs `uv sync --frozen` against it.
+.venv/
+venv/
+env/
+ENV/
+.python-version.local
+
+# --- Test, lint and type-check caches ------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.tox/
+.nox/
+.hypothesis/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+junit.xml
+report.xml
+
+# --- Django --------------------------------------------------------------
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# --- Celery --------------------------------------------------------------
+celerybeat-schedule
+celerybeat-schedule.*
+celerybeat.pid
+*.pid
+
+# --- Docker --------------------------------------------------------------
+# docker-compose-local.yml IS committed - it is the shared dev stack.
+# Only personal, machine-specific overrides are ignored.
+docker-compose.override.yml
+docker-compose.override.yaml
+.docker/
+
+# --- Node / frontend -----------------------------------------------------
+# Lockfiles (package-lock.json, pnpm-lock.yaml) ARE committed.
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/cache/
+.yarn/install-state.gz
+*.tsbuildinfo
+.vite/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# --- Editors and OS ------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+!.vscode/settings.json.example
+*.swp
+*.swo
+*~
+.claude/
+
+# --- Scratch -------------------------------------------------------------
+scratch/
+tmp/
+*.bak
+*.orig
+*.rej
+
+venv
+db.sqlite3

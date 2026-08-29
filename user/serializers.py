@@ -1,0 +1,358 @@
+"""Serializers for accounts and profiles.
+
+Read shapes (`UserSerializer`, `ProfileSerializer`) are deliberately separate
+from write shapes (`RegisterSerializer`, `LoginSerializer`): the fields a
+client sends when signing up have almost nothing in common with the fields it
+gets back, and merging them is how write-only fields leak.
+"""
+from django.conf import settings
+from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
+from django.db import transaction
+from rest_framework import exceptions, serializers
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from otp.models import OtpError
+from otp.services import start_email_verification, verify_email
+from user.models import Profile
+
+
+class ProfileSerializer(serializers.ModelSerializer):
+    """A profile as the owner sees it, and as it is written back.
+
+    `avatar` is write-only and `avatar_url` read-only: the client uploads a
+    file but wants a URL back, and returning the raw relative path would make
+    every consumer build the URL itself.
+    """
+
+    avatar = serializers.ImageField(write_only=True, required=False, allow_null=True)
+    avatar_url = serializers.SerializerMethodField()
+    display_label = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = Profile
+        fields = [
+            'display_name',
+            'display_label',
+            'avatar',
+            'avatar_url',
+            'phone_number',
+            'phone_no_verified',
+            'bio',
+            'date_of_birth',
+            'is_online',
+            'last_seen_at',
+            'updated_at',
+        ]
+        # Presence is owned by the websocket layer, not by whoever PATCHes.
+        # phone_no_verified belongs to the verification flow; a client that
+        # could PATCH it could mark its own unverified number verified.
+        read_only_fields = [
+            'phone_no_verified',
+            'is_online',
+            'last_seen_at',
+            'updated_at',
+        ]
+
+    def get_avatar_url(self, obj):
+        if not obj.avatar:
+            return None
+        request = self.context.get('request')
+        # Absolute when there is a request to build it from, so mobile
+        # clients do not have to know the host.
+        return request.build_absolute_uri(obj.avatar.url) if request else obj.avatar.url
+
+    def validate_avatar(self, value):
+        # ImageField already proved it decodes as an image; this is about
+        # not letting a 40MB photo through.
+        if value and value.size > settings.MAX_AVATAR_UPLOAD_BYTES:
+            limit_mb = settings.MAX_AVATAR_UPLOAD_BYTES // (1024 * 1024)
+            raise serializers.ValidationError(f'Keep the image under {limit_mb}MB.')
+        return value
+
+    def validate_phone_number(self, value):
+        if not value:
+            return None
+        taken = Profile.objects.filter(phone_number=value)
+        if self.instance:
+            taken = taken.exclude(pk=self.instance.pk)
+        if taken.exists():
+            raise serializers.ValidationError('That phone number is already in use.')
+        return value
+
+
+class PublicProfileSerializer(ProfileSerializer):
+    """What one user is allowed to see about another.
+
+    Phone number and date of birth are contact details, not public facts, so
+    looking someone up by id must not hand them over.
+    """
+
+    class Meta(ProfileSerializer.Meta):
+        fields = ['display_label', 'avatar_url', 'bio', 'is_online', 'last_seen_at']
+        read_only_fields = fields
+
+
+class UserSerializer(serializers.ModelSerializer):
+    """The signed-in user, and the target of PATCH /api/users/me/."""
+
+    profile = ProfileSerializer(read_only=True)
+
+    class Meta:
+        model = User
+        fields = [
+            'id',
+            'username',
+            'email',
+            'first_name',
+            'last_name',
+            'date_joined',
+            'profile',
+        ]
+        # Username changes break @mentions and message attribution, so they
+        # are not part of this endpoint.
+        read_only_fields = ['id', 'username', 'date_joined']
+
+    def validate_email(self, value):
+        return _validate_unique_email(value, exclude_user=self.instance)
+
+
+class PublicUserSerializer(serializers.ModelSerializer):
+    """Another user, as seen from a conversation."""
+
+    profile = PublicProfileSerializer(read_only=True)
+
+    class Meta:
+        model = User
+        fields = ['id', 'username', 'profile']
+        read_only_fields = fields
+
+
+class RegisterSerializer(serializers.ModelSerializer):
+    """Sign-up: creates the User and fills in the Profile the signal made."""
+
+    password = serializers.CharField(
+        write_only=True,
+        style={'input_type': 'password'},
+        # Runs AUTH_PASSWORD_VALIDATORS: length, commonness, all-numeric.
+        validators=[validate_password],
+    )
+    confirm_password = serializers.CharField(
+        write_only=True,
+        style={'input_type': 'password'},
+    )
+    email = serializers.EmailField(required=True)
+
+    # Profile fields accepted at sign-up so a new account is immediately
+    # usable in a conversation list.
+    display_name = serializers.CharField(max_length=80, required=False, allow_blank=True)
+    phone_number = serializers.CharField(max_length=16, required=False, allow_blank=True)
+
+    class Meta:
+        model = User
+        fields = [
+            'username',
+            'email',
+            'password',
+            'confirm_password',
+            'first_name',
+            'last_name',
+            'display_name',
+            'phone_number',
+        ]
+
+    def validate_username(self, value):
+        value = value.strip()
+        # Django's unique constraint is case-sensitive, which would let
+        # "Yul" and "yul" both exist and confuse everyone in a chat.
+        if User.objects.filter(username__iexact=value).exists():
+            raise serializers.ValidationError('That username is taken.')
+        return value
+
+    def validate_email(self, value):
+        return _validate_unique_email(value)
+
+    def validate_phone_number(self, value):
+        if not value:
+            return ''
+        from user.models import phone_number_validator
+
+        phone_number_validator(value)
+        if Profile.objects.filter(phone_number=value).exists():
+            raise serializers.ValidationError('That phone number is already in use.')
+        return value
+
+    def validate(self, attrs):
+        if attrs['password'] != attrs.pop('confirm_password'):
+            # Attached to the field so the client can highlight it.
+            raise serializers.ValidationError(
+                {'confirm_password': 'The two passwords do not match.'}
+            )
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        profile_data = {
+            'display_name': validated_data.pop('display_name', '') or '',
+            'phone_number': validated_data.pop('phone_number', '') or None,
+        }
+        password = validated_data.pop('password')
+
+        # create_user hashes the password; User(**data) would store it raw.
+        #
+        # is_active is what email verification actually controls: an inactive
+        # account exists but cannot sign in, because ModelBackend refuses it.
+        # With verification off, accounts are usable the moment they exist.
+        user = User.objects.create_user(
+            password=password,
+            is_active=not settings.REQUIRE_EMAIL_VERIFICATION,
+            **validated_data,
+        )
+
+        # The post_save signal already made the Profile; fill it in.
+        profile = user.profile
+        profile.display_name = profile_data['display_name']
+        profile.phone_number = profile_data['phone_number']
+        profile.save(update_fields=['display_name', 'phone_number', 'updated_at'])
+
+        return user
+
+
+class LoginSerializer(TokenObtainPairSerializer):
+    """Username-or-email login returning an access/refresh pair."""
+
+    default_error_messages = {
+        # Deliberately identical for "no such user" and "wrong password" so
+        # the endpoint cannot be used to enumerate accounts.
+        'no_active_account': 'Incorrect username or password.',
+    }
+
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        # Lets the websocket layer name a connection without a DB hit.
+        token['username'] = user.username
+        return token
+
+    def validate(self, attrs):
+        login = (attrs.get(self.username_field) or '').strip()
+
+        # People type whichever they remember; translate an email to the
+        # username that authenticate() expects.
+        if '@' in login:
+            match = User.objects.filter(email__iexact=login).first()
+            if match:
+                attrs[self.username_field] = match.username
+
+        try:
+            data = super().validate(attrs)
+        except exceptions.AuthenticationFailed:
+            # authenticate() returns None for an inactive user, which would
+            # otherwise read as "wrong password" to someone who typed it
+            # correctly. Checking the password first means this only ever
+            # tells the truth to a caller who already knows it - so it still
+            # cannot be used to discover which accounts exist.
+            self._explain_if_unverified(attrs)
+            raise
+
+        # Reshaped to match register, so a client parses one thing
+        # whether it just signed up or just logged in.
+        return {
+            'user': UserSerializer(self.user, context=self.context).data,
+            'tokens': {'access': data['access'], 'refresh': data['refresh']},
+        }
+
+
+    def _explain_if_unverified(self, attrs):
+        candidate = User.objects.filter(
+            username=attrs.get(self.username_field), is_active=False
+        ).first()
+        if candidate and candidate.check_password(attrs.get('password') or ''):
+            raise exceptions.AuthenticationFailed(
+                'Verify your email address before signing in.',
+                'email_not_verified',
+            )
+
+
+class VerifyEmailSerializer(serializers.Serializer):
+    """Confirms an emailed code and activates the account."""
+
+    email = serializers.EmailField()
+    code = serializers.CharField(max_length=6)
+
+    def validate_email(self, value):
+        user = User.objects.filter(email__iexact=value.strip()).first()
+        if user is None:
+            raise serializers.ValidationError('No account uses that email address.')
+        if user.is_active:
+            raise serializers.ValidationError('That account is already verified.')
+        self.user = user
+        return value
+
+    def save(self, **kwargs):
+        try:
+            return verify_email(self.user, self.validated_data['code'])
+        except OtpError as exc:
+            # Wrong, expired or exhausted - the message from the otp app is
+            # written to be shown to the user as-is.
+            raise serializers.ValidationError({'code': str(exc)})
+
+
+class ResendCodeSerializer(serializers.Serializer):
+    """Issues a fresh verification code for an unverified account."""
+
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        user = User.objects.filter(email__iexact=value.strip()).first()
+        if user is None:
+            raise serializers.ValidationError('No account uses that email address.')
+        if user.is_active:
+            raise serializers.ValidationError('That account is already verified.')
+        self.user = user
+        return value
+
+    def save(self, **kwargs):
+        try:
+            return start_email_verification(self.user)
+        except OtpError as exc:
+            # Almost always the resend cooldown.
+            raise serializers.ValidationError({'email': str(exc)})
+
+
+class LogoutSerializer(serializers.Serializer):
+    """Blacklists one refresh token.
+
+    The access token stays valid until it expires - that is the trade-off
+    JWT makes - which is why ACCESS_TOKEN_LIFETIME is short.
+    """
+
+    refresh = serializers.CharField(write_only=True)
+
+    def validate_refresh(self, value):
+        try:
+            self.token = RefreshToken(value)
+        except TokenError:
+            raise serializers.ValidationError('That refresh token is invalid or expired.')
+        return value
+
+    def save(self, **kwargs):
+        self.token.blacklist()
+        return self.token
+
+
+def _validate_unique_email(value, exclude_user=None):
+    """Django's User.email has no unique constraint; this supplies one.
+
+    Case-insensitive, because nobody thinks of Yul@x.com and yul@x.com as two
+    accounts - and password reset would become ambiguous if they were.
+    """
+    value = value.strip().lower()
+    taken = User.objects.filter(email__iexact=value)
+    if exclude_user is not None:
+        taken = taken.exclude(pk=exclude_user.pk)
+    if taken.exists():
+        raise serializers.ValidationError('An account with that email already exists.')
+    return value
