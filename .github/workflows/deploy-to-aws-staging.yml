@@ -185,38 +185,72 @@ jobs:
 
       # The Elated workflow sets wait-for-service-stability to false, which
       # reports green the moment ECS accepts the new definition - a
-      # crash-looping image passes.
+      # crash-looping image passes. So we wait. But neither of the obvious ways
+      # of waiting is correct on its own:
       #
-      # Waiting is necessary but not sufficient. `wait services-stable` succeeds
-      # as soon as there is one deployment with runningCount == desiredCount,
-      # and it inspects neither rolloutState nor which task definition won. When
-      # the circuit breaker rolls a bad image back, the service settles on the
-      # PREVIOUS revision and the waiter returns 0 - so the run would go green
-      # having deployed nothing. The assertion after it is what closes that.
+      #   `wait services-stable` succeeds once there is one deployment with
+      #   runningCount == desiredCount. runningCount counts tasks in the RUNNING
+      #   lifecycle state, which they reach as soon as the container starts -
+      #   BEFORE the load balancer has marked the target healthy. So it returns
+      #   early, while the deployment is still IN_PROGRESS.
+      #
+      #   rolloutState is the authoritative signal, but reading it once straight
+      #   after that waiter races the same window and fails a healthy deploy.
+      #
+      # So: poll rolloutState until it settles, then assert the revision that
+      # won is the one we registered. That last assertion is what catches a
+      # circuit-breaker rollback, where the service settles COMPLETED on the
+      # PREVIOUS revision and every other signal looks fine.
       - name: Wait for the service to stabilise
         run: |
           set -euo pipefail
 
-          WAIT_RC=0
-          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" || WAIT_RC=$?
+          # Cheap pre-wait so we usually poll once. Not authoritative - see above.
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" || true
 
-          READ=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-            --query 'services[0].{td:taskDefinition,state:deployments[0].rolloutState,reason:deployments[0].rolloutStateReason}' \
-            --output json)
-          LIVE_TD=$(echo "$READ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["td"])')
-          STATE=$(echo "$READ"  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state") or "")')
-          REASON=$(echo "$READ" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("reason") or "")')
+          DEADLINE=$(( SECONDS + 900 ))
+          while :; do
+            READ=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].{td:taskDefinition,state:deployments[0].rolloutState,reason:deployments[0].rolloutStateReason}' \
+              --output json)
+            LIVE_TD=$(echo "$READ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["td"])')
+            STATE=$(echo "$READ"  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state") or "")')
+            REASON=$(echo "$READ" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("reason") or "")')
 
-          echo ">> rolloutState : ${STATE}"
-          echo ">> running      : ${LIVE_TD}"
-          echo ">> expected     : ${{ steps.register.outputs.arn }}"
+            echo ">> rolloutState : ${STATE}   (${REASON})"
 
-          if [ "$WAIT_RC" -ne 0 ] || [ "$LIVE_TD" != "${{ steps.register.outputs.arn }}" ] || [ "$STATE" != "COMPLETED" ]; then
+            case "$STATE" in
+              COMPLETED) break ;;
+              FAILED)
+                echo "::error::Deployment failed: ${REASON}"
+                break
+                ;;
+            esac
+
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out after 15 minutes with rolloutState=${STATE}"
+              break
+            fi
+            sleep 15
+          done
+
+          echo ">> running  : ${LIVE_TD}"
+          echo ">> expected : ${{ steps.register.outputs.arn }}"
+
+          if [ "$STATE" != "COMPLETED" ] || [ "$LIVE_TD" != "${{ steps.register.outputs.arn }}" ]; then
             echo "::error::Deploy did not take. ${REASON}"
-            echo ">> ---- recent service events ----"
+            echo ">> ---- recent service events (newest first) ----"
             aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-              --query 'services[0].events[:10].message' --output text
+              --query 'services[0].events[:10].message' --output text | tr '\t' '\n'
+            echo ">> ---- target health ----"
+            TG=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].loadBalancers[0].targetGroupArn' --output text)
+            aws elbv2 describe-target-health --target-group-arn "$TG" \
+              --query 'TargetHealthDescriptions[].{target:Target.Id,state:TargetHealth.State,reason:TargetHealth.Description}' \
+              --output table || echo "(target health unavailable)"
             exit 1
           fi
+
+          echo ">> Deployed ${{ github.sha }}"
 
           echo ">> Deployed ${{ github.sha }}"
