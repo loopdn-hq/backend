@@ -19,13 +19,19 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
+from loopd.health import healthz
+
 urlpatterns = [
+    # No trailing slash, deliberately: APPEND_SLASH would answer /healthz with a
+    # 301 to /healthz/, and the load balancer's health check matches 200 only.
+    path('healthz', healthz, name='healthz'),
+
     path('admin/', admin.site.urls),
     path('api/v1/users/', include('user.urls')),
     path('api/v1/chat/', include('chat.urls')),
 ]
 
 if settings.DEBUG:
-    # In production the avatars in MEDIA_ROOT are served by nginx/S3, not by
-    # Django; this is the development-only equivalent.
+    # Only needed locally. With AWS_STORAGE_BUCKET_NAME set, uploads live in S3
+    # and are served from presigned URLs rather than through Django at all.
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

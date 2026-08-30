@@ -1,0 +1,1117 @@
+{
+  "info": {
+    "name": "Loopd'n API",
+    "description": "The REST API behind **Loopd'n**, a realtime messaging app. Django + DRF, JWT auth,\nwebsockets over Channels.\n\n## Getting started\n\n1. Start the backend — `python manage.py runserver` — and check `base_url` below matches.\n2. Run **1. Auth & accounts › Register**, then **Login**.\n3. That's it. Login's test script stores `access_token`, `refresh_token` and `user_id`\n   as collection variables, and every other request authenticates with them\n   automatically.\n\nWhen the access token expires (30 minutes), run **Refresh token** rather than logging\nin again.\n\n## The response envelope\n\nEvery endpoint answers with the same three keys, success or failure:\n\n```json\n{ \"code\": 1, \"message\": \"Login successful.\", \"data\": { } }\n```\n\n- `code` is `1` on success and `-1` on failure — **clients switch on this**.\n- `data` holds the payload on success, and per-field validation errors on failure:\n  `{\"username\": [\"That username is taken.\"]}`.\n- The HTTP status code is deliberately left meaningful (`201`, `400`, `401`, `404`)\n  so proxies, load balancers and error tracking still work. Infrastructure switches\n  on the status; clients switch on `code`.\n\nPaginated endpoints put the usual `{count, next, previous, results}` inside `data`,\n20 per page.\n\n## Auth\n\n`Authorization: Bearer <access token>`, set once at the collection level and inherited\nby every request. The four public endpoints (register, login, verify-email,\nresend-code, token/refresh) override it to send nothing.\n\nAccess tokens last 30 minutes, refresh tokens 30 days. **Refresh rotates**: the token\nyou send is blacklisted and a new pair comes back, so a client must store both halves\nevery time.\n\n## Websockets — not covered here\n\nRealtime lives outside this collection; Postman's HTTP requests cannot open a socket.\nAdd a WebSocket request manually if you want to try it:\n\n    ws://127.0.0.1:8000/ws/chat/?token=<access token>\n\nOne socket per user, not one per conversation — a client connects once and receives\nevents for every conversation it belongs to.\n\n    <- {\"type\": \"message.new\",         \"message\": { }}\n    <- {\"type\": \"conversation.added\",  \"conversation\": { }}\n    <- {\"type\": \"typing\", \"conversation_id\": 1, \"user_id\": 2}\n\n    -> {\"type\": \"message.send\", \"conversation_id\": 1, \"text\": \"hi\"}\n    -> {\"type\": \"typing\",       \"conversation_id\": 1}\n\nThe handshake is rejected with close code `4401` when the token is missing or invalid,\nand refused outright when the origin's host is not in `ALLOWED_HOSTS`.\n\n## Variables\n\n| Variable | What it is |\n| --- | --- |\n| `base_url` | Where the API lives. `http://127.0.0.1:8000` by default. |\n| `access_token` | Set by Login / Verify email / Refresh token. |\n| `refresh_token` | Set by the same three. |\n| `user_id` | The signed-in user, set by Login. |\n| `conversation_id` | Set by Start direct chat / Create group. |\n| `otp_code` | Set from `debug_code` while `DEBUG` is on, so email verification can be tested with no mail server. |\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{access_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Nothing to do before a request — tokens are captured by the",
+          "// test scripts on Login, Verify email and Refresh token."
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8000",
+      "type": "string",
+      "description": "No trailing slash. Every path in this collection starts with /api/v1/."
+    },
+    {
+      "key": "access_token",
+      "value": "",
+      "type": "string",
+      "description": "Set automatically by Login, Verify email and Refresh token."
+    },
+    {
+      "key": "refresh_token",
+      "value": "",
+      "type": "string",
+      "description": "Set automatically by the same three requests."
+    },
+    {
+      "key": "user_id",
+      "value": "",
+      "type": "string",
+      "description": "The signed-in user's id, set by Login."
+    },
+    {
+      "key": "conversation_id",
+      "value": "",
+      "type": "string",
+      "description": "Set by Start direct chat and Create group."
+    },
+    {
+      "key": "otp_code",
+      "value": "",
+      "type": "string",
+      "description": "Verification code, captured from debug_code while DEBUG is on."
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Auth & accounts",
+      "description": "Sign-up, sign-in and token lifecycle. Every request in this folder except **Logout** is public — it sends no `Authorization` header, because the caller does not have a token yet.\n\nRun **Register** then **Login** once and the rest of the collection works: Login's test script writes `access_token`, `refresh_token` and `user_id` into the collection variables, and every authenticated request reads them from there.",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/register/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "register"
+              ]
+            },
+            "description": "Create an account.\n\n**No tokens come back from this endpoint.** Signing in is Login's job, so registering and authenticating stay separate steps and a client has only one place to get credentials from. Call **Login** next.\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `username` | yes | Unique, compared case-insensitively — `Yul` and `yul` cannot both exist. |\n| `email` | yes | Unique, compared case-insensitively. |\n| `password` | yes | Run through Django's validators: length, commonness, not all-numeric. |\n| `confirm_password` | yes | Must match `password`. |\n| `first_name` | no | |\n| `last_name` | no | |\n| `display_name` | no | What other people see in a conversation list. Falls back to the username. |\n| `phone_number` | no | International E.164 form, e.g. `+639171234567`. Must be unique. |\n\n### Responses\n`201` with `data.user`.\n\nWith `REQUIRE_EMAIL_VERIFICATION` on, the account is created **inactive**, a `data.verification` block comes back too, and the user cannot log in until **Verify email** succeeds. With it off (the current setting) the account is active immediately.\n\n`400` with per-field errors in `data`, e.g. `{\"username\": [\"That username is taken.\"]}`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"yul\",\n  \"email\": \"yul@example.com\",\n  \"password\": \"correct-horse-battery\",\n  \"confirm_password\": \"correct-horse-battery\",\n  \"first_name\": \"Yul\",\n  \"last_name\": \"Gurrea\",\n  \"display_name\": \"Yul\",\n  \"phone_number\": \"+639171234567\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('account created', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "// Only present while REQUIRE_EMAIL_VERIFICATION is on AND DEBUG is on.",
+                  "const code = body.data && body.data.verification && body.data.verification.debug_code;",
+                  "if (code) {",
+                  "    pm.collectionVariables.set('otp_code', code);",
+                  "    console.log('Verification code:', code);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/login/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "login"
+              ]
+            },
+            "description": "Exchange credentials for an access/refresh pair.\n\n**Run this first.** The test script stores the tokens and `user_id` as collection variables, which is what every other request in this collection authenticates with.\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `username` | yes | Accepts a **username or an email address** — people type whichever they remember. |\n| `password` | yes | |\n\n### Responses\n`200` with `data.user` and `data.tokens.{access, refresh}`. The access token lasts 30 minutes, the refresh token 30 days.\n\n`401` — `Incorrect username or password.` Deliberately identical for \"no such user\" and \"wrong password\", so the endpoint cannot be used to discover which accounts exist. The one exception is a correct password on an unverified account, which gets `Verify your email address before signing in.`",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"yul\",\n  \"password\": \"correct-horse-battery\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "const tokens = body.data && body.data.tokens;",
+                  "if (tokens) {",
+                  "    pm.collectionVariables.set('access_token', tokens.access);",
+                  "    pm.collectionVariables.set('refresh_token', tokens.refresh);",
+                  "    console.log('Stored a fresh token pair.');",
+                  "}",
+                  "if (body.data && body.data.user) {",
+                  "    pm.collectionVariables.set('user_id', body.data.user.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Verify email",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/verify-email/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "verify-email"
+              ]
+            },
+            "description": "Confirm the emailed code, activate the account **and sign in**.\n\nTokens come back here because the user has just proved they own the address and typed a secret — asking for the password again would be pure friction.\n\nOnly reachable while `REQUIRE_EMAIL_VERIFICATION` is on; with it off, accounts are already active and this returns `That account is already verified.`\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `email` | yes | Must belong to an existing, still-inactive account. |\n| `code` | yes | Six digits, valid for 10 minutes, 5 wrong guesses and it dies. |\n\n`{{otp_code}}` is filled in automatically by **Register** / **Resend code** when `DEBUG` is on — in development the code is returned in the response rather than emailed.\n\n### Responses\n`200` with `data.user` and `data.tokens`.\n`400` with `data.code` — wrong, expired, or too many attempts.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"yul@example.com\",\n  \"code\": \"{{otp_code}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "const tokens = body.data && body.data.tokens;",
+                  "if (tokens) {",
+                  "    pm.collectionVariables.set('access_token', tokens.access);",
+                  "    pm.collectionVariables.set('refresh_token', tokens.refresh);",
+                  "    console.log('Stored a fresh token pair.');",
+                  "}",
+                  "if (body.data && body.data.user) {",
+                  "    pm.collectionVariables.set('user_id', body.data.user.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Resend code",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/resend-code/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "resend-code"
+              ]
+            },
+            "description": "Issue a fresh verification code, replacing any code still outstanding.\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `email` | yes | Must belong to an existing, still-inactive account. |\n\n### Responses\n`200` with `data.{email, expires_at, resend_available_in}` — and `debug_code` as well while `DEBUG` is on, which the test script stores as `{{otp_code}}`.\n\n`400` — usually the 60-second resend cooldown, which stops the endpoint being used to flood somebody's inbox.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"yul@example.com\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "if (body.data && body.data.debug_code) {",
+                  "    pm.collectionVariables.set('otp_code', body.data.debug_code);",
+                  "    console.log('Verification code:', body.data.debug_code);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refresh token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/token/refresh/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "token",
+                "refresh"
+              ]
+            },
+            "description": "Trade a refresh token for a new pair.\n\n**Rotation is on.** The token you send here is blacklisted and a *new* refresh token comes back with the response, so a client must store both halves every time. Sending the same refresh token twice fails the second time — that is the point: a stolen token stops working as soon as the real client next refreshes.\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `refresh` | yes | Defaults to the stored `{{refresh_token}}`. |\n\n### Responses\n`200` with `data.tokens.{access, refresh}` — the test script stores both.\n`401` if the token is expired, malformed or already blacklisted.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "const tokens = body.data && body.data.tokens;",
+                  "if (tokens) {",
+                  "    pm.collectionVariables.set('access_token', tokens.access);",
+                  "    pm.collectionVariables.set('refresh_token', tokens.refresh);",
+                  "    console.log('Stored a fresh token pair.');",
+                  "}",
+                  "if (body.data && body.data.user) {",
+                  "    pm.collectionVariables.set('user_id', body.data.user.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/logout/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "logout"
+              ]
+            },
+            "description": "Blacklist the caller's refresh token. **Requires authentication.**\n\nThe access token stays valid until it expires — that is the trade-off JWT makes, and why the access lifetime is only 30 minutes.\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `refresh` | yes | The refresh token to kill. |\n\n### Responses\n`200` with `data: null`.\n`400` if the token is already invalid or expired.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Me & profile",
+      "description": "The signed-in account and its profile. Everything here needs a bearer token, inherited from the collection.\n\nThe account (`/me/`) and the profile (`/me/profile/`) are separate endpoints on purpose: the account is Django's built-in `User` — credentials and identity — while the profile is everything a messaging app needs beyond that.",
+      "item": [
+        {
+          "name": "Get my account",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me"
+              ]
+            },
+            "description": "The signed-in account, with its profile nested under `data.profile`.\n\nReturns `id`, `username`, `email`, `first_name`, `last_name`, `date_joined` and the full (owner's view of the) profile."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update my account",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me"
+              ]
+            },
+            "description": "Update account fields. Partial — send only what changed.\n\n### Body\n| Field | Notes |\n| --- | --- |\n| `email` | Must stay unique across accounts, compared case-insensitively. |\n| `first_name` | |\n| `last_name` | |\n\n`id`, `username` and `date_joined` are read-only. Username changes are deliberately not offered here: they would break message attribution and @mentions.\n\n### Responses\n`200` with the updated account.\n`400` — e.g. `An account with that email already exists.`",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"yul.new@example.com\",\n  \"first_name\": \"Yul\",\n  \"last_name\": \"Gurrea\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get my profile",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/profile/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "profile"
+              ]
+            },
+            "description": "The signed-in user's profile, as the owner sees it — including the fields other people are not shown (`phone_number`, `date_of_birth`).\n\n`avatar_url` is absolute, so a mobile client does not have to know the host. It is `null` when no avatar has been uploaded."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update my profile (JSON)",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/profile/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "profile"
+              ]
+            },
+            "description": "Update profile fields that are not files. Partial — send only what changed.\n\n### Body\n| Field | Notes |\n| --- | --- |\n| `display_name` | Up to 80 chars. Blank falls back to the full name, then the username. |\n| `phone_number` | E.164, e.g. `+639171234567`. Unique. Send `null` to clear it. |\n| `bio` | Up to 280 chars. |\n| `date_of_birth` | `YYYY-MM-DD`. |\n\n**Read-only, and rejected silently if sent:** `phone_no_verified` (owned by the verification flow — otherwise anyone could mark their own number verified), `is_online` and `last_seen_at` (owned by the websocket layer).\n\nChanging `phone_number` automatically resets `phone_no_verified` to `false`.\n\nTo upload an avatar, use **Update my profile (avatar)** instead — a file needs a multipart body.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"display_name\": \"Yul\",\n  \"bio\": \"Building Loopd'n.\",\n  \"phone_number\": \"+639171234567\",\n  \"date_of_birth\": \"1995-06-14\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update my profile (avatar)",
+          "request": {
+            "method": "PATCH",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/profile/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "profile"
+              ]
+            },
+            "description": "Upload an avatar. Same endpoint as above, sent as `multipart/form-data` so the image can travel alongside the other fields.\n\n**Pick a file for the `avatar` row before sending** — Postman cannot store the file itself in an exported collection.\n\n### Body (form-data)\n| Field | Type | Notes |\n| --- | --- | --- |\n| `avatar` | file | Must decode as an image. Max 5MB. |\n| `display_name` | text | Any other profile field can ride along. |\n\n### Responses\n`200` with `data.avatar_url` — an absolute URL to the stored image. The original filename is discarded: it is attacker-controlled and everybody uploads `IMG_0001.jpg`.\n\n`400` — `Keep the image under 5MB.`\n\n> Do not set a `Content-Type` header by hand for this request. Postman writes it, with the multipart boundary that the server needs.",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "avatar",
+                  "type": "file",
+                  "src": [],
+                  "description": "The image to upload. Max 5MB."
+                },
+                {
+                  "key": "display_name",
+                  "value": "Yul",
+                  "type": "text",
+                  "disabled": true,
+                  "description": "Optional — any other profile field can be sent alongside."
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Search people",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/search/?q=ma",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "ma",
+                  "description": "Username prefix (min 2 chars) or exact +E.164 number."
+                },
+                {
+                  "key": "page",
+                  "value": "1",
+                  "description": "20 per page.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Find people to message.\n\n### Query\n| Param | Notes |\n| --- | --- |\n| `q` | **Username prefix**, or an **exact** phone number in `+E.164` form. Under 2 characters returns nothing — below that a search is a directory dump rather than a lookup. |\n| `page` | 20 results per page. |\n\nPhone matching is exact on purpose: a prefix search over numbers would let anyone walk the whole user directory a digit at a time. You can only find someone by number if you already know it.\n\nThe caller is excluded from their own results, and inactive accounts never appear.\n\n### Responses\n`200` with `data.{count, next, previous, results}`. Each result is the public view: `id`, `username`, and a profile trimmed to `display_label`, `avatar_url`, `bio`, `is_online`, `last_seen_at`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get a user by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/{{user_id}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "{{user_id}}"
+              ]
+            },
+            "description": "Another user, as a conversation shows them.\n\nReturns only the public view — `id`, `username`, `display_label`, `avatar_url`, `bio`, `is_online`, `last_seen_at`. Phone number, email and date of birth are contact details, not public facts, so looking somebody up by id must not hand them over.\n\n### Responses\n`200` with the user.\n`404` if no such user, or the account is deactivated. Deactivated accounts stay in the table so old messages keep their author, but they are not retrievable."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Chat",
+      "description": "Conversations, membership and messages. All authenticated.\n\n**Access control is the queryset, not a check bolted on afterwards.** Every lookup starts from the conversations the caller participates in, so a non-member gets a `404` from every route here — including the ones that would otherwise answer `403` — and cannot even learn that a conversation exists.\n\nTwo kinds of conversation share one table:\n\n- `direct` — exactly two people, created on demand, never duplicated.\n- `group` — any number of people, created deliberately, has admins.\n\n**Start direct chat** and **Create group** both store the new `conversation_id` as a collection variable, so the requests below them work straight away.",
+      "item": [
+        {
+          "name": "List my conversations",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1",
+                  "description": "20 per page.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Every conversation the caller participates in, newest activity first.\n\n### Query\n| Param | Notes |\n| --- | --- |\n| `page` | 20 per page. |\n\n### Responses\n`200` with `data.{count, next, previous, results}`. Each conversation carries `id`, `kind`, `name`, `title`, `participants[]`, `last_message` and timestamps.\n\n`title` is what to render in a list: a group's own name, or — for a direct conversation — the *other* person's display label, so it depends on who is asking. `last_message` is `null` for a conversation nobody has written in yet."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Start direct chat",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/direct/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "direct"
+              ]
+            },
+            "description": "Open the one-to-one conversation with somebody, creating it the first time.\n\n**Safe to call every time the user taps a name.** The same pair always resolves to the same conversation — a unique key built from the two user ids in a fixed order is what stops two people ending up with two parallel threads.\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `identifier` | yes | A **username**, or a phone number in `+E.164` form. A leading `+` is what marks it as a number, so there is no ambiguity with a numeric username. |\n\n### Responses\n`200` with the conversation — whether it was just created or already existed. The other person is notified over their websocket when it is new.\n\n`400` — `No user found with that username or number.` Deliberately vague: confirming \"no such user\" for arbitrary input would turn this into a directory oracle. You also cannot start one with yourself.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"identifier\": \"maya\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "if (body.data && body.data.id) {",
+                  "    pm.collectionVariables.set('conversation_id', body.data.id);",
+                  "    console.log('conversation_id =', body.data.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create group",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/group/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "group"
+              ]
+            },
+            "description": "Create a group. **The caller becomes its admin.**\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `name` | yes | Up to 120 chars. |\n| `members` | no | Usernames and/or `+E.164` phone numbers. The caller is added automatically and does not need listing. |\n\n### Responses\n`201` with the conversation, participants included. Everyone added is notified over their websocket.\n\n`400` — `No user found for: ...`, naming every identifier that failed to resolve, so the client can highlight them all at once rather than one per round trip. Nothing is created when any one of them fails.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Weekend plans\",\n  \"members\": [\n    \"maya\",\n    \"+639179876543\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "if (body.data && body.data.id) {",
+                  "    pm.collectionVariables.set('conversation_id', body.data.id);",
+                  "    console.log('conversation_id =', body.data.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get a conversation",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}"
+              ]
+            },
+            "description": "One conversation, with its full participant list and last message.\n\n### Responses\n`200` with the conversation.\n`404` if it does not exist **or** the caller is not a participant — the two are indistinguishable by design."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Add members to a group",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/members/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "members"
+              ]
+            },
+            "description": "Add people to a group. **Admins only.**\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `members` | yes | Non-empty list of usernames and/or `+E.164` phone numbers. |\n\nRe-adding somebody who is already in the group is a no-op rather than an error — but they are not notified a second time either.\n\n### Responses\n`200` with the conversation and its refreshed participant list. Everyone newly added is notified over their websocket.\n\n`400` — `Only groups can take extra members.`, or `No user found for: ...`\n`403` — `Only a group admin can add people.`\n`404` — not a participant.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"members\": [\n    \"maya\",\n    \"+639179876543\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get message history",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/messages/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "messages"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1",
+                  "description": "20 per page.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "A page of the conversation's history, **newest first**.\n\n### Query\n| Param | Notes |\n| --- | --- |\n| `page` | 20 per page. |\n\n### Responses\n`200` with `data.{count, next, previous, results}`. Each message carries `id`, `conversation`, `sender` (the public user view), `text`, `attachments[]` and `created_at`.\n\n`404` if the caller is not a participant."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Send a message (text)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/messages/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "messages"
+              ]
+            },
+            "description": "Post a text message.\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `text` | yes, unless sending attachments | Emoji and links need nothing special — they are ordinary characters. |\n\n### Responses\n`201` with the created message.\n`400` — `Send some text or at least one attachment.` (whitespace does not count).\n`404` — not a participant.\n\nThe message is broadcast to every participant's websocket as it is created; the sender gets it back in this response as well, so a plain REST client works with no socket at all.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"Are we still on for Saturday? 🎉\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Send a message (attachments)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/messages/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "messages"
+              ]
+            },
+            "description": "Post files, with or without text. Same endpoint, sent as `multipart/form-data`.\n\n**Pick files for the `attachments` rows before sending** — Postman cannot store them in an exported collection.\n\n### Body (form-data)\n| Field | Type | Notes |\n| --- | --- | --- |\n| `attachments` | file | Repeat the key once per file. Max **10 files**, **25MB each**. |\n| `text` | text | Optional caption. |\n\nImages are detected and come back with `width` and `height` so a client can reserve the right space before loading. The uploaded filename is kept in `original_name` for display but plays no part in the storage path.\n\n### Responses\n`201` with the message and its `attachments[]`, each with an absolute `url`.\n`400` — `At most 10 files per message.` or `\"x.png\" is too large. Keep files under 25MB.`\n\n> Attachments are never sent over the websocket — binary uploads belong on this endpoint, which broadcasts the finished message to the sockets anyway.\n\n> Do not set a `Content-Type` header by hand. Postman writes it, with the multipart boundary the server needs.",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "attachments",
+                  "type": "file",
+                  "src": [],
+                  "description": "A file to attach. Max 25MB."
+                },
+                {
+                  "key": "attachments",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "Repeat the key for each extra file, up to 10."
+                },
+                {
+                  "key": "text",
+                  "value": "look at this 😍",
+                  "type": "text",
+                  "disabled": true,
+                  "description": "Optional caption to send with the files."
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

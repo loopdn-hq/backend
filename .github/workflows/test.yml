@@ -1,0 +1,39 @@
+name: Tests
+
+# The same suite the deploy workflow gates on, run on pull requests so a branch
+# is known-good before it reaches `staging`.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # No Postgres or Redis service needed: with POSTGRES_DB and REDIS_URL
+      # unset, settings.py falls back to SQLite and the in-memory channel layer.
+      - name: Run tests
+        run: python manage.py test --verbosity 2
+
+      # Catches the settings mistakes that only appear with DEBUG off - the
+      # exact configuration the container runs under.
+      - name: Django deployment checks
+        env:
+          DEBUG: 'False'
+          SECRET_KEY: ci-only-not-a-real-secret
+          ALLOWED_HOSTS: '*'
+        run: python manage.py check --deploy --fail-level ERROR

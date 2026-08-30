@@ -42,6 +42,37 @@ ALLOWED_HOSTS = [
     host.strip() for host in os.environ.get('ALLOWED_HOSTS', '').split(',') if host.strip()
 ]
 
+# Behind CloudFront, TLS terminates at the edge and the origin hop is plain
+# HTTP, so Django would otherwise decide the request was insecure and build
+# http:// URLs underneath an https:// site.
+#
+# X-Forwarded-Proto is deliberately not what is trusted here: the load balancer
+# overwrites it with the protocol of the CloudFront-to-ALB hop, which really is
+# http. X-Forwarded-Scheme is a custom header CloudFront attaches and nothing
+# downstream rewrites, so it reflects what the *viewer* actually used.
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_SCHEME', 'https')
+
+    # Every real request arrives over HTTPS because CloudFront redirects at the
+    # edge, so these cookies can carry the Secure flag.
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+    # SECURE_SSL_REDIRECT is deliberately left off. The load balancer's health
+    # check speaks plain HTTP to the container and does not send
+    # X-Forwarded-Scheme, so Django would answer it with a 301 - and the target
+    # group matches 200 only, so every task would be marked unhealthy and
+    # killed. The HTTPS redirect belongs at CloudFront, which already does it.
+
+# Required for admin logins once the site is served over HTTPS: Django checks
+# the Origin header against this list. Accepts wildcards, which is what lets the
+# generated *.cloudfront.net name be trusted before it is known.
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',')
+    if origin.strip()
+]
+
 
 # Application definition
 
@@ -71,6 +102,10 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # Directly after SecurityMiddleware, as whitenoise requires. With DEBUG off
+    # Django refuses to serve static files itself and there is no nginx in front
+    # of the container, so without this the admin renders as unstyled HTML.
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -168,9 +203,58 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
-# Where collectstatic writes. Ignored by git; served by nginx in a real
-# deployment.
+# Where collectstatic writes. Ignored by git. In the container this is populated
+# at image build time and served by whitenoise.
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+
+# Storage backends
+#
+# Uploads go to S3 when a bucket is configured, and to local disk otherwise, so
+# a laptop needs no AWS credentials. This is not a nicety: container filesystems
+# are discarded on every deploy, so on ECS the local-disk path loses every
+# avatar and attachment each time the service is updated, and two tasks cannot
+# see each other's files.
+#
+# The bucket stays private - querystring_auth leaves django-storages signing
+# each URL, so media is reachable only through a short-lived signed link rather
+# than being world-readable.
+
+AWS_STORAGE_BUCKET_NAME = os.environ.get('AWS_STORAGE_BUCKET_NAME', '')
+
+if DEBUG:
+    # The manifest only exists after collectstatic has run, so requiring it
+    # locally would break `runserver` on a fresh checkout.
+    _staticfiles_backend = 'django.contrib.staticfiles.storage.StaticFilesStorage'
+else:
+    # Hashes filenames and pre-compresses. The hashing is what makes the
+    # CloudFront /static/* cache behaviour safe to cache indefinitely.
+    _staticfiles_backend = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
+if AWS_STORAGE_BUCKET_NAME:
+    STORAGES = {
+        'default': {
+            'BACKEND': 'storages.backends.s3.S3Storage',
+            'OPTIONS': {
+                'bucket_name': AWS_STORAGE_BUCKET_NAME,
+                'region_name': os.environ.get('AWS_REGION', 'us-west-2'),
+                # Uploads are named with a uuid already; this stops a collision
+                # from silently replacing somebody else's file.
+                'file_overwrite': False,
+                'querystring_auth': True,
+                'querystring_expire': 3600,
+                'default_acl': None,
+                # Credentials come from the ECS task role, so no keys are read
+                # from the environment.
+            },
+        },
+        'staticfiles': {'BACKEND': _staticfiles_backend},
+    }
+else:
+    STORAGES = {
+        'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+        'staticfiles': {'BACKEND': _staticfiles_backend},
+    }
 
 
 # Email

@@ -1,0 +1,51 @@
+# Keep the build context to the application itself.
+#
+# Without this file `COPY . .` ships venv/ (184MB of macOS-built wheels that
+# would not even run in the container), the local SQLite database, and - most
+# importantly - .env.staging, which holds real credentials. Anything copied in
+# is readable by anyone who can pull the image.
+
+# Secrets. Configuration reaches the container through ECS `secrets` from SSM,
+# never through a file in the image.
+.env
+.env.*
+!.env.staging.example
+
+# Local virtualenv - built for the host platform, useless and huge.
+venv/
+.venv/
+
+# Local database and uploads.
+db.sqlite3
+*.sqlite3
+var/
+
+# collectstatic output. The image runs collectstatic itself at build time, so
+# copying a stale local build in first would only shadow it.
+staticfiles/
+
+# Python noise
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# VCS and tooling
+.git/
+.gitignore
+.github/
+.dockerignore
+docker-compose*.yml
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Docs
+README.md
