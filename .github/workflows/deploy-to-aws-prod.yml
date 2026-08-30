@@ -1,0 +1,261 @@
+name: Deploy to AWS Loopd Production
+
+# Generated from deploy-to-aws-staging.yml. Only the branch, the `environment:`
+# and the five identifiers under `env:` differ - keep it that way, so a fix to
+# one is a fix to both.
+#
+# The `aws-prod` GitHub Environment carries a REQUIRED REVIEWER. Tests and the
+# image build run immediately on merge; the deploy job then waits for a human to
+# approve before anything reaches users. That protection is configured in the
+# repository settings, not here - this file cannot enforce it on its own.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  # Two deploys racing would have ECS updating the service from under a
+  # migration that is still running.
+  group: deploy-prod
+  cancel-in-progress: false
+
+env:
+  ENVIRONMENT: prod
+  ECR_REPOSITORY: loopd/prod/base
+  ECS_CLUSTER: ecs-loopd-prod
+  ECS_SERVICE: svc-ecs-loopd-prod-api
+  CONTAINER_NAME: image-loopd-prod-api
+
+jobs:
+  # Runs before anything is built, so a failing suite never reaches ECR.
+  # No services needed: the tests fall back to SQLite and the in-memory channel
+  # layer when POSTGRES_DB and REDIS_URL are unset.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python manage.py test --verbosity 2
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: aws-prod
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      IMAGE_TAG: v${{ github.run_number }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The tasks run on Graviton, which is 20% cheaper than x86 Fargate. This
+      # repository is private, so GitHub's arm64 runners are not included in the
+      # free allotment - QEMU on a standard runner is the cheaper trade. Nothing
+      # compiles during the build (every pinned dependency ships an aarch64
+      # manylinux wheel), so emulation costs a few minutes, not an hour.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker_context/staging/Dockerfile
+          platforms: linux/arm64
+          push: true
+          # Three tags for three jobs: the run number is what a human reads, the
+          # commit sha is what makes a rollback unambiguous, and `latest` is
+          # what the terraform-created task definition points at on first apply.
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Buildx would otherwise push an OCI image index carrying provenance
+          # attestations, which Fargate refuses to pull.
+          provenance: false
+
+      # Pulls the live task definition and swaps only the image. Environment and
+      # secrets stay exactly as terraform defined them, so CI never has to
+      # restate the SSM wiring and the two cannot drift.
+      - name: Render task definition
+        id: taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-arn: arn:aws:ecs:${{ vars.AWS_REGION }}:${{ secrets.ACCOUNT_ID }}:task-definition/${{ env.ECS_SERVICE }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Register task definition
+        id: register
+        run: |
+          set -euo pipefail
+          ARN=$(aws ecs register-task-definition \
+            --cli-input-json "file://${{ steps.taskdef.outputs.task-definition }}" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered $ARN"
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      # Migrations run once, here, as a one-off task on the new image - before
+      # the service is updated. docker-compose-staging.yml warns why: concurrent
+      # `migrate` calls race each other once there is more than one replica.
+      #
+      # The network configuration is read back off the running service rather
+      # than restated as repository variables, so it cannot drift from terraform.
+      - name: Run database migrations
+        run: |
+          set -euo pipefail
+
+          NETCFG=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].networkConfiguration' --output json)
+
+          echo ">> Starting migration task"
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition "${{ steps.register.outputs.arn }}" \
+            --launch-type FARGATE \
+            --network-configuration "$NETCFG" \
+            --started-by "gha-${{ github.run_id }}-migrate" \
+            --overrides '{"containerOverrides":[{"name":"'"$CONTAINER_NAME"'","command":["python","manage.py","migrate","--noinput"]}]}' \
+            --query 'tasks[0].taskArn' --output text)
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "::error::run-task did not return a task ARN"
+            exit 1
+          fi
+          echo ">> $TASK_ARN"
+
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
+
+          echo ">> ---- migration output ----"
+          TASK_ID="${TASK_ARN##*/}"
+          aws logs get-log-events \
+            --log-group-name "/ecs/${ECS_CLUSTER}/${CONTAINER_NAME}" \
+            --log-stream-name "ecs/${CONTAINER_NAME}/${TASK_ID}" \
+            --query 'events[].message' --output text 2>/dev/null || \
+            echo "(log stream not available yet)"
+          echo ">> ---------------------------"
+
+          EXIT_CODE=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          REASON=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].stoppedReason' --output text)
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::Migrations failed (exit ${EXIT_CODE}): ${REASON}"
+            exit 1
+          fi
+          echo ">> Migrations applied"
+
+      - name: Deploy to ECS
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.register.outputs.arn }}" \
+            --query 'service.serviceName' --output text
+
+      # The Elated workflow sets wait-for-service-stability to false, which
+      # reports green the moment ECS accepts the new definition - a
+      # crash-looping image passes. So we wait. But neither of the obvious ways
+      # of waiting is correct on its own:
+      #
+      #   `wait services-stable` succeeds once there is one deployment with
+      #   runningCount == desiredCount. runningCount counts tasks in the RUNNING
+      #   lifecycle state, which they reach as soon as the container starts -
+      #   BEFORE the load balancer has marked the target healthy. So it returns
+      #   early, while the deployment is still IN_PROGRESS.
+      #
+      #   rolloutState is the authoritative signal, but reading it once straight
+      #   after that waiter races the same window and fails a healthy deploy.
+      #
+      # So: poll rolloutState until it settles, then assert the revision that
+      # won is the one we registered. That last assertion is what catches a
+      # circuit-breaker rollback, where the service settles COMPLETED on the
+      # PREVIOUS revision and every other signal looks fine.
+      - name: Wait for the service to stabilise
+        run: |
+          set -euo pipefail
+
+          # Cheap pre-wait so we usually poll once. Not authoritative - see above.
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" || true
+
+          DEADLINE=$(( SECONDS + 900 ))
+          while :; do
+            READ=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].{td:taskDefinition,state:deployments[0].rolloutState,reason:deployments[0].rolloutStateReason}' \
+              --output json)
+            LIVE_TD=$(echo "$READ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["td"])')
+            STATE=$(echo "$READ"  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state") or "")')
+            REASON=$(echo "$READ" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("reason") or "")')
+
+            echo ">> rolloutState : ${STATE}   (${REASON})"
+
+            case "$STATE" in
+              COMPLETED) break ;;
+              FAILED)
+                echo "::error::Deployment failed: ${REASON}"
+                break
+                ;;
+            esac
+
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out after 15 minutes with rolloutState=${STATE}"
+              break
+            fi
+            sleep 15
+          done
+
+          echo ">> running  : ${LIVE_TD}"
+          echo ">> expected : ${{ steps.register.outputs.arn }}"
+
+          if [ "$STATE" != "COMPLETED" ] || [ "$LIVE_TD" != "${{ steps.register.outputs.arn }}" ]; then
+            echo "::error::Deploy did not take. ${REASON}"
+            echo ">> ---- recent service events (newest first) ----"
+            aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].events[:10].message' --output text | tr '\t' '\n'
+            echo ">> ---- target health ----"
+            TG=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].loadBalancers[0].targetGroupArn' --output text)
+            aws elbv2 describe-target-health --target-group-arn "$TG" \
+              --query 'TargetHealthDescriptions[].{target:Target.Id,state:TargetHealth.State,reason:TargetHealth.Description}' \
+              --output table || echo "(target health unavailable)"
+            exit 1
+          fi
+
+          echo ">> Deployed ${{ github.sha }}"
+
+          echo ">> Deployed ${{ github.sha }}"

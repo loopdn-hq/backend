@@ -42,6 +42,38 @@ ALLOWED_HOSTS = [
     host.strip() for host in os.environ.get('ALLOWED_HOSTS', '').split(',') if host.strip()
 ]
 
+# On ECS the load balancer health-checks the task by its private IP, so that IP
+# arrives as the Host header. Django answers 400 to any Host it does not
+# recognise, the target never goes healthy, and ECS kills and replaces the task
+# forever - so the IP has to be in the list. It is not knowable ahead of time,
+# hence the metadata lookup; ECS injects this variable into every task.
+#
+# This is what lets ALLOWED_HOSTS be a real list rather than '*'. Falling back
+# to '*' on failure is deliberate: a metadata blip should degrade host checking,
+# not take the service down.
+_ecs_metadata_uri = os.environ.get('ECS_CONTAINER_METADATA_URI_V4')
+
+if _ecs_metadata_uri:
+    import json
+    import logging
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f'{_ecs_metadata_uri}/task', timeout=2) as response:
+            _task_metadata = json.load(response)
+
+        for _container in _task_metadata.get('Containers', []):
+            for _network in _container.get('Networks', []):
+                for _address in _network.get('IPv4Addresses', []):
+                    if _address and _address not in ALLOWED_HOSTS:
+                        ALLOWED_HOSTS.append(_address)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'ECS task metadata unreachable; falling back to ALLOWED_HOSTS = ["*"] '
+            'so load balancer health checks keep passing.'
+        )
+        ALLOWED_HOSTS = ['*']
+
 # Behind CloudFront, TLS terminates at the edge and the origin hop is plain
 # HTTP, so Django would otherwise decide the request was insecure and build
 # http:// URLs underneath an https:// site.
@@ -268,7 +300,7 @@ MAILERS = {
 
 # The console backend ignores this, but it is the From: on every real send,
 # so it has to be right before SMTP is switched on.
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'no-reply@loopd.app')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'no-reply@loopdn.com')
 
 
 # One-time passcodes
