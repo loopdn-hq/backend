@@ -120,6 +120,8 @@ desktop.ini
 *.swo
 *~
 .claude/
+# Local Claude Code guidance - useful, but not something the team has agreed to.
+CLAUDE.md
 
 # --- Scratch -------------------------------------------------------------
 scratch/
