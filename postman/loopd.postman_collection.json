@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Loopd'n API",
-    "description": "The REST API behind **Loopd'n**, a realtime messaging app. Django + DRF, JWT auth,\nwebsockets over Channels.\n\n## Getting started\n\n1. Start the backend — `python manage.py runserver` — and check `base_url` below matches.\n2. Run **1. Auth & accounts › Register**, then **Login**.\n3. That's it. Login's test script stores `access_token`, `refresh_token` and `user_id`\n   as collection variables, and every other request authenticates with them\n   automatically.\n\nWhen the access token expires (30 minutes), run **Refresh token** rather than logging\nin again.\n\n## The response envelope\n\nEvery endpoint answers with the same three keys, success or failure:\n\n```json\n{ \"code\": 1, \"message\": \"Login successful.\", \"data\": { } }\n```\n\n- `code` is `1` on success and `-1` on failure — **clients switch on this**.\n- `data` holds the payload on success, and per-field validation errors on failure:\n  `{\"username\": [\"That username is taken.\"]}`.\n- The HTTP status code is deliberately left meaningful (`201`, `400`, `401`, `404`)\n  so proxies, load balancers and error tracking still work. Infrastructure switches\n  on the status; clients switch on `code`.\n\nPaginated endpoints put the usual `{count, next, previous, results}` inside `data`,\n20 per page.\n\n## Auth\n\n`Authorization: Bearer <access token>`, set once at the collection level and inherited\nby every request. The four public endpoints (register, login, verify-email,\nresend-code, token/refresh) override it to send nothing.\n\nAccess tokens last 30 minutes, refresh tokens 30 days. **Refresh rotates**: the token\nyou send is blacklisted and a new pair comes back, so a client must store both halves\nevery time.\n\n## Websockets — not covered here\n\nRealtime lives outside this collection; Postman's HTTP requests cannot open a socket.\nAdd a WebSocket request manually if you want to try it:\n\n    ws://127.0.0.1:8000/ws/chat/?token=<access token>\n\nOne socket per user, not one per conversation — a client connects once and receives\nevents for every conversation it belongs to.\n\n    <- {\"type\": \"message.new\",         \"message\": { }}\n    <- {\"type\": \"conversation.added\",  \"conversation\": { }}\n    <- {\"type\": \"typing\", \"conversation_id\": 1, \"user_id\": 2}\n\n    -> {\"type\": \"message.send\", \"conversation_id\": 1, \"text\": \"hi\"}\n    -> {\"type\": \"typing\",       \"conversation_id\": 1}\n\nThe handshake is rejected with close code `4401` when the token is missing or invalid,\nand refused outright when the origin's host is not in `ALLOWED_HOSTS`.\n\n## Variables\n\n| Variable | What it is |\n| --- | --- |\n| `base_url` | Where the API lives. `http://127.0.0.1:8000` by default. |\n| `access_token` | Set by Login / Verify email / Refresh token. |\n| `refresh_token` | Set by the same three. |\n| `user_id` | The signed-in user, set by Login. |\n| `conversation_id` | Set by Start direct chat / Create group. |\n| `otp_code` | Set from `debug_code` while `DEBUG` is on, so email verification can be tested with no mail server. |\n",
+    "description": "The REST API behind **Loopd'n**, a realtime messaging app. Django + DRF, JWT auth,\nwebsockets over Channels.\n\n## Getting started\n\n1. Start the backend — `python manage.py runserver` — and check `base_url` below matches.\n2. Run **1. Auth & accounts › Register**, then **Login**.\n3. That's it. Login's test script stores `access_token`, `refresh_token` and `user_id`\n   as collection variables, and every other request authenticates with them\n   automatically.\n\nWhen the access token expires (30 minutes), run **Refresh token** rather than logging\nin again.\n\n## The response envelope\n\nEvery endpoint answers with the same three keys, success or failure:\n\n```json\n{ \"code\": 1, \"message\": \"Login successful.\", \"data\": { } }\n```\n\n- `code` is `1` on success and `-1` on failure — **clients switch on this**.\n- `data` holds the payload on success, and per-field validation errors on failure:\n  `{\"username\": [\"That username is taken.\"]}`.\n- The HTTP status code is deliberately left meaningful (`201`, `400`, `401`, `404`)\n  so proxies, load balancers and error tracking still work. Infrastructure switches\n  on the status; clients switch on `code`.\n\nPaginated endpoints put the usual `{count, next, previous, results}` inside `data`,\n20 per page.\n\n## Auth\n\n`Authorization: Bearer <access token>`, set once at the collection level and inherited\nby every request. The four public endpoints (register, login, verify-email,\nresend-code, token/refresh) override it to send nothing.\n\nAccess tokens last 30 minutes, refresh tokens 30 days. **Refresh rotates**: the token\nyou send is blacklisted and a new pair comes back, so a client must store both halves\nevery time.\n\n## Websockets — not covered here\n\nRealtime lives outside this collection; Postman's HTTP requests cannot open a socket.\nAdd a WebSocket request manually if you want to try it:\n\n    ws://127.0.0.1:8000/ws/chat/?token=<access token>\n\nOne socket per user, not one per conversation — a client connects once and receives\nevents for every conversation it belongs to.\n\n    <- {\"type\": \"message.new\",         \"message\": { }}\n    <- {\"type\": \"conversation.added\",  \"conversation\": { }}\n    <- {\"type\": \"typing\", \"conversation_id\": 1, \"user_id\": 2}\n\n    -> {\"type\": \"message.send\", \"conversation_id\": 1, \"text\": \"hi\"}\n    -> {\"type\": \"typing\",       \"conversation_id\": 1}\n\nThe handshake is rejected with close code `4401` when the token is missing or invalid,\nand refused outright when the origin's host is not in `ALLOWED_HOSTS`.\n\n## Variables\n\n| Variable | What it is |\n| --- | --- |\n| `base_url` | Where the API lives. `http://127.0.0.1:8000` by default. |\n| `access_token` | Set by Login / Verify email / Refresh token. |\n| `refresh_token` | Set by the same three. |\n| `user_id` | The signed-in user, set by Login. |\n| `conversation_id` | Set by Start direct chat / Create group. |\n| `otp_code` | Email code, set from `debug_code` while `DEBUG` is on, so verification can be tested with no mail server. |\n| `phone_otp_code` | Phone code, captured the same way. Locally always `000000` — no Telnyx account needed. |\n",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -61,7 +61,13 @@
       "key": "otp_code",
       "value": "",
       "type": "string",
-      "description": "Verification code, captured from debug_code while DEBUG is on."
+      "description": "Email verification code, captured from debug_code while DEBUG is on."
+    },
+    {
+      "key": "phone_otp_code",
+      "value": "",
+      "type": "string",
+      "description": "Phone verification code. Locally always 000000, captured automatically."
     }
   ],
   "item": [
@@ -1105,6 +1111,175 @@
                   "const body = pm.response.json();",
                   "pm.test('envelope reports success', function () {",
                   "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Phone verification",
+      "description": "Verifying the signed-in user's phone number. Both endpoints need a bearer token, inherited from the collection.\n\n### How this works\nThese drive the Telnyx **Verify** API, not a code this project generates. Telnyx creates the code, texts it, remembers it, and answers whether what the user typed matches — the backend never holds an SMS code at all.\n\n**Running locally, nothing is texted.** With `TELNYX_API_KEY` unset, the backend logs instead of sending and accepts the fixed code `000000`, which also comes back as `debug_code` and is captured into `{{phone_otp_code}}` automatically. So the whole flow works on a laptop with no Telnyx account and no network.\n\n### Limits you will hit while testing\n| Limit | Default | Where |\n| --- | --- | --- |\n| Resend cooldown | 60s | `OTP_COOLDOWN_SECONDS` |\n| Sends per hour | 5 | `OTP_MAX_SENDS_PER_HOUR` |\n| Sends per day | 10 | `OTP_MAX_SENDS_PER_DAY` |\n| Wrong guesses per code | 5 | `OTP_MAX_ATTEMPTS` |\n\nThe hourly and daily ceilings are counted **per account and per destination number**, so requesting a second code within a minute returns a 400 — that is the cooldown working, not a bug. Restart the server to clear them when running with the local-memory cache.",
+      "item": [
+        {
+          "name": "Request phone code",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/phone/request-code/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "phone",
+                "request-code"
+              ]
+            },
+            "description": "Have Telnyx text a code to the number already on the profile.\n\nRun **Register** first (its payload sets a phone number) or **Update my profile (JSON)**, otherwise there is no number to verify and this answers `Add a phone number to your profile first.`\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `phone_number` | no | Omitted here, so the profile's number is used. See the next request for the other form. |\n\n### Responses\n`200` with `data.{phone_number, expires_at, resend_available_in}` — plus `debug_code` locally, which the test script stores as `{{phone_otp_code}}`.\n\n`400` — the resend cooldown, an hourly or daily ceiling, no number on the profile, or a country outside `SMS_ALLOWED_COUNTRY_PREFIXES` (`+63,+1` by default).\n\n`503` — Telnyx itself failed. The pending code is discarded rather than holding the cooldown against you for an outage that was not yours.",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "// Present only while Telnyx is unconfigured AND DEBUG is on - i.e. locally.",
+                  "if (body.data && body.data.debug_code) {",
+                  "    pm.collectionVariables.set('phone_otp_code', body.data.debug_code);",
+                  "    console.log('Phone verification code:', body.data.debug_code);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Request phone code (new number)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/phone/request-code/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "phone",
+                "request-code"
+              ]
+            },
+            "description": "The change-my-number path: verify a number that is not on the profile yet. On success **Verify phone** writes it to the profile and marks it verified in the same step.\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `phone_number` | yes | International E.164 form, e.g. `+639175550123`. Must be unused by anyone else. |\n\nThe code is bound to this number, not to whatever the profile says. Editing the profile before verifying does not move it — that is what stops a code sent to a number you own from verifying one you do not.\n\n### Responses\nSame as above. `400` additionally for a malformed number or `That phone number is already in use.`\n\n> Running this straight after the previous request hits the 60-second cooldown. Wait, or restart the server to clear the counters.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone_number\": \"+639175550123\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "// Present only while Telnyx is unconfigured AND DEBUG is on - i.e. locally.",
+                  "if (body.data && body.data.debug_code) {",
+                  "    pm.collectionVariables.set('phone_otp_code', body.data.debug_code);",
+                  "    console.log('Phone verification code:', body.data.debug_code);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Verify phone",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/phone/verify/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "phone",
+                "verify"
+              ]
+            },
+            "description": "Confirm the code and set `phone_no_verified` to `true`.\n\n### Body\n| Field | Required | Notes |\n| --- | --- | --- |\n| `code` | yes | Defaults to `{{phone_otp_code}}`, captured by whichever request-code call ran last. Locally that is always `000000`. |\n\nThe code is checked against the number it was actually sent to, and the number and the verified flag are written in a single save — split them and the model resets the flag on purpose.\n\n### Responses\n`200` with the full profile, including `phone_number` and `phone_no_verified: true`. The pending code is consumed, so verifying twice fails.\n\n`400` — wrong code (the response names how many attempts remain), an expired code, five wrong guesses spent, no pending code at all, or the number was claimed by someone else in the meantime.\n\n`503` — Telnyx could not be reached to check it.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{phone_otp_code}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "pm.test('the number is now verified', function () {",
+                  "    pm.expect(body.data.phone_no_verified).to.eql(true);",
                   "});"
                 ]
               }

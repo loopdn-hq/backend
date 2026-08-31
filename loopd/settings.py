@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 import os
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -336,9 +337,47 @@ OTP_TTL = timedelta(minutes=10)
 # requested. Without it, 1,000,000 tries is a weekend's work.
 OTP_MAX_ATTEMPTS = 5
 
-# Minimum gap between sends, so the endpoint cannot be used to flood
-# somebody's inbox (or run up a bill once SMS is added).
-OTP_RESEND_COOLDOWN = timedelta(seconds=60)
+# Minimum gap between sends, so the endpoint cannot be used to flood somebody's
+# inbox - or run up a real bill, now that SMS is wired up.
+OTP_RESEND_COOLDOWN = timedelta(
+    seconds=int(os.environ.get('OTP_COOLDOWN_SECONDS', '60'))
+)
+
+# The cooldown alone only stops bursts: waiting 60 seconds between requests
+# still buys 1,440 messages a day. These are the ceilings that make an attack
+# uninteresting, and every SMS is a real charge - see utils/sms.py on pumping.
+# Enforced per profile AND per destination number, so neither one account
+# working through many numbers nor many accounts hammering one number gets
+# through. See otp/services.py.
+OTP_MAX_SENDS_PER_HOUR = int(os.environ.get('OTP_MAX_SENDS_PER_HOUR', '5'))
+OTP_MAX_SENDS_PER_DAY = int(os.environ.get('OTP_MAX_SENDS_PER_DAY', '10'))
+
+
+# SMS / phone verification (Telnyx Verify)
+#
+# We use the Verify API, not the Messages API: Telnyx generates, sends, stores
+# and checks the code, so this project never holds an SMS code at all. The full
+# reasoning is at the top of utils/sms.py.
+#
+# Unset in development - utils/sms.py then logs instead of sending and accepts
+# a fixed code, so the flow works with no account and no network.
+
+TELNYX_API_KEY = os.environ.get('TELNYX_API_KEY', '')
+TELNYX_VERIFY_PROFILE_ID = os.environ.get('TELNYX_VERIFY_PROFILE_ID', '')
+
+# Short on purpose. This call sits inside a request the user is waiting on, and
+# a provider that has stopped answering should surface as an error quickly
+# rather than hold a worker open.
+SMS_REQUEST_TIMEOUT = 10
+
+# Country prefixes we are willing to text. The main defence against SMS pumping
+# fraud; empty means no restriction. Widen this before launching in a new market
+# or verification will silently fail there.
+SMS_ALLOWED_COUNTRY_PREFIXES = [
+    prefix.strip()
+    for prefix in os.environ.get('SMS_ALLOWED_COUNTRY_PREFIXES', '+63,+1').split(',')
+    if prefix.strip()
+]
 
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
@@ -447,6 +486,31 @@ if REDIS_URL:
 else:
     CHANNEL_LAYERS = {
         'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'},
+    }
+
+
+# Cache
+#
+# Backs the OTP send counters in otp/services.py, which are the hourly and daily
+# spam ceilings. Redis rather than locmem matters in a deployment: locmem is
+# per-process, so with more than one ECS task each would keep its own count and
+# the real ceiling would be the limit times the task count.
+#
+# Database 2, following the same split as the channel layer (0) and Celery (1),
+# so a FLUSHDB on one never drops the others.
+
+if REDIS_URL:
+    _cache_url = urlsplit(REDIS_URL)._replace(path='/2').geturl()
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': _cache_url,
+        }
+    }
+else:
+    # Development and tests. Per-process, which is fine for a single runserver.
+    CACHES = {
+        'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}
     }
 
 
