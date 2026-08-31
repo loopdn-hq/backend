@@ -105,6 +105,15 @@ CSRF_TRUSTED_ORIGINS = [
     if origin.strip()
 ]
 
+# A browser frontend on another local port needs an explicit CORS response.
+# Production origins are supplied by CORS_ALLOWED_ORIGINS instead.
+_default_cors_origins = 'http://localhost:3000,http://127.0.0.1:3000' if DEBUG else ''
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CORS_ALLOWED_ORIGINS', _default_cors_origins).split(',')
+    if origin.strip()
+]
+
 
 # Application definition
 
@@ -122,6 +131,7 @@ INSTALLED_APPS = [
 
     # Third party
     'channels',
+    'corsheaders',
     'django_celery_beat',
     'rest_framework',
     'rest_framework_simplejwt.token_blacklist',
@@ -134,6 +144,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     # Directly after SecurityMiddleware, as whitenoise requires. With DEBUG off
     # Django refuses to serve static files itself and there is no nginx in front
     # of the container, so without this the admin renders as unstyled HTML.
