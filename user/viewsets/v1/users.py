@@ -5,6 +5,7 @@ One viewset covers the whole account lifecycle:
     POST   /api/v1/users/register/        create an account (active; see settings)
     POST   /api/v1/users/verify-email/    confirm the code -> account activated
     POST   /api/v1/users/resend-code/     issue a fresh verification code
+    POST   /api/v1/users/google/          sign in or create an account with Google
     POST   /api/v1/users/login/           username-or-email + password -> tokens
     POST   /api/v1/users/logout/          blacklist the caller's refresh token
     POST   /api/v1/users/token/refresh/   trade a refresh token for a new pair
@@ -21,6 +22,7 @@ its payload and names its `message` in `success_messages`.
 """
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.db import transaction
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -33,6 +35,7 @@ from otp.services import start_email_verification
 from user.lookups import search_users
 from user.models import Profile
 from user.serializers import (
+    GoogleCredentialSerializer,
     LoginSerializer,
     LogoutSerializer,
     ProfileSerializer,
@@ -82,6 +85,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     # One serializer per action beats branching inside each method.
     serializer_classes = {
         'register': RegisterSerializer,
+        'google': GoogleCredentialSerializer,
         'verify_email': VerifyEmailSerializer,
         'resend_code': ResendCodeSerializer,
         'login': LoginSerializer,
@@ -93,6 +97,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
 
     success_messages = {
         'register': 'Account created. Enter the verification code to activate it.',
+        'google': 'Google sign-in successful.',
         'verify_email': 'Email verified. Your account is now active.',
         'resend_code': 'A new verification code has been issued.',
         'login': 'Login successful.',
@@ -141,6 +146,49 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         # success_messages, which cannot vary per request.
         response.message = message
         return response
+
+    @action(detail=False, methods=['post'], permission_classes=[AllowAny])
+    def google(self, request):
+        """Exchange a verified Google ID token for this API's token pair."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user, created = self._get_or_create_google_user(
+            serializer.validated_data['credential']
+        )
+
+        if not user.is_active:
+            return Response(
+                {'detail': 'This account is inactive.'}, status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        response = Response(
+            {
+                'user': UserSerializer(user, context=self.get_serializer_context()).data,
+                'tokens': issue_tokens(user),
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+        if created:
+            response.message = 'Google account created successfully.'
+        return response
+
+    @staticmethod
+    @transaction.atomic
+    def _get_or_create_google_user(claims):
+        email = claims['email'].strip()
+        user = User.objects.filter(email__iexact=email).first()
+        if user:
+            return user, False
+
+        user = User.objects.create_user(
+            username=f'google-{claims["sub"]}'[:150],
+            email=email,
+            first_name=claims.get('given_name', ''),
+            last_name=claims.get('family_name', ''),
+        )
+        user.profile.display_name = claims.get('name', '')
+        user.profile.save(update_fields=['display_name', 'updated_at'])
+        return user, True
 
     @action(
         detail=False,

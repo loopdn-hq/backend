@@ -16,6 +16,7 @@ from rest_framework.views import exception_handler as drf_exception_handler
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
 from otp.models import OtpError
+from utils.sms import SmsError
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,15 @@ def api_exception_handler(exc, context):
         from rest_framework.exceptions import ValidationError as DRFValidationError
 
         exc = DRFValidationError({'detail': str(exc)})
+
+    # SmsError means the provider failed, not the caller - Telnyx timed out or
+    # refused. The message is already written for a user, and 503 says "not your
+    # fault, try again" where a 400 would blame the request and a 500 would hide
+    # the reason behind "Internal server error".
+    if isinstance(exc, SmsError):
+        return Response(
+            {'detail': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
 
     # TokenError is a plain Exception, so an expired or blacklisted refresh
     # token would otherwise fall through to the 500 branch below. This is the

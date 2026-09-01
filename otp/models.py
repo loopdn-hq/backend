@@ -70,10 +70,15 @@ class BaseOtp(models.Model):
         return max(0, int(remaining))
 
     @classmethod
-    def issue(cls, profile):
+    def issue(cls, profile, **extra_defaults):
         """Create or replace this profile's code and return the row.
 
         Raises OtpError while the cooldown on the previous send is running.
+
+        `extra_defaults` is for fields a channel adds to the base row. SmsOtp
+        uses it to record which number the code went to, and to blank `code`:
+        under the Telnyx Verify API the provider holds the code, so there is
+        nothing local to store. See utils/sms.py.
         """
         existing = cls.objects.filter(profile=profile).first()
         if existing and existing.seconds_until_resend > 0:
@@ -89,6 +94,7 @@ class BaseOtp(models.Model):
                 'expiry': default_expiry(),
                 # A fresh code deserves a fresh budget of attempts.
                 'attempts': 0,
+                **extra_defaults,
             },
         )
         return otp

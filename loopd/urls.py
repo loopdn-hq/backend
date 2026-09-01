@@ -27,6 +27,12 @@ urlpatterns = [
     path('healthz', healthz, name='healthz'),
 
     path('admin/', admin.site.urls),
+
+    # Ahead of user.urls so the nested phone routes are matched first. The two
+    # cannot actually collide - the user router's detail pattern excludes
+    # slashes - but the ordering says the intent out loud.
+    path('api/v1/users/me/phone/', include('otp.urls')),
+
     path('api/v1/users/', include('user.urls')),
     path('api/v1/chat/', include('chat.urls')),
 ]
