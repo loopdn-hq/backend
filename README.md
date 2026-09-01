@@ -8,8 +8,11 @@ The API behind Loopd'n, a realtime messaging app. It handles everything the
 clients need and nothing they render:
 
 - **Accounts** — register, log in with a username *or* email, JWT sessions with
-  refresh-token rotation and blacklisting. Email verification via one-time code
-  is built and wired up, currently switched off (`REQUIRE_EMAIL_VERIFICATION`).
+  refresh-token rotation and blacklisting. Email verification is **on** by
+  default (`REQUIRE_EMAIL_VERIFICATION`): registering emails a six-digit code
+  and login is refused until `verify-email` confirms it, which also returns the
+  first token pair. With `RESEND_API_KEY` unset the message is rendered and
+  logged instead of sent, so a laptop needs no account.
 - **Profiles** — display name, avatar upload, bio, date of birth, E.164 phone
   number, and presence (`is_online` / `last_seen_at`).
 - **People search** — find users by username prefix or exact phone number.

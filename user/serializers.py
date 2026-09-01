@@ -43,6 +43,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             'avatar_url',
             'phone_number',
             'phone_no_verified',
+            'email_verified',
             'bio',
             'date_of_birth',
             'is_online',
@@ -54,6 +55,7 @@ class ProfileSerializer(serializers.ModelSerializer):
         # could PATCH it could mark its own unverified number verified.
         read_only_fields = [
             'phone_no_verified',
+            'email_verified',
             'is_online',
             'last_seen_at',
             'updated_at',
@@ -120,6 +122,25 @@ class UserSerializer(serializers.ModelSerializer):
 
     def validate_email(self, value):
         return _validate_unique_email(value, exclude_user=self.instance)
+
+    def update(self, instance, validated_data):
+        # Compared before the write, while `instance` still holds the old one.
+        email_changed = 'email' in validated_data and (
+            validated_data['email'].lower() != (instance.email or '').lower()
+        )
+
+        user = super().update(instance, validated_data)
+
+        if email_changed:
+            # The new address has not been confirmed, so the badge cannot
+            # survive the change - the same rule Profile.save() applies when a
+            # phone number changes. Without this, someone verifies an address
+            # they own, swaps in one they do not, and keeps the flag.
+            profile = user.profile
+            profile.email_verified = False
+            profile.save(update_fields=['email_verified', 'updated_at'])
+
+        return user
 
 
 class PublicUserSerializer(serializers.ModelSerializer):
@@ -205,20 +226,31 @@ class RegisterSerializer(serializers.ModelSerializer):
 
         # create_user hashes the password; User(**data) would store it raw.
         #
-        # is_active is what email verification actually controls: an inactive
-        # account exists but cannot sign in, because ModelBackend refuses it.
-        # With verification off, accounts are usable the moment they exist.
-        user = User.objects.create_user(
-            password=password,
-            is_active=not settings.REQUIRE_EMAIL_VERIFICATION,
-            **validated_data,
-        )
+        # is_active stays True even when the address is unverified: it means
+        # "not banned", and nothing but an admin may write it. What actually
+        # gates signing in is profile.email_verified, checked in
+        # LoginSerializer. See the note on the field in user/models.py.
+        user = User.objects.create_user(password=password, **validated_data)
 
         # The post_save signal already made the Profile; fill it in.
+        #
+        # email_verified is decided here, in the same place and from the same
+        # setting as the rest of the account, so the two can never disagree.
+        # With verification off nobody is ever asked for a code, so leaving it
+        # False would mark every account unverified forever - and hand a banned
+        # one a working route through resend-code.
         profile = user.profile
         profile.display_name = profile_data['display_name']
         profile.phone_number = profile_data['phone_number']
-        profile.save(update_fields=['display_name', 'phone_number', 'updated_at'])
+        profile.email_verified = not settings.REQUIRE_EMAIL_VERIFICATION
+        profile.save(
+            update_fields=[
+                'display_name',
+                'phone_number',
+                'email_verified',
+                'updated_at',
+            ]
+        )
 
         return user
 
@@ -273,16 +305,19 @@ class LoginSerializer(TokenObtainPairSerializer):
             if match:
                 attrs[self.username_field] = match.username
 
-        try:
-            data = super().validate(attrs)
-        except exceptions.AuthenticationFailed:
-            # authenticate() returns None for an inactive user, which would
-            # otherwise read as "wrong password" to someone who typed it
-            # correctly. Checking the password first means this only ever
-            # tells the truth to a caller who already knows it - so it still
-            # cannot be used to discover which accounts exist.
-            self._explain_if_unverified(attrs)
-            raise
+        # A banned account (is_active=False) fails in here and is told only
+        # 'Incorrect username or password.' - naming the ban would confirm the
+        # account exists, and there is nothing the user could do about it.
+        data = super().validate(attrs)
+
+        # Past this point the password was correct, so saying why sign-in is
+        # refused reveals nothing to anyone who did not already know it. That
+        # is what keeps this from becoming an account-enumeration oracle.
+        if settings.REQUIRE_EMAIL_VERIFICATION and not self.user.profile.email_verified:
+            raise exceptions.AuthenticationFailed(
+                'Verify your email address before signing in.',
+                'email_not_verified',
+            )
 
         # Reshaped to match register, so a client parses one thing
         # whether it just signed up or just logged in.
@@ -292,16 +327,6 @@ class LoginSerializer(TokenObtainPairSerializer):
         }
 
 
-    def _explain_if_unverified(self, attrs):
-        candidate = User.objects.filter(
-            username=attrs.get(self.username_field), is_active=False
-        ).first()
-        if candidate and candidate.check_password(attrs.get('password') or ''):
-            raise exceptions.AuthenticationFailed(
-                'Verify your email address before signing in.',
-                'email_not_verified',
-            )
-
 
 class VerifyEmailSerializer(serializers.Serializer):
     """Confirms an emailed code and activates the account."""
@@ -310,10 +335,16 @@ class VerifyEmailSerializer(serializers.Serializer):
     code = serializers.CharField(max_length=6)
 
     def validate_email(self, value):
-        user = User.objects.filter(email__iexact=value.strip()).first()
+        # `is_active=True` in the lookup, not a separate check: a banned
+        # account is simply not found, so it gets the same answer as an
+        # address nobody uses. Telling it apart would confirm the account
+        # exists, and a ban must not be undoable from out here anyway.
+        user = User.objects.filter(
+            email__iexact=value.strip(), is_active=True
+        ).select_related('profile').first()
         if user is None:
             raise serializers.ValidationError('No account uses that email address.')
-        if user.is_active:
+        if user.profile.email_verified:
             raise serializers.ValidationError('That account is already verified.')
         self.user = user
         return value
@@ -333,10 +364,14 @@ class ResendCodeSerializer(serializers.Serializer):
     email = serializers.EmailField()
 
     def validate_email(self, value):
-        user = User.objects.filter(email__iexact=value.strip()).first()
+        # See the note in VerifyEmailSerializer: a banned account must not be
+        # issued a code, and must not be able to tell that it is banned.
+        user = User.objects.filter(
+            email__iexact=value.strip(), is_active=True
+        ).select_related('profile').first()
         if user is None:
             raise serializers.ValidationError('No account uses that email address.')
-        if user.is_active:
+        if user.profile.email_verified:
             raise serializers.ValidationError('That account is already verified.')
         self.user = user
         return value
