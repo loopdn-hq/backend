@@ -9,6 +9,9 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.db import transaction
+from google.auth.exceptions import GoogleAuthError
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
 from rest_framework import exceptions, serializers
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
@@ -218,6 +221,30 @@ class RegisterSerializer(serializers.ModelSerializer):
         profile.save(update_fields=['display_name', 'phone_number', 'updated_at'])
 
         return user
+
+
+class GoogleCredentialSerializer(serializers.Serializer):
+    """Validates the ID token issued by Google Identity Services."""
+
+    credential = serializers.CharField(trim_whitespace=True)
+
+    def validate_credential(self, value):
+        if not settings.GOOGLE_CLIENT_ID:
+            raise serializers.ValidationError('Google sign-in is not configured.')
+
+        try:
+            claims = id_token.verify_oauth2_token(
+                value,
+                google_requests.Request(),
+                settings.GOOGLE_CLIENT_ID,
+            )
+        except (GoogleAuthError, ValueError):
+            raise serializers.ValidationError('The Google credential is invalid.')
+
+        if not claims.get('email') or claims.get('email_verified') is not True:
+            raise serializers.ValidationError('The Google account email is not verified.')
+
+        return claims
 
 
 class LoginSerializer(TokenObtainPairSerializer):
