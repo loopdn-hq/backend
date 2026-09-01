@@ -65,6 +65,23 @@ class Profile(models.Model):
     # mean nothing. Reset automatically in save() when the number changes.
     phone_no_verified = models.BooleanField(default=False)
 
+    # Whether `user.email` has been confirmed with an emailed code. This is
+    # the flag that gates signing in, not `user.is_active`.
+    #
+    # The two are kept strictly apart, and the split is load-bearing:
+    #
+    #   is_active      an admin has not banned this account. Written by admins
+    #                  only - never by the verification flow.
+    #   email_verified the address has been confirmed. Written by the
+    #                  verification flow only - never by the profile endpoint.
+    #
+    # Collapsing them, which is the obvious shortcut, breaks bans: a banned
+    # account and a never-verified one become indistinguishable, so the two
+    # public verification endpoints hand a banned user a way to switch their
+    # own account back on. Cleared again in UserSerializer.update when the
+    # address changes, which is why is_active must not follow it.
+    email_verified = models.BooleanField(default=False)
+
     bio = models.CharField(max_length=280, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
 

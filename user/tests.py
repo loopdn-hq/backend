@@ -7,21 +7,24 @@ import io
 import shutil
 import tempfile
 from datetime import timedelta
+from unittest import mock
 from unittest.mock import patch
 
 from django.conf import settings
-from django.utils import timezone
-
 from django.contrib.auth.models import User
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.urls import reverse
+from django.utils import timezone
 from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from otp.models import EmailOtp
+from otp.services import verify_email
 from user.models import Profile
+from utils.mail import EmailError
 
 MEDIA_ROOT = tempfile.mkdtemp(prefix='loopd-test-media-')
 
@@ -51,8 +54,19 @@ class EnvelopeAssertions:
         return body
 
 
+@override_settings(REQUIRE_EMAIL_VERIFICATION=False)
 class RegisterTests(EnvelopeAssertions, APITestCase):
+    """Registration with verification switched OFF.
+
+    No longer the default - see RegisterWithVerificationTests for that - but
+    still supported, and the mode a local checkout without a Resend key wants.
+    """
+
     def setUp(self):
+        # The per-address send ceiling lives in the cache, which is
+        # process-wide and would otherwise leak counts from one test into the
+        # next - every test here registers the same address.
+        cache.clear()
         self.url = reverse('user:user-register')
         self.payload = {
             'username': 'yul',
@@ -77,6 +91,10 @@ class RegisterTests(EnvelopeAssertions, APITestCase):
 
         user = User.objects.get(username='yul')
         self.assertTrue(user.is_active)
+        # Nobody is ever asked for a code in this mode, so the account must be
+        # marked verified here - leaving it False would strand it as
+        # permanently unverified and hand a later ban a way out.
+        self.assertTrue(user.profile.email_verified)
         self.assertFalse(EmailOtp.objects.filter(profile=user.profile).exists())
 
     def test_the_new_account_can_log_in_immediately(self):
@@ -217,12 +235,61 @@ class GoogleAuthTests(EnvelopeAssertions, APITestCase):
 
         self.assertIn('credential', body['data'])
 
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_a_google_account_is_marked_email_verified(self, verify_token):
+        # GoogleCredentialSerializer refuses any token whose email_verified
+        # claim is not True, so arriving here means Google vouched for the
+        # address. Leaving the flag False would make the account permanently
+        # unverified: unable to use password login later, and a standing
+        # target for verification codes it can never need.
+        verify_token.return_value = self.claims
+        self.assertSuccess(
+            self.client.post(self.url, {'credential': 'x'}), status.HTTP_201_CREATED
+        )
+
+        user = User.objects.get(email='yul@example.com')
+        self.assertTrue(user.profile.email_verified)
+
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_signing_in_with_google_verifies_an_existing_unverified_account(
+        self, verify_token
+    ):
+        # Registered with a password, never opened the email, then used the
+        # Google button. Google has now proven the address, so the password
+        # login they abandoned must start working.
+        user = User.objects.create_user(
+            'yul', 'yul@example.com', 'a-strong-passphrase-42'
+        )
+        self.assertFalse(user.profile.email_verified)
+
+        verify_token.return_value = self.claims
+        self.assertSuccess(self.client.post(self.url, {'credential': 'x'}))
+
+        user.profile.refresh_from_db()
+        self.assertTrue(user.profile.email_verified)
+
+        with override_settings(REQUIRE_EMAIL_VERIFICATION=True):
+            self.assertSuccess(
+                self.client.post(
+                    reverse('user:user-login'),
+                    {'username': 'yul', 'password': 'a-strong-passphrase-42'},
+                )
+            )
 
 @override_settings(REQUIRE_EMAIL_VERIFICATION=True)
 class RegisterWithVerificationTests(EnvelopeAssertions, APITestCase):
-    """The same endpoint with REQUIRE_EMAIL_VERIFICATION switched back on."""
+    """Registration as it now behaves by default: inactive until verified.
+
+    The override is redundant with the current setting and kept deliberately,
+    so that flipping REQUIRE_EMAIL_VERIFICATION does not silently stop testing
+    this path.
+    """
 
     def setUp(self):
+        # The per-address send ceiling lives in the cache, which is
+        # process-wide; every test here registers the same address, so without
+        # this the sixth one is refused by a limit the test never mentions.
+        cache.clear()
         self.url = reverse('user:user-register')
         self.payload = {
             'username': 'yul',
@@ -231,7 +298,7 @@ class RegisterWithVerificationTests(EnvelopeAssertions, APITestCase):
             'confirm_password': 'a-strong-passphrase-42',
         }
 
-    def test_creates_an_inactive_account_and_issues_a_code(self):
+    def test_creates_an_unverified_account_and_issues_a_code(self):
         data = self.assertSuccess(
             self.client.post(self.url, self.payload), status.HTTP_201_CREATED
         )
@@ -239,7 +306,10 @@ class RegisterWithVerificationTests(EnvelopeAssertions, APITestCase):
         self.assertEqual(data['verification']['email'], 'yul@example.com')
 
         user = User.objects.get(username='yul')
-        self.assertFalse(user.is_active)
+        # Unverified, but NOT banned: is_active is an admin's field and
+        # registration has no business writing it.
+        self.assertFalse(user.profile.email_verified)
+        self.assertTrue(user.is_active)
 
         otp = EmailOtp.objects.get(profile=user.profile)
         self.assertEqual(len(otp.code), 6)
@@ -263,6 +333,238 @@ class RegisterWithVerificationTests(EnvelopeAssertions, APITestCase):
         )
         self.assertEqual(body['message'], 'Verify your email address before signing in.')
 
+    def test_the_default_settings_require_verification(self):
+        # The override on this class matches the shipped default; if someone
+        # flips REQUIRE_EMAIL_VERIFICATION this is the test that objects.
+        self.assertTrue(settings.REQUIRE_EMAIL_VERIFICATION)
+
+    def test_the_new_account_cannot_log_in_until_it_is_verified(self):
+        self.client.post(self.url, self.payload)
+
+        body = self.assertFailure(
+            self.client.post(
+                reverse('user:user-login'),
+                {'username': 'yul', 'password': self.payload['password']},
+            ),
+            status.HTTP_401_UNAUTHORIZED,
+        )
+        self.assertEqual(
+            body['message'], 'Verify your email address before signing in.'
+        )
+
+    @override_settings(RESEND_API_KEY='re_test')
+    def test_the_whole_flow_end_to_end(self):
+        # 1. register -> 2. code emailed -> 3. verify -> 4. account verified.
+        with mock.patch('utils.mail._post', return_value={'id': 'abc'}) as post:
+            self.assertSuccess(
+                self.client.post(self.url, self.payload), status.HTTP_201_CREATED
+            )
+
+        user = User.objects.get(username='yul')
+        self.assertFalse(user.profile.email_verified)
+
+        # The code really did go out, and it is the one on the row.
+        otp = EmailOtp.objects.get(profile=user.profile)
+        self.assertIn(otp.code, post.call_args.args[1]['text'])
+        self.assertEqual(post.call_args.args[1]['to'], ['yul@example.com'])
+
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('user:user-verify-email'),
+                {'email': 'yul@example.com', 'code': otp.code},
+            )
+        )
+
+        user.profile.refresh_from_db()
+        self.assertTrue(user.profile.email_verified)
+        # Verifying signs them in, so there is no second round trip.
+        self.assertIn('access', data['tokens'])
+        # Single-use: the code is gone.
+        self.assertFalse(EmailOtp.objects.filter(profile=user.profile).exists())
+
+    @override_settings(RESEND_API_KEY='re_test')
+    def test_a_delivery_failure_still_creates_a_recoverable_account(self):
+        # Failing the request outright would strand the user: registering
+        # again answers "that email already exists", and a client shown an
+        # error has no reason to call resend-code.
+        with mock.patch('utils.mail._post', side_effect=EmailError('boom')):
+            data = self.assertSuccess(
+                self.client.post(self.url, self.payload), status.HTTP_201_CREATED
+            )
+
+        self.assertIsNone(data['verification'])
+
+        user = User.objects.get(username='yul')
+        self.assertFalse(user.profile.email_verified)
+        # No row, so the resend cooldown is not burned by our outage.
+        self.assertFalse(EmailOtp.objects.filter(profile=user.profile).exists())
+
+        # And the documented recovery actually works.
+        with mock.patch('utils.mail._post', return_value={'id': 'abc'}):
+            self.assertSuccess(
+                self.client.post(
+                    reverse('user:user-resend-code'), {'email': 'yul@example.com'}
+                )
+            )
+        self.assertTrue(EmailOtp.objects.filter(profile=user.profile).exists())
+
+@override_settings(REQUIRE_EMAIL_VERIFICATION=True)
+class DeactivatedAccountTests(EnvelopeAssertions, APITestCase):
+    """is_active means "not banned"; Profile.email_verified means "confirmed".
+
+    Keeping them apart is the whole point of the second flag. Collapsed into
+    one, a deactivated account is indistinguishable from a never-verified one,
+    and the two public verification endpoints become a way back in.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(
+            username='yul', email='yul@example.com', password='a-strong-passphrase-42'
+        )
+        # A verified, long-standing account - then an admin deactivates it.
+        self.user.profile.email_verified = True
+        self.user.profile.save(update_fields=['email_verified'])
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+
+    def test_a_deactivated_account_cannot_request_a_code(self):
+        body = self.assertFailure(
+            self.client.post(
+                reverse('user:user-resend-code'), {'email': 'yul@example.com'}
+            )
+        )
+        self.assertIn('email', body['data'])
+        self.assertFalse(EmailOtp.objects.filter(profile=self.user.profile).exists())
+
+    def test_a_deactivated_account_cannot_verify_its_way_back_in(self):
+        # Even handed a live code - say one issued before the ban - the
+        # endpoint refuses, so the ban cannot be undone from outside.
+        EmailOtp.issue(self.user.profile)
+        otp = EmailOtp.objects.get(profile=self.user.profile)
+
+        self.assertFailure(
+            self.client.post(
+                reverse('user:user-verify-email'),
+                {'email': 'yul@example.com', 'code': otp.code},
+            )
+        )
+
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
+
+    def test_verifying_never_writes_is_active(self):
+        # The root cause of the un-ban path was verify_email writing is_active.
+        # It must only ever write the profile flag.
+        User.objects.filter(pk=self.user.pk).update(is_active=True)
+        self.user.profile.email_verified = False
+        self.user.profile.save(update_fields=['email_verified'])
+        otp = EmailOtp.issue(self.user.profile)
+
+        verify_email(self.user, otp.code)
+
+        self.user.profile.refresh_from_db()
+        self.assertTrue(self.user.profile.email_verified)
+        # Unchanged by verification, in either direction.
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+        otp = EmailOtp.issue(self.user.profile)
+        self.user.profile.email_verified = False
+        self.user.profile.save(update_fields=['email_verified'])
+        verify_email(User.objects.get(pk=self.user.pk), otp.code)
+        self.assertFalse(User.objects.get(pk=self.user.pk).is_active)
+
+    def test_an_unverified_but_unbanned_account_is_still_allowed_through(self):
+        # The guard must catch bans without also blocking the ordinary case:
+        # active, not yet verified.
+        self.user.profile.email_verified = False
+        self.user.profile.save(update_fields=['email_verified'])
+        User.objects.filter(pk=self.user.pk).update(is_active=True)
+
+        self.assertSuccess(
+            self.client.post(
+                reverse('user:user-resend-code'), {'email': 'yul@example.com'}
+            )
+        )
+
+    def test_a_ban_cannot_be_armed_by_changing_the_email_first(self):
+        # The whole chain, in order: a user changes their address (which
+        # clears email_verified while the account is still active), is banned
+        # afterwards, and then tries to verify their way back in. Every step
+        # is an ordinary endpoint, which is what made this reachable.
+        User.objects.filter(pk=self.user.pk).update(is_active=True)
+        self.client.force_authenticate(self.user)
+        self.assertSuccess(
+            self.client.patch(reverse('user:user-me'), {'email': 'new@example.com'})
+        )
+        self.user.profile.refresh_from_db()
+        self.assertFalse(self.user.profile.email_verified)
+
+        # Now the ban lands, on an account sitting in the unverified state.
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+        self.client.force_authenticate(None)
+
+        # Barrier one: the code is never issued.
+        self.assertFailure(
+            self.client.post(
+                reverse('user:user-resend-code'), {'email': 'new@example.com'}
+            )
+        )
+
+        # Barrier two: even holding a live code, verifying cannot un-ban.
+        # EmailOtp.issue bypasses the endpoint entirely, which is the
+        # strongest form of the attack.
+        EmailOtp.issue(self.user.profile)
+        otp = EmailOtp.objects.get(profile=self.user.profile)
+        self.assertFailure(
+            self.client.post(
+                reverse('user:user-verify-email'),
+                {'email': 'new@example.com', 'code': otp.code},
+            )
+        )
+
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
+
+
+class EmailChangeTests(EnvelopeAssertions, APITestCase):
+    """Changing the address has to drop the badge that vouched for the old one."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='yul', email='yul@example.com', password='a-strong-passphrase-42'
+        )
+        self.user.profile.email_verified = True
+        self.user.profile.save(update_fields=['email_verified'])
+        self.client.force_authenticate(self.user)
+
+    def test_changing_the_email_clears_the_verified_flag(self):
+        self.assertSuccess(
+            self.client.patch(reverse('user:user-me'), {'email': 'other@example.com'})
+        )
+        self.user.profile.refresh_from_db()
+        self.assertFalse(self.user.profile.email_verified)
+
+    def test_rewriting_the_same_email_keeps_the_flag(self):
+        # A PATCH that changes a different field must not cost the badge.
+        self.assertSuccess(
+            self.client.patch(
+                reverse('user:user-me'),
+                {'email': 'YUL@example.com', 'first_name': 'Yul'},
+            )
+        )
+        self.user.profile.refresh_from_db()
+        self.assertTrue(self.user.profile.email_verified)
+
+    def test_the_flag_cannot_be_set_through_the_profile_endpoint(self):
+        self.user.profile.email_verified = False
+        self.user.profile.save(update_fields=['email_verified'])
+
+        self.assertSuccess(
+            self.client.patch(
+                reverse('user:user-me-profile'), {'email_verified': True}
+            )
+        )
+        self.user.profile.refresh_from_db()
+        self.assertFalse(self.user.profile.email_verified)
 
 class LoginTests(EnvelopeAssertions, APITestCase):
     def setUp(self):
@@ -271,9 +573,16 @@ class LoginTests(EnvelopeAssertions, APITestCase):
         self.user = User.objects.create_user(
             username='yul', email='yul@example.com', password=self.password
         )
+        # create_user bypasses RegisterSerializer, so the flag has to be set
+        # by hand; without it login is refused as unverified.
+        self.user.profile.email_verified = True
+        self.user.profile.save(update_fields=['email_verified'])
 
+    @override_settings(REQUIRE_EMAIL_VERIFICATION=True)
     def test_unverified_account_is_told_to_verify(self):
-        User.objects.filter(pk=self.user.pk).update(is_active=False)
+        # Unverified, not banned - the account is active throughout.
+        self.user.profile.email_verified = False
+        self.user.profile.save(update_fields=['email_verified'])
         body = self.assertFailure(
             self.client.post(
                 self.url, {'username': 'yul', 'password': self.password}
@@ -281,6 +590,23 @@ class LoginTests(EnvelopeAssertions, APITestCase):
             status.HTTP_401_UNAUTHORIZED,
         )
         self.assertEqual(body['message'], 'Verify your email address before signing in.')
+
+    @override_settings(REQUIRE_EMAIL_VERIFICATION=True)
+    def test_a_banned_account_is_not_told_it_is_banned(self):
+        # A ban must be indistinguishable from a wrong password: saying so
+        # would confirm the account exists, and telling a banned user to
+        # "verify your email" sends them to an endpoint that refuses them.
+        self.user.profile.email_verified = True
+        self.user.profile.save(update_fields=['email_verified'])
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+
+        body = self.assertFailure(
+            self.client.post(
+                self.url, {'username': 'yul', 'password': self.password}
+            ),
+            status.HTTP_401_UNAUTHORIZED,
+        )
+        self.assertEqual(body['message'], 'Incorrect username or password.')
 
     def test_unverified_account_with_a_wrong_password_reveals_nothing(self):
         # The "verify your email" hint must only reach someone who already
@@ -326,6 +652,8 @@ class LoginTests(EnvelopeAssertions, APITestCase):
 @override_settings(REQUIRE_EMAIL_VERIFICATION=True)
 class EmailVerificationTests(EnvelopeAssertions, APITestCase):
     def setUp(self):
+        # See the note in RegisterWithVerificationTests.setUp.
+        cache.clear()
         self.password = 'a-strong-passphrase-42'
         self.client.post(
             reverse('user:user-register'),
@@ -370,8 +698,8 @@ class EmailVerificationTests(EnvelopeAssertions, APITestCase):
         self.otp.refresh_from_db()
         self.assertEqual(self.otp.attempts, 1)
 
-        self.user.refresh_from_db()
-        self.assertFalse(self.user.is_active)
+        self.user.profile.refresh_from_db()
+        self.assertFalse(self.user.profile.email_verified)
 
     def test_code_dies_after_too_many_wrong_attempts(self):
         wrong = '000000' if self.otp.code != '000000' else '111111'
@@ -382,8 +710,8 @@ class EmailVerificationTests(EnvelopeAssertions, APITestCase):
         body = self.assertFailure(self.verify(self.otp.code))
         self.assertIn('Too many incorrect attempts', body['message'])
 
-        self.user.refresh_from_db()
-        self.assertFalse(self.user.is_active)
+        self.user.profile.refresh_from_db()
+        self.assertFalse(self.user.profile.email_verified)
 
     def test_expired_code_is_refused(self):
         EmailOtp.objects.filter(pk=self.otp.pk).update(
@@ -442,6 +770,10 @@ class AuthenticatedFlowTests(EnvelopeAssertions, APITestCase):
         self.user = User.objects.create_user(
             username='yul', email='yul@example.com', password=self.password
         )
+        # create_user bypasses RegisterSerializer, so the flag has to be set
+        # by hand; without it login is refused as unverified.
+        self.user.profile.email_verified = True
+        self.user.profile.save(update_fields=['email_verified'])
         tokens = self.client.post(
             reverse('user:user-login'), {'username': 'yul', 'password': self.password}
         ).json()['data']['tokens']

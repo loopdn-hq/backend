@@ -1,0 +1,11 @@
+{% extends "email/base.html" %}
+
+{% block content %}
+<p style="margin:0 0 20px;">Enter this code to verify your email address:</p>
+
+<p style="margin:0 0 20px; font-size:34px; font-weight:700; letter-spacing:7px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; color:#18181b;">{{ code }}</p>
+
+<p style="margin:0 0 20px;">The code expires in {{ expires_in_minutes }} minutes.</p>
+
+<p style="margin:0; color:#71717a; font-size:14px; line-height:20px;">If you did not create a {{ product_name }} account, you can ignore this email &mdash; nobody can use the code without it.</p>
+{% endblock %}

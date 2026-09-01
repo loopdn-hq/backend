@@ -1,0 +1,42 @@
+{% comment %}
+Shared shell for every HTML email. Extend it and fill `content`.
+
+Email clients are not browsers: Outlook renders with Word, Gmail strips <style>
+blocks it dislikes, and none of them agree on flexbox. So this is a centred
+table with inline styles - the one layout that has worked everywhere for twenty
+years. Resist the urge to modernise it.
+
+Colours are fixed rather than theme-aware for the same reason: a client that
+inverts a message for dark mode will do so whatever we declare, and a palette
+that survives inversion beats one that fights it.
+{% endcomment %}<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}{{ product_name }}{% endblock %}</title>
+  </head>
+  <body style="margin:0; padding:0; background-color:#f4f4f5;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f4f5; padding:32px 12px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:480px; background-color:#ffffff; border-radius:12px; padding:32px;">
+            <tr>
+              <td style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; font-size:16px; line-height:24px; color:#18181b;">
+                <p style="margin:0 0 24px; font-size:18px; font-weight:600;">{{ product_name }}</p>
+                {% block content %}{% endblock %}
+              </td>
+            </tr>
+          </table>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:480px; padding:20px 8px 0;">
+            <tr>
+              <td style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; font-size:12px; line-height:18px; color:#71717a;">
+                {% block footer %}Questions? Reach us at {{ support_address }}.{% endblock %}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

@@ -165,7 +165,11 @@ ROOT_URLCONF = 'loopd.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        # Project-level templates, searched before any app's. Email bodies live
+        # here rather than inside an app because utils/mail.py renders them and
+        # utils is not an installed app - APP_DIRS would never find them - and
+        # because the next email may not belong to `user` or `otp` at all.
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -306,15 +310,31 @@ else:
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
-    },
-}
+# Product email goes out through utils/mail.py and the Resend HTTP API, not
+# through django.core.mail - see the header of that module for why. This
+# backend therefore only ever carries Django's own mail: admin error reports
+# and anything contrib sends. Console, because nothing should be relying on it.
+#
+# (A `MAILERS` dict used to sit here. Django 6.0 has no such setting, so it was
+# silently ignored and django.core.mail fell through to the SMTP default -
+# which would have tried localhost:25 the first time anything called send_mail.)
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 
-# The console backend ignores this, but it is the From: on every real send,
-# so it has to be right before SMTP is switched on.
+# The From: on every message Resend sends. The domain has to be verified in the
+# Resend dashboard or the API rejects the send with a 403.
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'no-reply@loopdn.com')
+
+# Unset in development - utils/mail.py then renders the message and logs it
+# instead of sending, so the whole flow works with no account and no network.
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+
+# Short on purpose, and for the same reason as SMS_REQUEST_TIMEOUT: this call
+# sits inside a request the user is waiting on.
+EMAIL_REQUEST_TIMEOUT = 10
+
+# Available to every email template without the caller passing them.
+EMAIL_PRODUCT_NAME = os.environ.get('EMAIL_PRODUCT_NAME', 'Loopd')
+EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMAIL)
 
 
 # One-time passcodes
@@ -323,13 +343,21 @@ DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'no-reply@loopdn.com')
 # Six digits is the familiar length. It is only 1,000,000 possibilities, so
 # the security comes from the short lifetime and the attempt cap below, not
 # from the code itself.
-# Email verification is off for now: registering activates the account
-# immediately and returns tokens, so a new user can sign in straight away.
-# Turn it on (here or via the environment) and register goes back to
-# creating an inactive account that must confirm an emailed code first.
-# Nothing else needs to change - the OTP endpoints stay wired up either way.
+# Email verification is ON: registering emails a code, and login is refused
+# until verify-email confirms it.
+#
+# The flag that gates sign-in is `Profile.email_verified`, NOT `user.is_active`
+# - the two are kept strictly apart, because is_active is also how an admin
+# bans an account, and a verification code must never be able to write it. See
+# the note on the field in user/models.py. LoginSerializer refuses an
+# unverified account only after the password checks out, so it cannot be used
+# to discover which accounts exist.
+#
+# Turn it off (here or via the environment) and registration marks the account
+# verified on the spot, so it can sign in straight away. Nothing else changes -
+# the verification endpoints stay wired up either way.
 REQUIRE_EMAIL_VERIFICATION = os.environ.get(
-    'REQUIRE_EMAIL_VERIFICATION', 'False'
+    'REQUIRE_EMAIL_VERIFICATION', 'True'
 ).lower() in ('1', 'true', 'yes')
 
 OTP_CODE_LENGTH = 6
