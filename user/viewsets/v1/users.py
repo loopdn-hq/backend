@@ -210,6 +210,16 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         email = claims['email'].strip()
         user = User.objects.filter(email__iexact=email).first()
         if user:
+            # Google is a verification of this address, and a stronger one
+            # than our own six-digit code: GoogleCredentialSerializer refuses
+            # any token whose email_verified claim is not True, so arriving
+            # here means Google has vouched for it. Marking it lets someone who
+            # registered but never opened the email sign in with a password
+            # afterwards, and stops us mailing codes for an address already
+            # proven.
+            if not user.profile.email_verified:
+                user.profile.email_verified = True
+                user.profile.save(update_fields=['email_verified', 'updated_at'])
             return user, False
 
         user = User.objects.create_user(
@@ -219,7 +229,14 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
             last_name=claims.get('family_name', ''),
         )
         user.profile.display_name = claims.get('name', '')
-        user.profile.save(update_fields=['display_name', 'updated_at'])
+        # Same reasoning, and load-bearing here: create_user leaves the flag
+        # False, which would leave every Google account permanently unverified
+        # - unable to use password login later, and a standing target for
+        # verification codes it can never need.
+        user.profile.email_verified = True
+        user.profile.save(
+            update_fields=['display_name', 'email_verified', 'updated_at']
+        )
         return user, True
 
     @action(

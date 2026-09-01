@@ -235,6 +235,46 @@ class GoogleAuthTests(EnvelopeAssertions, APITestCase):
 
         self.assertIn('credential', body['data'])
 
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_a_google_account_is_marked_email_verified(self, verify_token):
+        # GoogleCredentialSerializer refuses any token whose email_verified
+        # claim is not True, so arriving here means Google vouched for the
+        # address. Leaving the flag False would make the account permanently
+        # unverified: unable to use password login later, and a standing
+        # target for verification codes it can never need.
+        verify_token.return_value = self.claims
+        self.assertSuccess(
+            self.client.post(self.url, {'credential': 'x'}), status.HTTP_201_CREATED
+        )
+
+        user = User.objects.get(email='yul@example.com')
+        self.assertTrue(user.profile.email_verified)
+
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_signing_in_with_google_verifies_an_existing_unverified_account(
+        self, verify_token
+    ):
+        # Registered with a password, never opened the email, then used the
+        # Google button. Google has now proven the address, so the password
+        # login they abandoned must start working.
+        user = User.objects.create_user(
+            'yul', 'yul@example.com', 'a-strong-passphrase-42'
+        )
+        self.assertFalse(user.profile.email_verified)
+
+        verify_token.return_value = self.claims
+        self.assertSuccess(self.client.post(self.url, {'credential': 'x'}))
+
+        user.profile.refresh_from_db()
+        self.assertTrue(user.profile.email_verified)
+
+        with override_settings(REQUIRE_EMAIL_VERIFICATION=True):
+            self.assertSuccess(
+                self.client.post(
+                    reverse('user:user-login'),
+                    {'username': 'yul', 'password': 'a-strong-passphrase-42'},
+                )
+            )
 
 @override_settings(REQUIRE_EMAIL_VERIFICATION=True)
 class RegisterWithVerificationTests(EnvelopeAssertions, APITestCase):
