@@ -115,6 +115,8 @@ CORS_ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '310157572832-e20tuelb23m2jbrier48hvg49i9kvg5t.apps.googleusercontent.com')
+
 
 # Application definition
 

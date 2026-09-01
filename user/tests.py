@@ -7,6 +7,7 @@ import io
 import shutil
 import tempfile
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.conf import settings
 from django.utils import timezone
@@ -169,6 +170,52 @@ class RegisterTests(EnvelopeAssertions, APITestCase):
         self.assertSuccess(
             self.client.post(self.url, self.payload), status.HTTP_201_CREATED
         )
+
+
+@override_settings(GOOGLE_CLIENT_ID='google-client-id')
+class GoogleAuthTests(EnvelopeAssertions, APITestCase):
+    def setUp(self):
+        self.url = reverse('user:user-google')
+        self.claims = {
+            'sub': 'google-subject-123',
+            'email': 'yul@example.com',
+            'email_verified': True,
+            'given_name': 'Yul',
+            'family_name': 'G',
+            'name': 'Yul G',
+        }
+
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_creates_an_account_and_returns_tokens(self, verify_token):
+        verify_token.return_value = self.claims
+        data = self.assertSuccess(
+            self.client.post(self.url, {'credential': 'google-id-token'}),
+            status.HTTP_201_CREATED,
+        )
+
+        self.assertEqual(data['user']['email'], 'yul@example.com')
+        self.assertEqual(data['user']['profile']['display_name'], 'Yul G')
+        self.assertIn('access', data['tokens'])
+        self.assertIn('refresh', data['tokens'])
+        verify_token.assert_called_once()
+
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_logs_in_to_the_existing_email_account(self, verify_token):
+        user = User.objects.create_user('existing', 'yul@example.com', 'password')
+        verify_token.return_value = self.claims
+
+        data = self.assertSuccess(self.client.post(self.url, {'credential': 'google-id-token'}))
+
+        self.assertEqual(data['user']['id'], user.id)
+        self.assertEqual(User.objects.filter(email__iexact='yul@example.com').count(), 1)
+
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_rejects_an_unverified_google_email(self, verify_token):
+        verify_token.return_value = {**self.claims, 'email_verified': False}
+
+        body = self.assertFailure(self.client.post(self.url, {'credential': 'google-id-token'}))
+
+        self.assertIn('credential', body['data'])
 
 
 @override_settings(REQUIRE_EMAIL_VERIFICATION=True)
