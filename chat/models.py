@@ -484,6 +484,22 @@ class Conversation(models.Model):
     def has_phone_participant(self, phone_number):
         return self.active_participants.filter(phone_number=phone_number).exists()
 
+    def may_add_members(self, user):
+        """Whether this person may add or invite people."""
+        if self.add_member_permission == self.MemberAddPermission.MEMBERS:
+            return self.has_participant(user)
+        return self.is_admin(user)
+
+    def may_edit_group(self, user):
+        """Whether this person may change the name, image or description.
+
+        Never covers the policy settings - see ADMIN_ONLY_SETTINGS. A member who
+        could grant themselves permissions would make this setting pointless.
+        """
+        if self.edit_group_permission == self.EditGroupPermission.MEMBERS:
+            return self.has_participant(user)
+        return self.is_admin(user)
+
     def is_admin(self, user):
         return self.active_participants.filter(
             user=user, role=Participant.Role.ADMIN

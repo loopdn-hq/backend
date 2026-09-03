@@ -269,6 +269,59 @@ class DirectConversationSerializer(serializers.Serializer):
         return conversation
 
 
+class GroupSettingsFieldsSerializer(serializers.Serializer):
+    """How a group behaves - its policy, as opposed to what it is called.
+
+    One serializer used by BOTH create and update, so there is a single shape to
+    learn rather than two that drift apart. Every field optional; anything left
+    out keeps its default.
+
+    `name`, `description` and `image` are deliberately NOT here. They are the
+    group's identity, they are what `edit_group_permission` can be relaxed to
+    let ordinary members change, and the policy below must not travel with them.
+    """
+
+    mode = serializers.ChoiceField(choices=Conversation.Mode.choices, required=False)
+    join_mode = serializers.ChoiceField(
+        choices=Conversation.JoinMode.choices, required=False
+    )
+    add_member_permission = serializers.ChoiceField(
+        choices=Conversation.MemberAddPermission.choices, required=False
+    )
+    edit_group_permission = serializers.ChoiceField(
+        choices=Conversation.EditGroupPermission.choices, required=False
+    )
+    sms_delivery_enabled = serializers.BooleanField(required=False)
+    sms_replies_enabled = serializers.BooleanField(required=False)
+    voice_messages_enabled = serializers.BooleanField(required=False)
+
+
+#: Changing any of these is an admin decision even in a group where members may
+#: edit the name and photo. A member who could grant themselves permissions
+#: would make `edit_group_permission` meaningless.
+ADMIN_ONLY_SETTINGS = {
+    'mode',
+    'join_mode',
+    'add_member_permission',
+    'edit_group_permission',
+    'sms_delivery_enabled',
+    'sms_replies_enabled',
+    'voice_messages_enabled',
+}
+
+
+class InviteEntrySerializer(serializers.Serializer):
+    """One person to add by number who has no account yet."""
+
+    phone_number = serializers.CharField(max_length=16)
+    display_name = serializers.CharField(max_length=80)
+
+    def validate_phone_number(self, value):
+        number = value.strip()
+        phone_number_validator(number)
+        return number
+
+
 class GroupCreateSerializer(serializers.Serializer):
     """Create a group. Whoever calls this becomes its admin.
 
@@ -288,8 +341,18 @@ class GroupCreateSerializer(serializers.Serializer):
     members = serializers.ListField(
         child=serializers.CharField(),
         required=False,
-        help_text='Usernames or +E.164 phone numbers.',
+        help_text='Usernames or verified +E.164 numbers of EXISTING accounts.',
     )
+    # Separate from `members`, not merged into it, because the two behave
+    # differently when something is wrong: `members` means "these people exist,
+    # fail if they do not", so a typo is caught. Merged, a mistyped username
+    # would quietly become somebody's phone number.
+    invite = InviteEntrySerializer(
+        many=True,
+        required=False,
+        help_text='People with no account, added by number and texted an invitation.',
+    )
+    settings = GroupSettingsFieldsSerializer(required=False)
 
     def validate_image(self, value):
         return validate_group_image(value)
@@ -315,6 +378,12 @@ class GroupCreateSerializer(serializers.Serializer):
                 'Could not provision a number for conversation %s', conversation.pk
             )
 
+        # After provisioning, because an invitation is a text and a text needs
+        # the group's number to come from.
+        self._invite_by_number(
+            conversation, validated_data.get('invite') or [], creator
+        )
+
         return conversation
 
     def _create_group(self, validated_data, creator):
@@ -325,6 +394,12 @@ class GroupCreateSerializer(serializers.Serializer):
             image=validated_data.get('image'),
         )
 
+        group_settings = validated_data.get('settings') or {}
+        if group_settings:
+            for field, value in group_settings.items():
+                setattr(conversation, field, value)
+            conversation.save(update_fields=list(group_settings))
+
         members = validated_data.get('members') or []
         for user in members:
             conversation.add_participant(user)
@@ -332,6 +407,32 @@ class GroupCreateSerializer(serializers.Serializer):
             announce_added_to_conversation(conversation, members)
 
         return conversation
+
+    def _invite_by_number(self, conversation, entries, creator):
+        """Add the people who have no account, after the group exists.
+
+        Each is texted an invitation and receives nothing from the group until
+        they reply YES. Done one at a time and never allowed to fail the whole
+        request: the group and its real members are already committed, and
+        losing them because one number was unreachable helps nobody.
+        """
+        from chat import membership
+
+        invited = []
+        for entry in entries:
+            try:
+                invited.append(membership.invite_by_phone(
+                    conversation,
+                    entry['phone_number'],
+                    entry['display_name'],
+                    creator,
+                ))
+            except Exception:
+                logger.exception(
+                    'Could not invite %s to conversation %s',
+                    entry['phone_number'], conversation.pk,
+                )
+        return invited
 
 
 class GroupSettingsSerializer(serializers.ModelSerializer):
@@ -352,18 +453,12 @@ class GroupSettingsSerializer(serializers.ModelSerializer):
     # null, so DRF reads an empty `image` field as None.
     image = serializers.ImageField(required=False, allow_null=True, write_only=True)
 
-    # How people get in. The four modes are the product's, not a free-text
-    # field: see Conversation.JoinMode.
-    join_mode = serializers.ChoiceField(
-        choices=Conversation.JoinMode.choices, required=False
-    )
-    # Chat or broadcast. Changing it does not touch who is in the group, only
-    # who may speak.
-    mode = serializers.ChoiceField(choices=Conversation.Mode.choices, required=False)
+    # The same object `POST /group/` takes, so there is one shape to learn.
+    settings = GroupSettingsFieldsSerializer(required=False)
 
     class Meta:
         model = Conversation
-        fields = ['name', 'description', 'image', 'join_mode', 'mode']
+        fields = ['name', 'description', 'image', 'settings']
 
     def validate_image(self, value):
         return validate_group_image(value)
@@ -372,10 +467,13 @@ class GroupSettingsSerializer(serializers.ModelSerializer):
         if not validated_data:
             return instance
 
+        group_settings = validated_data.pop('settings', None) or {}
         for field, value in validated_data.items():
             setattr(instance, field, value)
+        for field, value in group_settings.items():
+            setattr(instance, field, value)
 
-        fields = list(validated_data)
+        fields = list(validated_data) + list(group_settings)
 
         # A group can predate join codes, or have had one revoked. Switching to
         # a mode that needs one and leaving it NULL would make the group

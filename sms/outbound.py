@@ -163,6 +163,17 @@ def fan_out(message):
             if row.pk not in already
         ]
 
+    if not conversation.sms_delivery_enabled:
+        # The group's own outbound switch, above every member's. Recorded per
+        # person for the same reason: a silent non-delivery is a support ticket.
+        send_to, _ = recipients_for(message)
+        return [
+            _record(message, row, SmsDelivery.Status.SKIPPED,
+                    reason='sms is off for this group')
+            for row in send_to
+            if row.pk not in already
+        ]
+
     group_number = GroupNumber.for_number_of(conversation)
     send_to, skipped = recipients_for(message)
 
