@@ -2,49 +2,77 @@
 
 Two channels, deliberately asymmetric because the providers are:
 
-  EMAIL - we own the code. `EmailOtp` generates it, expires it, counts wrong
-          guesses and compares it in constant time. Delivery is still not wired
-          up; `start_email_verification` issues and logs, but sends nothing.
+  EMAIL - we own the code AND the message. `EmailOtp` generates it, expires it,
+          counts wrong guesses and compares it in constant time; utils/mail.py
+          renders a template and hands the finished thing to Resend.
 
   SMS   - Telnyx owns the code. We use its Verify API, so this project never
           generates or stores an SMS code; it asks Telnyx to send one, and later
           asks Telnyx whether what the user typed was right. The `SmsOtp` row
           survives only to hold the resend clock, the local attempt count, and
-          which number the code went to. See the header of utils/sms.py.
+          which number the code went to. See the header of sms/verification.py.
 
 Both raise OtpError for anything the user should be told about;
 loopd/exceptions.py turns that into a 400 inside the normal envelope.
 """
+import hashlib
 import logging
 
 from django.conf import settings
 from django.core.cache import cache
 
 from otp.models import EmailOtp, OtpError, SmsOtp
+from sms.client import SmsError, is_allowed_destination
+from sms.verification import check_verification_code, send_verification_code
 from user.models import Profile
-from utils.sms import (
-    SmsError,
-    check_verification_code,
-    is_allowed_destination,
-    send_verification_code,
-)
+from utils.mail import VERIFICATION_CODE, EmailError, send_templated_email
 
 logger = logging.getLogger(__name__)
 
 
 def start_email_verification(user):
-    """Issue a verification code for this user and return the EmailOtp row.
+    """Email this user a verification code and return the EmailOtp row.
 
-    Raises OtpError if a code was issued too recently.
+    Raises OtpError if a code was issued too recently, if the hourly or daily
+    ceiling is reached, or if the account has no address; EmailError if Resend
+    itself failed.
     """
+    if not user.email:
+        raise OtpError('Add an email address to your account first.')
+
+    # Checked before issuing, so a request that is over the ceiling does not
+    # also burn the resend cooldown. /resend-code is AllowAny and takes only
+    # an address, so without this one inbox can be sent 1,440 codes a day -
+    # which burns the sending domain's reputation and takes every other
+    # transactional email down with it.
+    _enforce_send_limits('email', user.profile, user.email)
+
     otp = EmailOtp.issue(user.profile)
 
-    # Until delivery exists, the console log is how the code reaches a
-    # developer. Guarded on DEBUG so a live deployment never writes a valid
-    # credential into its log files.
+    # Guarded on DEBUG so a live deployment never writes a valid credential
+    # into its log files. Redundant with the unconfigured-Resend log in
+    # utils/mail.py, and deliberately so: this one still fires when a developer
+    # has a real API key set.
     if settings.DEBUG:
         logger.info('Email OTP for %s: %s', user.email or user.username, otp.code)
 
+    try:
+        send_templated_email(
+            VERIFICATION_CODE,
+            to=user.email,
+            context={
+                'code': otp.code,
+                'expires_in_minutes': int(settings.OTP_TTL.total_seconds() // 60),
+            },
+        )
+    except EmailError:
+        # Same bargain as the SMS path: the provider failed, not the user.
+        # Dropping the row releases the resend cooldown so they can retry at
+        # once, rather than being locked out for a minute over our outage.
+        otp.delete()
+        raise
+
+    _record_send('email', user.profile, user.email)
     return otp
 
 
@@ -58,9 +86,14 @@ def verify_email(user, code):
     # and returns True on success.
     otp.verify(code)
 
-    if not user.is_active:
-        user.is_active = True
-        user.save(update_fields=['is_active'])
+    # Only the profile flag. Deliberately NOT user.is_active: that field means
+    # "an admin has not banned this account", and a verification code must
+    # never be able to write it. If it could, a banned user would only have to
+    # get themselves back into the unverified state - changing their email
+    # address does exactly that - and then verify their way out of the ban.
+    profile = user.profile
+    profile.email_verified = True
+    profile.save(update_fields=['email_verified', 'updated_at'])
 
     return user
 
@@ -92,7 +125,7 @@ def start_phone_verification(user, phone_number=None):
 
     # Checked before issuing, so a request that is over the ceiling does not
     # also burn the resend cooldown.
-    _enforce_send_limits(profile, number)
+    _enforce_send_limits('sms', profile, number)
 
     # `code` is deliberately empty: under the Verify API there is no local code
     # to store. The row exists for the resend clock, the attempt count, and
@@ -109,7 +142,7 @@ def start_phone_verification(user, phone_number=None):
         otp.delete()
         raise
 
-    _record_send(profile, number)
+    _record_send('sms', profile, number)
     return otp
 
 
@@ -179,19 +212,30 @@ def verify_phone(user, code):
 # the check to four cache reads.
 
 
-def _send_limit_windows(profile, phone_number):
+def _send_limit_windows(channel, profile, destination):
     hour = settings.OTP_MAX_SENDS_PER_HOUR
     day = settings.OTP_MAX_SENDS_PER_DAY
+
+    # The destination is hashed rather than used raw. A phone number was
+    # already borderline; an email address is personal data, and cache keys
+    # surface in logs, in `redis-cli KEYS` output and in memory dumps. It also
+    # sidesteps the memcached key rules, which forbid spaces and control
+    # characters - an address is user-supplied and need not be well behaved.
+    # Lowercased first so Yul@x.com and yul@x.com share one budget.
+    target = hashlib.sha256(destination.strip().lower().encode()).hexdigest()[:32]
+
+    # `channel` keeps email and SMS on separate budgets. Sharing one would mean
+    # a user who verified their phone could not then be emailed.
     return [
-        (f'otp:sms:h:profile:{profile.pk}', 3600, hour),
-        (f'otp:sms:d:profile:{profile.pk}', 86400, day),
-        (f'otp:sms:h:number:{phone_number}', 3600, hour),
-        (f'otp:sms:d:number:{phone_number}', 86400, day),
+        (f'otp:{channel}:h:profile:{profile.pk}', 3600, hour),
+        (f'otp:{channel}:d:profile:{profile.pk}', 86400, day),
+        (f'otp:{channel}:h:dest:{target}', 3600, hour),
+        (f'otp:{channel}:d:dest:{target}', 86400, day),
     ]
 
 
-def _enforce_send_limits(profile, phone_number):
-    for key, _ttl, limit in _send_limit_windows(profile, phone_number):
+def _enforce_send_limits(channel, profile, destination):
+    for key, _ttl, limit in _send_limit_windows(channel, profile, destination):
         if (cache.get(key) or 0) >= limit:
             # Deliberately vague: naming which ceiling was hit tells an attacker
             # which axis to spread across.
@@ -200,8 +244,8 @@ def _enforce_send_limits(profile, phone_number):
             )
 
 
-def _record_send(profile, phone_number):
-    for key, ttl, _limit in _send_limit_windows(profile, phone_number):
+def _record_send(channel, profile, destination):
+    for key, ttl, _limit in _send_limit_windows(channel, profile, destination):
         # add() only writes when the key is absent, which is what starts the
         # window; incr() then bumps it without extending the expiry.
         cache.add(key, 0, ttl)

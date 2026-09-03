@@ -1,18 +1,31 @@
 """Tests for conversations, membership, messages and the realtime layer."""
 import shutil
 import tempfile
+from unittest import mock
 
 from channels.db import database_sync_to_async
 from channels.testing import WebsocketCommunicator
 from django.contrib.auth.models import User
+from django.core.cache import cache
+from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TransactionTestCase, override_settings
+from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from chat.models import Attachment, Conversation, Message, Participant
+from chat import membership
+from sms import inbound
+from chat.models import (
+    Attachment,
+    BlockedFromConversation,
+    Conversation,
+    Message,
+    Participant,
+)
+from chat.serializers import ConversationSerializer
 from chat.services import create_message
 from user.tests import EnvelopeAssertions, make_image_upload
 
@@ -24,7 +37,12 @@ def make_user(username, phone=None, password='a-strong-passphrase-42'):
         username=username, email=f'{username}@example.com', password=password
     )
     if phone:
+        # Verified in the same save, which is what Profile.save() treats as the
+        # verification flow rather than a number change. Unverified numbers are
+        # deliberately not resolvable by find_user, so a fixture that skipped
+        # this would make every lookup-by-number test fail for the wrong reason.
         user.profile.phone_number = phone
+        user.profile.phone_no_verified = True
         user.profile.save()
     return user
 
@@ -125,6 +143,271 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
             )
         )
         self.assertIn('ghost', str(body['data']))
+
+    # -- a group's description and image -----------------------------------
+
+    def test_a_group_can_be_created_with_a_description(self):
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Trip', 'description': 'Palawan, March.'},
+                format='json',
+            ),
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(data['description'], 'Palawan, March.')
+
+    def test_a_group_created_without_one_has_a_blank_description(self):
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-group'), {'name': 'Trip'}, format='json'
+            ),
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(data['description'], '')
+        self.assertIsNone(data['image_url'])
+
+    def test_a_description_longer_than_the_column_is_rejected(self):
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Trip', 'description': 'x' * 281},
+                format='json',
+            )
+        )
+
+    def test_a_group_can_be_created_with_an_image(self):
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Trip', 'image': make_image_upload('group.png')},
+                format='multipart',
+            ),
+            status.HTTP_201_CREATED,
+        )
+        self.assertTrue(data['image_url'].startswith('http'))
+
+        conversation = Conversation.objects.get(pk=data['id'])
+        # Filed under the conversation, not under the literal string 'None':
+        # a FileField is written before the INSERT, so start_group has to
+        # attach the image in a second save to have a pk to file it by.
+        self.assertTrue(
+            conversation.image.name.startswith(f'chat/{conversation.pk}/group/'),
+            conversation.image.name,
+        )
+
+    def test_a_failed_image_upload_leaves_no_conversation_behind(self):
+        # The storage write is a network call to S3 in staging and production,
+        # and it sits between the INSERT and add_participant. Without the
+        # atomic block on start_group a timeout would commit a conversation
+        # with no participants - and access control here IS the queryset, so
+        # such a row is invisible to its own creator and unreachable forever.
+        with mock.patch.object(
+            default_storage, '_save', side_effect=OSError('S3 timed out')
+        ):
+            # loopd/exceptions.py turns the unhandled error into a 500 inside
+            # the envelope, so nothing escapes the client.
+            self.assertFailure(
+                self.client.post(
+                    reverse('chat:conversation-group'),
+                    {'name': 'Doomed', 'image': make_image_upload('group.png')},
+                    format='multipart',
+                ),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        self.assertFalse(Conversation.objects.filter(name='Doomed').exists())
+        self.assertFalse(
+            Participant.objects.filter(conversation__name='Doomed').exists()
+        )
+
+    def test_the_uploaded_filename_is_not_the_stored_one(self):
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Trip', 'image': make_image_upload('IMG_0001.png')},
+                format='multipart',
+            ),
+            status.HTTP_201_CREATED,
+        )
+        conversation = Conversation.objects.get(pk=data['id'])
+        self.assertNotIn('IMG_0001', conversation.image.name)
+        self.assertTrue(conversation.image.name.endswith('.png'))
+
+    @override_settings(MAX_GROUP_IMAGE_UPLOAD_BYTES=10)
+    def test_an_oversized_group_image_is_rejected(self):
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Trip', 'image': make_image_upload('group.png')},
+                format='multipart',
+            )
+        )
+        self.assertFalse(Conversation.objects.filter(name='Trip').exists())
+
+    def test_a_file_that_is_not_an_image_is_rejected(self):
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {
+                    'name': 'Trip',
+                    'image': SimpleUploadedFile(
+                        'notes.png', b'not an image', content_type='image/png'
+                    ),
+                },
+                format='multipart',
+            )
+        )
+
+    def test_the_group_photo_is_visible_to_every_member(self):
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {
+                    'name': 'Trip',
+                    'description': 'Palawan, March.',
+                    'members': ['bob'],
+                    'image': make_image_upload('group.png'),
+                },
+                format='multipart',
+            ),
+            status.HTTP_201_CREATED,
+        )
+
+        self.client.force_authenticate(self.bob)
+        seen = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-detail', args=[data['id']]))
+        )
+        self.assertEqual(seen['description'], 'Palawan, March.')
+        self.assertEqual(seen['image_url'], data['image_url'])
+
+    def test_a_direct_conversation_carries_neither(self):
+        data = self.assertSuccess(
+            self.client.post(reverse('chat:conversation-direct'), {'identifier': 'bob'})
+        )
+        self.assertEqual(data['description'], '')
+        self.assertIsNone(data['image_url'])
+
+    def test_a_broadcast_payload_carries_the_image_as_a_relative_path(self):
+        # broadcast_added_to_conversation serialises with no request, so there
+        # is no host to build an absolute URL from. Clients resolve it against
+        # the API host they already know - the same rule as an attachment.
+        conversation = Conversation.start_group(
+            self.alice, 'Trip', image=make_image_upload('group.png')
+        )
+        payload = ConversationSerializer(conversation).data
+        self.assertTrue(payload['image_url'].startswith('/'), payload['image_url'])
+
+    # -- editing a group ---------------------------------------------------
+
+    def patch_settings(self, conversation, payload, multipart=False):
+        """PATCH the group settings route.
+
+        Multipart PATCH needs encoding by hand: the test client's patch()
+        defaults to application/octet-stream - only post() defaults to
+        multipart - which DRF answers with a 415.
+        """
+        url = reverse('chat:conversation-settings', args=[conversation.id])
+        if multipart:
+            return self.client.patch(
+                url,
+                encode_multipart(BOUNDARY, payload),
+                content_type=MULTIPART_CONTENT,
+            )
+        return self.client.patch(url, payload, format='json')
+
+    def test_an_admin_can_rename_a_group_and_edit_its_description(self):
+        group = Conversation.start_group(self.alice, 'Trip', description='Draft.')
+        data = self.assertSuccess(
+            self.patch_settings(group, {'name': 'Palawan', 'description': 'Booked.'})
+        )
+        self.assertEqual(data['name'], 'Palawan')
+        self.assertEqual(data['description'], 'Booked.')
+
+    def test_editing_one_field_leaves_the_others_alone(self):
+        group = Conversation.start_group(self.alice, 'Trip', description='Booked.')
+        data = self.assertSuccess(self.patch_settings(group, {'name': 'Palawan'}))
+        self.assertEqual(data['description'], 'Booked.')
+
+    def test_an_admin_can_replace_the_group_photo(self):
+        group = Conversation.start_group(
+            self.alice, 'Trip', image=make_image_upload('first.png')
+        )
+        first = group.image.name
+
+        data = self.assertSuccess(
+            self.patch_settings(
+                group, {'image': make_image_upload('second.png')}, multipart=True
+            )
+        )
+        self.assertIsNotNone(data['image_url'])
+
+        group.refresh_from_db()
+        self.assertNotEqual(group.image.name, first)
+
+    def test_an_admin_can_remove_the_group_photo(self):
+        group = Conversation.start_group(
+            self.alice, 'Trip', image=make_image_upload('group.png')
+        )
+        data = self.assertSuccess(
+            self.patch_settings(group, {'image': ''}, multipart=True)
+        )
+        self.assertIsNone(data['image_url'])
+
+        group.refresh_from_db()
+        self.assertFalse(group.image)
+
+    @override_settings(MAX_GROUP_IMAGE_UPLOAD_BYTES=10)
+    def test_an_oversized_replacement_photo_is_rejected(self):
+        group = Conversation.start_group(self.alice, 'Trip')
+        self.assertFailure(
+            self.patch_settings(
+                group, {'image': make_image_upload('group.png')}, multipart=True
+            )
+        )
+        group.refresh_from_db()
+        self.assertFalse(group.image)
+
+    def test_a_group_name_cannot_be_blanked(self):
+        group = Conversation.start_group(self.alice, 'Trip')
+        self.assertFailure(self.patch_settings(group, {'name': ''}))
+        group.refresh_from_db()
+        self.assertEqual(group.name, 'Trip')
+
+    def test_a_plain_member_cannot_edit_the_group(self):
+        group = Conversation.start_group(self.alice, 'Trip')
+        group.add_participant(self.bob)
+
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.patch_settings(group, {'name': 'Hijacked'}),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_a_stranger_cannot_edit_the_group(self):
+        group = Conversation.start_group(self.alice, 'Trip')
+
+        # 404, not 403: the queryset is the access control, so a non-member
+        # cannot even learn that this conversation exists.
+        self.client.force_authenticate(self.carol)
+        self.assertFailure(
+            self.patch_settings(group, {'name': 'Hijacked'}),
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_a_direct_conversation_has_no_settings_to_edit(self):
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        self.assertFailure(self.patch_settings(conversation, {'name': 'Nope'}))
+
+    def test_editing_a_group_does_not_bump_it_up_the_conversation_list(self):
+        # updated_at is the list's last-activity sort key. Fixing a typo is
+        # not activity, so it must not jump the group over a live thread.
+        group = Conversation.start_group(self.alice, 'Trip')
+        before = Conversation.objects.get(pk=group.pk).updated_at
+
+        self.assertSuccess(self.patch_settings(group, {'description': 'Booked.'}))
+
+        self.assertEqual(Conversation.objects.get(pk=group.pk).updated_at, before)
 
     # -- membership --------------------------------------------------------
 
@@ -500,3 +783,1307 @@ class ChatWebsocketTests(TransactionTestCase):
         self.assertEqual(stored, 0)
 
         await communicator.disconnect()
+
+
+class PhoneOnlyParticipantTests(EnvelopeAssertions, APITestCase):
+    """Members who have a phone number but no LoopD account.
+
+    Nothing in this class sends anything - the schema has to support these
+    people well before the SMS machinery that talks to them exists. What is
+    under test is that they can be represented at all, that the database
+    refuses the malformed shapes, and above all that their presence does not
+    widen anybody's access to the conversation.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice', phone='+639170000001')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.client.force_authenticate(self.alice)
+
+    def add_mom(self, number='+639171111111', name='Mom'):
+        return self.group.add_phone_participant(
+            number, display_name=name, added_by=self.alice
+        )
+
+    # --- the shape itself ---------------------------------------------------
+
+    def test_a_member_can_be_a_phone_number_with_no_account(self):
+        mom = self.add_mom()
+        self.assertIsNone(mom.user_id)
+        self.assertTrue(mom.is_phone_only)
+        self.assertEqual(mom.display_label, 'Mom')
+        self.assertTrue(self.group.has_phone_participant('+639171111111'))
+
+    def test_adding_the_same_number_twice_is_harmless(self):
+        first = self.add_mom()
+        second = self.add_mom()
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(self.group.participants.count(), 2)
+
+    def test_an_account_member_still_labels_from_their_own_profile(self):
+        # display_name is whatever whoever added them typed once; a real
+        # profile is the name they keep current, so it has to win.
+        self.group.add_participant(self.bob)
+        participant = self.group.participants.get(user=self.bob)
+        self.assertEqual(participant.display_label, self.bob.profile.display_label)
+
+    # --- what the database refuses -----------------------------------------
+
+    def test_a_membership_must_identify_somebody(self):
+        from django.db.utils import IntegrityError
+
+        with self.assertRaises(IntegrityError):
+            Participant.objects.create(conversation=self.group)
+
+    def test_a_phone_only_member_must_have_a_name(self):
+        # Otherwise the group renders a bare phone number to everybody in it,
+        # which the per-group-number design exists to avoid.
+        from django.db.utils import IntegrityError
+
+        with self.assertRaises(IntegrityError):
+            Participant.objects.create(
+                conversation=self.group, phone_number='+639172222222'
+            )
+
+    def test_the_same_number_cannot_join_one_group_twice(self):
+        from django.db.utils import IntegrityError
+
+        self.add_mom()
+        with self.assertRaises(IntegrityError):
+            Participant.objects.create(
+                conversation=self.group,
+                phone_number='+639171111111',
+                display_name='Mum',
+            )
+
+    def test_the_same_number_may_be_in_two_different_groups(self):
+        other = Conversation.start_group(self.alice, name='Work')
+        self.add_mom()
+        other.add_phone_participant('+639171111111', display_name='Mom')
+        self.assertEqual(
+            Participant.objects.filter(phone_number='+639171111111').count(), 2
+        )
+
+    # --- access control is unchanged ---------------------------------------
+
+    def test_a_phone_only_member_grants_nobody_access(self):
+        # The access-control queryset is `participants__user=request.user`.
+        # A row with a NULL user must never satisfy it for anyone.
+        self.add_mom()
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id])),
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_a_phone_only_member_does_not_appear_in_anyones_conversation_list(self):
+        self.add_mom()
+        self.client.force_authenticate(self.bob)
+        data = self.assertSuccess(self.client.get(reverse('chat:conversation-list')))
+        self.assertEqual(data['results'], [])
+
+    def test_the_group_still_lists_normally_for_a_real_member(self):
+        self.add_mom()
+        data = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
+        )
+        labels = {p['display_label'] for p in data['participants']}
+        self.assertEqual(labels, {self.alice.profile.display_label, 'Mom'})
+
+        mom = next(p for p in data['participants'] if p['is_phone_only'])
+        self.assertIsNone(mom['user'])
+        # Everybody receives texts by default. A member verifies their number
+        # when they sign up precisely so their groups can reach them on it, and
+        # having the app installed does not change that - the app and SMS are
+        # two ways into one conversation.
+        self.assertTrue(mom['sms_enabled'])
+        alice_row = next(p for p in data['participants'] if not p['is_phone_only'])
+        self.assertTrue(alice_row['sms_enabled'])
+
+    # --- registering later claims the row rather than duplicating it -------
+
+    def test_registering_claims_the_phone_row_instead_of_adding_a_second(self):
+        mom = self.add_mom(number='+639171111111')
+        # She registers and verifies that number.
+        real_mom = make_user('mom', phone='+639171111111')
+
+        claimed = self.group.add_participant(real_mom)
+
+        self.assertEqual(claimed.pk, mom.pk)
+        self.assertEqual(claimed.user_id, real_mom.pk)
+        self.assertEqual(self.group.participants.count(), 2)
+        # Her own profile name now wins over whatever alice typed.
+        self.assertEqual(claimed.display_label, real_mom.profile.display_label)
+
+    def test_claiming_keeps_the_messages_she_texted_in(self):
+        mom = self.add_mom(number='+639171111111')
+        create_message(
+            conversation=self.group,
+            sender=None,
+            text='On my way',
+            source=Message.Source.SMS,
+            participant=mom,
+        )
+        real_mom = make_user('mom', phone='+639171111111')
+        claimed = self.group.add_participant(real_mom)
+
+        message = Message.objects.get(text='On my way')
+        self.assertEqual(message.sender_participant_id, claimed.pk)
+
+    def test_an_unverified_number_never_claims_somebody_elses_row(self):
+        # The number is the only evidence of who this row belongs to, so an
+        # unproven claim on it must not hand over the membership.
+        self.add_mom(number='+639171111111')
+        impostor = User.objects.create_user(username='eve', password='x')
+        impostor.profile.phone_number = '+639171111111'
+        impostor.profile.save()
+
+        self.group.add_participant(impostor)
+
+        self.assertEqual(self.group.participants.count(), 3)
+        self.assertTrue(
+            self.group.participants.filter(
+                user__isnull=True, phone_number='+639171111111'
+            ).exists()
+        )
+
+    def test_being_in_twice_merges_down_to_one_row(self):
+        # Reachable via the admin or the shell: added as an account, and
+        # separately as a number that later gets verified.
+        bob_row = self.group.add_participant(self.bob)
+        phone_row = self.group.add_phone_participant(
+            self.bob.profile.phone_number, display_name='Bobby', added_by=self.alice
+        )
+        create_message(
+            conversation=self.group,
+            sender=None,
+            text='texted in',
+            source=Message.Source.SMS,
+            participant=phone_row,
+        )
+
+        survivor = self.group.add_participant(self.bob)
+
+        self.assertEqual(survivor.pk, bob_row.pk)
+        self.assertFalse(Participant.objects.filter(pk=phone_row.pk).exists())
+        # The history moved across rather than being orphaned by SET_NULL.
+        self.assertEqual(
+            Message.objects.get(text='texted in').sender_participant_id, bob_row.pk
+        )
+
+    # --- messages from somebody with no account ----------------------------
+
+    def test_a_message_can_be_sent_by_a_phone_only_member(self):
+        mom = self.add_mom()
+        message = create_message(
+            conversation=self.group,
+            sender=None,
+            text='On my way',
+            source=Message.Source.SMS,
+            participant=mom,
+        )
+        self.assertIsNone(message.sender_id)
+        self.assertEqual(message.sender_participant_id, mom.pk)
+        self.assertEqual(message.source, Message.Source.SMS)
+        self.assertEqual(message.sender_label, 'Mom')
+
+    def test_such_a_message_serialises_to_the_same_shape_as_any_other(self):
+        # Every client reads sender.profile.display_label. If a sender with no
+        # account came back as null, all of them would break on one message.
+        mom = self.add_mom()
+        create_message(
+            conversation=self.group,
+            sender=None,
+            text='On my way',
+            source=Message.Source.SMS,
+            participant=mom,
+        )
+        data = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-messages', args=[self.group.id]))
+        )
+        row = data['results'][0]
+        self.assertEqual(row['source'], 'sms')
+        self.assertEqual(row['sender']['profile']['display_label'], 'Mom')
+        self.assertIsNone(row['sender']['id'])
+        self.assertIsNone(row['sender']['username'])
+
+    def test_an_ordinary_message_is_unchanged_and_credits_its_membership(self):
+        message = create_message(
+            conversation=self.group, sender=self.alice, text='hello'
+        )
+        self.assertEqual(message.source, Message.Source.APP)
+        # Resolved automatically, so no existing caller had to change.
+        self.assertIsNotNone(message.sender_participant_id)
+        self.assertEqual(message.sender_participant.user_id, self.alice.pk)
+
+
+class MembershipStateTests(EnvelopeAssertions, APITestCase):
+    """Joining, leaving, approval, removal, blocking and muting.
+
+    The rule under test throughout is that `Participant.status` is honoured
+    everywhere, not just where it was convenient: a row that is not ACTIVE must
+    not read history, appear in a member list, or reach the access-control
+    queryset.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice', phone='+639170000001')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.client.force_authenticate(self.alice)
+
+    def join_as(self, user, code=None):
+        self.client.force_authenticate(user)
+        return self.client.post(
+            reverse('chat:conversation-join'),
+            {'code': code if code is not None else self.group.join_code},
+            format='json',
+        )
+
+    def set_mode(self, mode):
+        self.group.join_mode = mode
+        self.group.save(update_fields=['join_mode'])
+
+    # --- join codes and modes ----------------------------------------------
+
+    def test_a_new_group_gets_a_join_code_and_is_invite_only(self):
+        self.assertTrue(self.group.join_code)
+        self.assertEqual(self.group.join_mode, Conversation.JoinMode.INVITE)
+
+    def test_invite_only_refuses_a_join_even_with_the_right_code(self):
+        self.assertFailure(self.join_as(self.bob))
+        self.assertFalse(self.group.has_participant(self.bob))
+
+    def test_open_lets_somebody_straight_in(self):
+        self.set_mode(Conversation.JoinMode.OPEN)
+        self.assertSuccess(self.join_as(self.bob))
+        self.assertTrue(self.group.has_participant(self.bob))
+
+    def test_a_wrong_code_is_refused(self):
+        self.set_mode(Conversation.JoinMode.OPEN)
+        self.assertFailure(self.join_as(self.bob, code='WRONGX'))
+        self.assertFalse(self.group.has_participant(self.bob))
+
+    def test_a_code_is_matched_case_insensitively(self):
+        # It gets read off a screen and typed into a text message.
+        self.set_mode(Conversation.JoinMode.CODE)
+        self.assertSuccess(self.join_as(self.bob, code=self.group.join_code.lower()))
+        self.assertTrue(self.group.has_participant(self.bob))
+
+    def test_regenerating_the_code_invalidates_the_old_one(self):
+        self.set_mode(Conversation.JoinMode.OPEN)
+        old = self.group.join_code
+        self.group.regenerate_join_code()
+        self.assertFailure(self.join_as(self.bob, code=old))
+
+    def test_joining_twice_does_not_make_two_rows(self):
+        self.set_mode(Conversation.JoinMode.OPEN)
+        self.assertSuccess(self.join_as(self.bob))
+        self.assertSuccess(self.join_as(self.bob))
+        self.assertEqual(self.group.participants.filter(user=self.bob).count(), 1)
+
+    # --- approval ----------------------------------------------------------
+
+    def test_approval_mode_makes_a_pending_request_not_a_member(self):
+        self.set_mode(Conversation.JoinMode.APPROVAL)
+        self.assertSuccess(self.join_as(self.bob))
+
+        row = self.group.participants.get(user=self.bob)
+        self.assertEqual(row.status, Participant.Status.PENDING)
+        # Pending is not membership: no history, no listing.
+        self.assertFalse(self.group.has_participant(self.bob))
+        self.assertFailure(
+            self.client.get(
+                reverse('chat:conversation-messages', args=[self.group.id])
+            ),
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_an_admin_sees_and_approves_a_pending_request(self):
+        self.set_mode(Conversation.JoinMode.APPROVAL)
+        self.join_as(self.bob)
+
+        self.client.force_authenticate(self.alice)
+        url = reverse('chat:conversation-requests', args=[self.group.id])
+        waiting = self.assertSuccess(self.client.get(url))
+        self.assertEqual([r['display_label'] for r in waiting],
+                         [self.bob.profile.display_label])
+
+        row = self.group.participants.get(user=self.bob)
+        self.assertSuccess(
+            self.client.post(url, {'participant': row.pk, 'decision': 'approve'},
+                             format='json')
+        )
+        self.assertTrue(self.group.has_participant(self.bob))
+
+    def test_declining_leaves_them_out(self):
+        self.set_mode(Conversation.JoinMode.APPROVAL)
+        self.join_as(self.bob)
+        row = self.group.participants.get(user=self.bob)
+
+        self.client.force_authenticate(self.alice)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-requests', args=[self.group.id]),
+                {'participant': row.pk, 'decision': 'decline'},
+                format='json',
+            )
+        )
+        self.assertFalse(self.group.has_participant(self.bob))
+
+    def test_a_plain_member_cannot_review_requests(self):
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.get(reverse('chat:conversation-requests', args=[self.group.id])),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    # --- leaving, removal, blocking ----------------------------------------
+
+    def test_leaving_ends_access_but_keeps_the_messages(self):
+        self.group.add_participant(self.bob)
+        create_message(conversation=self.group, sender=self.bob, text='bye')
+
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.post(reverse('chat:conversation-leave', args=[self.group.id]))
+        )
+
+        self.assertFalse(self.group.has_participant(self.bob))
+        self.assertFailure(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id])),
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.assertTrue(Message.objects.filter(text='bye').exists())
+
+    def test_rejoining_after_leaving_reuses_the_row(self):
+        self.set_mode(Conversation.JoinMode.OPEN)
+        self.group.add_participant(self.bob)
+        membership.leave(self.group.participants.get(user=self.bob))
+
+        self.assertSuccess(self.join_as(self.bob))
+        self.assertEqual(self.group.participants.filter(user=self.bob).count(), 1)
+        self.assertTrue(self.group.has_participant(self.bob))
+
+    def test_an_admin_removes_a_member(self):
+        self.group.add_participant(self.bob)
+        row = self.group.participants.get(user=self.bob)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-remove', args=[self.group.id]),
+                {'participant': row.pk},
+                format='json',
+            )
+        )
+        self.assertFalse(self.group.has_participant(self.bob))
+
+    def test_a_blocked_member_cannot_get_back_in_by_any_route(self):
+        self.set_mode(Conversation.JoinMode.OPEN)
+        self.group.add_participant(self.bob)
+        row = self.group.participants.get(user=self.bob)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-remove', args=[self.group.id]),
+                {'participant': row.pk, 'block': True},
+                format='json',
+            )
+        )
+
+        # Not by joining, even though the group is wide open. The refusal is
+        # indistinguishable from a wrong code, on purpose.
+        self.assertFailure(self.join_as(self.bob))
+        # ...and not by an admin adding them back.
+        self.client.force_authenticate(self.alice)
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-members', args=[self.group.id]),
+                {'members': ['bob']},
+                format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertFalse(self.group.has_participant(self.bob))
+
+    def test_the_last_admin_cannot_be_removed(self):
+        # Otherwise the group is left with nobody who can approve, add or edit.
+        row = self.group.participants.get(user=self.alice)
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-remove', args=[self.group.id]),
+                {'participant': row.pk},
+                format='json',
+            )
+        )
+
+    def test_a_plain_member_cannot_remove_anybody(self):
+        self.group.add_participant(self.bob)
+        alice_row = self.group.participants.get(user=self.alice)
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-remove', args=[self.group.id]),
+                {'participant': alice_row.pk},
+                format='json',
+            )
+        )
+
+    # --- muting ------------------------------------------------------------
+
+    def test_muting_keeps_membership_but_records_the_choice(self):
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.bob)
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-delivery', args=[self.group.id]),
+                {'muted': True},
+                format='json',
+            )
+        )
+        self.assertTrue(data['muted'])
+        # Still a member: mute silences delivery, it does not remove anybody.
+        self.assertTrue(self.group.has_participant(self.bob))
+        self.assertSuccess(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
+        )
+
+    # --- the member list ---------------------------------------------------
+
+    def test_inactive_rows_never_appear_in_the_member_list(self):
+        self.group.add_participant(self.bob)
+        carol = make_user('carol')
+        self.group.add_participant(carol)
+        membership.leave(self.group.participants.get(user=carol))
+
+        data = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
+        )
+        labels = {p['display_label'] for p in data['participants']}
+        self.assertEqual(
+            labels,
+            {self.alice.profile.display_label, self.bob.profile.display_label},
+        )
+
+
+class BlockedMemberCannotReturnTests(EnvelopeAssertions, APITestCase):
+    """A block must hold whichever identifier the person comes back with.
+
+    One human has up to two: an account and a phone number. Every one of these
+    was a real hole - blocking by one left the other wide open.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice', phone='+639170000001')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.join_mode = Conversation.JoinMode.OPEN
+        self.group.save(update_fields=['join_mode'])
+        self.client.force_authenticate(self.alice)
+
+    def block(self, participant):
+        return membership.remove(participant, self.alice, block=True)
+
+    def test_blocked_by_account_cannot_return_by_texting_join(self):
+        bob = make_user('bob', phone='+639170000002')
+        self.block(self.group.add_participant(bob))
+
+        result = inbound.handle_inbound(self.group, '+639170000002', 'JOIN')
+
+        self.assertEqual(result.action, 'refused_blocked')
+        self.assertIsNone(result.reply)
+        self.assertFalse(self.group.has_participant(bob))
+        self.assertEqual(self.group.participants.count(), 2)
+
+    def test_blocked_by_account_cannot_post_by_text_either(self):
+        bob = make_user('bob', phone='+639170000002')
+        self.block(self.group.add_participant(bob))
+
+        result = inbound.handle_inbound(self.group, '+639170000002', 'hello?')
+
+        self.assertEqual(result.action, 'ignored_unknown_sender')
+        self.assertEqual(Message.objects.count(), 0)
+
+    def test_blocked_by_number_cannot_return_by_registering_an_account(self):
+        phone_row = self.group.add_phone_participant(
+            '+639170000003', display_name='Mom', added_by=self.alice
+        )
+        self.block(phone_row)
+
+        # They register and verify the very number that was blocked.
+        mom = make_user('mom', phone='+639170000003')
+        self.client.force_authenticate(mom)
+        refused = self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-join'),
+                {'code': self.group.join_code},
+                format='json',
+            )
+        )
+        self.assertFalse(self.group.has_participant(mom))
+
+        # And the refusal is word-for-word what a wrong code gets. A blocked
+        # person who could tell the two apart would know their guessed code is
+        # real, which is the whole of what code-harvesting needs.
+        wrong = self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-join'), {'code': 'ZZZZZZ'}, format='json'
+            )
+        )
+        self.assertEqual(refused, wrong)
+
+    def test_an_admin_cannot_re_add_a_blocked_number_by_username(self):
+        # The prefetch cache hid the blocked row from add_participant, so this
+        # quietly succeeded and created a fresh active row.
+        phone_row = self.group.add_phone_participant(
+            '+639170000004', display_name='Mom', added_by=self.alice
+        )
+        self.block(phone_row)
+        mom = make_user('mom', phone='+639170000004')
+
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-members', args=[self.group.id]),
+                {'members': ['mom']},
+                format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertFalse(self.group.has_participant(mom))
+
+    def test_removing_without_block_never_lifts_an_existing_block(self):
+        bob = make_user('bob', phone='+639170000002')
+        row = self.block(self.group.add_participant(bob))
+
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-remove', args=[self.group.id]),
+                {'participant': row.pk, 'block': False},
+                format='json',
+            )
+        )
+        row.refresh_from_db()
+        self.assertEqual(row.status, Participant.Status.BLOCKED)
+
+
+class MembershipGuardTests(EnvelopeAssertions, APITestCase):
+    """Guards that stop a group being stranded or a thread being lost."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.client.force_authenticate(self.alice)
+
+    def test_the_last_admin_cannot_leave(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+
+        self.assertFailure(
+            self.client.post(reverse('chat:conversation-leave', args=[group.id]))
+        )
+        self.assertTrue(group.is_admin(self.alice))
+
+    def test_an_admin_can_leave_once_there_is_another(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob, role=Participant.Role.ADMIN)
+
+        self.assertSuccess(
+            self.client.post(reverse('chat:conversation-leave', args=[group.id]))
+        )
+        self.assertFalse(group.has_participant(self.alice))
+
+    def test_you_cannot_leave_a_one_to_one_conversation(self):
+        # There is no way back into one: start_direct finds the existing row by
+        # direct_key and never reactivates a membership, so leaving would lock
+        # somebody out permanently while the other person kept writing.
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-leave', args=[conversation.id])
+            )
+        )
+        self.assertTrue(conversation.has_participant(self.alice))
+
+    def test_an_invite_only_code_is_indistinguishable_from_a_wrong_one(self):
+        # Otherwise the endpoint confirms which codes are real.
+        group = Conversation.start_group(self.alice, name='Private')
+        self.client.force_authenticate(self.bob)
+
+        real = self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-join'),
+                {'code': group.join_code},
+                format='json',
+            )
+        )
+        wrong = self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-join'), {'code': 'ZZZZZZ'}, format='json'
+            )
+        )
+        self.assertEqual(str(real['message']), str(wrong['message']))
+
+
+class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
+    """Handing over a group, and controlling how people get into it."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.alice)
+
+    def role_url(self):
+        return reverse('chat:conversation-role', args=[self.group.id])
+
+    def code_url(self):
+        return reverse('chat:conversation-join-code', args=[self.group.id])
+
+    def settings_url(self):
+        return reverse('chat:conversation-settings', args=[self.group.id])
+
+    def row(self, user):
+        return Participant.objects.get(conversation=self.group, user=user)
+
+    # --- handover -----------------------------------------------------------
+
+    def test_the_only_admin_can_hand_over_and_then_leave(self):
+        # The whole point of the role endpoint: leave and remove both refuse to
+        # take the last admin, so without this the founder is stuck forever.
+        self.assertFailure(
+            self.client.post(reverse('chat:conversation-leave', args=[self.group.id]))
+        )
+
+        self.assertSuccess(
+            self.client.post(
+                self.role_url(),
+                {'participant': self.row(self.bob).pk, 'role': 'admin'},
+                format='json',
+            )
+        )
+        self.assertSuccess(
+            self.client.post(reverse('chat:conversation-leave', args=[self.group.id]))
+        )
+        self.assertFalse(self.group.has_participant(self.alice))
+        self.assertTrue(self.group.is_admin(self.bob))
+
+    def test_the_last_admin_cannot_demote_themselves(self):
+        self.assertFailure(
+            self.client.post(
+                self.role_url(),
+                {'participant': self.row(self.alice).pk, 'role': 'member'},
+                format='json',
+            )
+        )
+        self.assertTrue(self.group.is_admin(self.alice))
+
+    def test_a_plain_member_cannot_promote_anybody(self):
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.post(
+                self.role_url(),
+                {'participant': self.row(self.bob).pk, 'role': 'admin'},
+                format='json',
+            )
+        )
+        self.assertFalse(self.group.is_admin(self.bob))
+
+    def test_somebody_with_no_account_cannot_be_made_admin(self):
+        # Every admin action is an authenticated REST call, so the role would be
+        # unusable - while still counting towards the last-admin guard.
+        mom = self.group.add_phone_participant(
+            '+639171111111', display_name='Mom', added_by=self.alice
+        )
+        self.assertFailure(
+            self.client.post(
+                self.role_url(), {'participant': mom.pk, 'role': 'admin'}, format='json'
+            )
+        )
+
+    def test_a_removed_member_cannot_be_promoted(self):
+        membership.remove(self.row(self.bob), self.alice)
+        self.assertFailure(
+            self.client.post(
+                self.role_url(),
+                {'participant': self.row(self.bob).pk, 'role': 'admin'},
+                format='json',
+            )
+        )
+
+    # --- join settings ------------------------------------------------------
+
+    def test_an_admin_changes_how_people_join(self):
+        data = self.assertSuccess(
+            self.client.patch(
+                self.settings_url(), {'settings': {'join_mode': 'approval'}}, format='json'
+            )
+        )
+        self.assertEqual(data['join_mode'], 'approval')
+
+    def test_switching_to_code_mode_guarantees_there_is_a_code(self):
+        # A group can predate join codes, or have had one revoked; the setting
+        # must not claim a mode the group cannot actually serve.
+        Conversation.objects.filter(pk=self.group.pk).update(join_code=None)
+        self.assertSuccess(
+            self.client.patch(self.settings_url(), {'settings': {'join_mode': 'code'}}, format='json')
+        )
+        self.group.refresh_from_db()
+        self.assertTrue(self.group.join_code)
+
+    def test_editing_settings_does_not_bump_the_group_up_the_list(self):
+        before = Conversation.objects.get(pk=self.group.pk).updated_at
+        self.assertSuccess(
+            self.client.patch(self.settings_url(), {'settings': {'join_mode': 'open'}}, format='json')
+        )
+        self.assertEqual(Conversation.objects.get(pk=self.group.pk).updated_at, before)
+
+    # --- the join code ------------------------------------------------------
+
+    def test_an_admin_reads_and_reissues_the_code(self):
+        first = self.assertSuccess(self.client.get(self.code_url()))['join_code']
+        self.assertEqual(first, self.group.join_code)
+
+        second = self.assertSuccess(self.client.post(self.code_url()))['join_code']
+        self.assertNotEqual(first, second)
+
+    def test_reissuing_invalidates_the_old_code(self):
+        self.group.join_mode = Conversation.JoinMode.OPEN
+        self.group.save(update_fields=['join_mode'])
+        old = self.group.join_code
+        self.client.post(self.code_url())
+
+        carol = make_user('carol')
+        self.client.force_authenticate(carol)
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-join'), {'code': old}, format='json'
+            )
+        )
+
+    def test_a_plain_member_cannot_see_the_join_code(self):
+        # It is the thing that lets a stranger in, so it stays with the people
+        # who administer the group rather than on every conversation fetch.
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(self.client.get(self.code_url()), status.HTTP_403_FORBIDDEN)
+
+    def test_the_join_code_is_not_in_the_conversation_payload(self):
+        data = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
+        )
+        self.assertNotIn('join_code', data)
+        self.assertIn('join_mode', data)
+
+
+class BroadcastModeTests(EnvelopeAssertions, APITestCase):
+    """A group where admins announce and members receive.
+
+    Enforced in `create_message`, the single write path, so REST, the websocket
+    and inbound SMS all obey it without each remembering to.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Announcements')
+        self.group.add_participant(self.bob)
+        self.group.mode = Conversation.Mode.BROADCAST
+        self.group.save(update_fields=['mode'])
+        self.client.force_authenticate(self.alice)
+
+    def messages_url(self):
+        return reverse('chat:conversation-messages', args=[self.group.id])
+
+    def test_an_admin_can_post(self):
+        self.assertSuccess(
+            self.client.post(self.messages_url(), {'text': 'Office closed Monday'}),
+            status.HTTP_201_CREATED,
+        )
+
+    def test_a_member_cannot_post(self):
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.post(self.messages_url(), {'text': 'why not'}),
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(Message.objects.count(), 0)
+
+    def test_a_member_can_still_read(self):
+        # Broadcast restricts speaking, not membership.
+        self.client.post(self.messages_url(), {'text': 'Office closed Monday'})
+        self.client.force_authenticate(self.bob)
+        data = self.assertSuccess(self.client.get(self.messages_url()))
+        self.assertEqual(
+            [m['text'] for m in data['results']], ['Office closed Monday']
+        )
+
+    def test_a_member_texting_in_is_told_rather_than_ignored(self):
+        # They are a member in good standing; silence would read as breakage.
+        result = inbound.handle_inbound(self.group, '+639170000002', 'why not')
+        self.assertEqual(result.action, 'refused_broadcast')
+        self.assertIn('announcements only', result.reply)
+        self.assertEqual(Message.objects.count(), 0)
+
+    def test_an_admin_texting_in_still_posts(self):
+        self.alice.profile.phone_number = '+639170000001'
+        self.alice.profile.phone_no_verified = True
+        self.alice.profile.save()
+
+        result = inbound.handle_inbound(self.group, '+639170000001', 'Office closed')
+        self.assertEqual(result.action, 'posted')
+
+    def test_switching_back_to_chat_lets_members_post_again(self):
+        self.assertSuccess(
+            self.client.patch(
+                reverse('chat:conversation-settings', args=[self.group.id]),
+                {'settings': {'mode': 'chat'}},
+                format='json',
+            )
+        )
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.post(self.messages_url(), {'text': 'thanks'}),
+            status.HTTP_201_CREATED,
+        )
+
+    def test_a_member_still_cannot_post_over_the_websocket(self):
+        # The check is at the write path, so every entry point inherits it.
+        from chat.models import PostingNotAllowed
+        from chat.services import create_message
+
+        with self.assertRaises(PostingNotAllowed):
+            create_message(conversation=self.group, sender=self.bob, text='sneaking in')
+
+
+class SplitIdentityTests(EnvelopeAssertions, APITestCase):
+    """One human holding two rows - an account and a phone number.
+
+    Every bug here was a case where the two halves of one person were treated
+    as two people. The earlier tests only ever built a single row, which is
+    exactly why they passed while blocking was bypassable.
+    """
+
+    def setUp(self):
+        # The inbound rate limits are cache-backed and shared across tests.
+        cache.clear()
+        self.alice = make_user('alice')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.join_mode = Conversation.JoinMode.OPEN
+        self.group.save(update_fields=['join_mode'])
+        self.number = '+639170000002'
+
+    def two_rows_for_bob(self):
+        """Bob as an account AND as a phone number - a reachable state.
+
+        He joins in the app while his number is still unverified (so nothing
+        links the two), texts JOIN from that handset, then verifies the number.
+        """
+        bob = make_user('bob')
+        self.group.add_participant(bob)
+        inbound.handle_inbound(self.group, self.number, 'JOIN')
+
+        bob.profile.phone_number = self.number
+        bob.profile.phone_no_verified = True
+        bob.profile.save()
+        return bob
+
+    def test_blocking_one_row_blocks_the_person(self):
+        # resolve_sender used to return the first ACTIVE row while the REST
+        # path resolved BLOCKED - two answers to one question, so a blocked
+        # member kept posting by SMS.
+        bob = self.two_rows_for_bob()
+        account_row = Participant.objects.get(conversation=self.group, user=bob)
+        membership.remove(account_row, self.alice, block=True)
+
+        result = inbound.handle_inbound(self.group, self.number, 'still here')
+
+        self.assertEqual(result.action, 'ignored_unknown_sender')
+        self.assertEqual(Message.objects.count(), 0)
+
+    def test_a_banned_account_cannot_text_its_way_to_a_fresh_membership(self):
+        # The ban check used to live inside the identity lookup, so a banned
+        # person stopped being findable, fell through, and was handed a brand
+        # new row - blocking failed OPEN.
+        bob = make_user('bob', phone=self.number)
+        row = self.group.add_participant(bob)
+        membership.remove(row, self.alice, block=True)
+        User.objects.filter(pk=bob.pk).update(is_active=False)
+
+        result = inbound.handle_inbound(self.group, self.number, 'JOIN')
+
+        self.assertEqual(result.action, 'refused_blocked')
+        self.assertEqual(self.group.participants.count(), 2)
+
+    def test_a_banned_account_cannot_post_even_while_active(self):
+        bob = make_user('bob', phone=self.number)
+        self.group.add_participant(bob)
+        User.objects.filter(pk=bob.pk).update(is_active=False)
+
+        result = inbound.handle_inbound(self.group, self.number, 'hello')
+
+        self.assertEqual(result.action, 'ignored_banned_account')
+        self.assertEqual(Message.objects.count(), 0)
+
+    def test_approving_refuses_somebody_blocked_under_their_other_identity(self):
+        # The admin reviewing the queue cannot see that this pending account is
+        # the same human as a blocked phone row.
+        self.group.join_mode = Conversation.JoinMode.APPROVAL
+        self.group.save(update_fields=['join_mode'])
+
+        inbound.handle_inbound(self.group, self.number, 'JOIN')
+        phone_row = Participant.objects.get(
+            conversation=self.group, phone_number=self.number
+        )
+        membership.remove(phone_row, self.alice, block=True)
+
+        # She asks while her number is still UNVERIFIED, so nothing links the
+        # request to the blocked phone row and a PENDING account row is made.
+        mom = make_user('mom')
+        pending = membership.request_to_join(self.group, user=mom)
+        self.assertEqual(pending.status, Participant.Status.PENDING)
+
+        # She verifies it while waiting. Now the two rows are the same person -
+        # and the admin looking at the queue has no way to see that.
+        mom.profile.phone_number = self.number
+        mom.profile.phone_no_verified = True
+        mom.profile.save()
+
+        with self.assertRaises(BlockedFromConversation):
+            membership.approve(pending, self.alice)
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, Participant.Status.PENDING)
+
+    def test_a_blocked_person_is_refused_at_the_join_itself_when_linkable(self):
+        # When the identifiers already line up, the refusal happens earlier and
+        # no pending row is created for an admin to mishandle at all.
+        self.group.join_mode = Conversation.JoinMode.APPROVAL
+        self.group.save(update_fields=['join_mode'])
+        inbound.handle_inbound(self.group, self.number, 'JOIN')
+        membership.remove(
+            Participant.objects.get(
+                conversation=self.group, phone_number=self.number
+            ),
+            self.alice,
+            block=True,
+        )
+
+        mom = make_user('mom', phone=self.number)
+        with self.assertRaises(BlockedFromConversation):
+            membership.request_to_join(self.group, user=mom)
+
+    def test_joining_by_account_claims_the_old_phone_row(self):
+        # It used to reactivate the phone-only row and never attach the account,
+        # so the caller was told "joined" while has_participant stayed False.
+        phone_row = self.group.add_phone_participant(
+            self.number, display_name='Mom', added_by=self.alice
+        )
+        membership.remove(phone_row, self.alice)
+
+        mom = make_user('mom', phone=self.number)
+        self.client.force_authenticate(mom)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-join'),
+                {'code': self.group.join_code},
+                format='json',
+            )
+        )
+
+        self.assertTrue(self.group.has_participant(mom))
+        self.assertEqual(self.group.participants.filter(user=mom).count(), 1)
+
+    def test_a_recycled_number_does_not_collide_with_its_old_row(self):
+        # Mom's row keeps the number she surrendered; the carrier gives it to a
+        # stranger, who texts JOIN. That used to raise IntegrityError -> 500.
+        mom = make_user('mom', phone=self.number)
+        self.group.add_participant(mom)
+        mom.profile.phone_number = '+639170000009'
+        mom.profile.phone_no_verified = True
+        mom.profile.save()
+        Participant.objects.filter(conversation=self.group, user=mom).update(
+            phone_number=self.number
+        )
+
+        result = inbound.handle_inbound(self.group, self.number, 'JOIN')
+
+        self.assertEqual(result.action, 'joined')
+        self.assertNotEqual(result.participant.user_id, mom.pk)
+
+    def test_a_pending_joiner_asking_again_is_answered(self):
+        self.group.join_mode = Conversation.JoinMode.APPROVAL
+        self.group.save(update_fields=['join_mode'])
+        inbound.handle_inbound(self.group, self.number, 'JOIN')
+
+        result = inbound.handle_inbound(self.group, self.number, 'JOIN')
+
+        self.assertEqual(result.action, 'join_pending')
+        self.assertIn('still with the admins', result.reply)
+
+    def test_the_sole_admin_texting_leave_is_told_not_crashed(self):
+        # An uncaught raise here 500s the webhook, and a carrier reads 500 as
+        # "retry" - so the same text arrives again and again.
+        alice = make_user('solo', phone='+639170000007')
+        group = Conversation.start_group(alice, name='Solo')
+
+        result = inbound.handle_inbound(group, '+639170000007', 'LEAVE')
+
+        self.assertEqual(result.action, 'refused')
+        self.assertIn('admin', result.reply)
+        self.assertTrue(group.has_participant(alice))
+
+
+class GroupAdminActionsTests(EnvelopeAssertions, APITestCase):
+    """Deleting a group, and naming a member who has no account."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', phone='+639170000001')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.alice)
+
+    def detail_url(self):
+        return reverse('chat:conversation-detail', args=[self.group.id])
+
+    def rename_url(self):
+        return reverse('chat:conversation-rename', args=[self.group.id])
+
+    # --- deleting -----------------------------------------------------------
+
+    def test_an_admin_can_delete_the_group(self):
+        response = self.client.delete(self.detail_url())
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Conversation.objects.filter(pk=self.group.pk).exists())
+
+    def test_a_plain_member_cannot_delete_it(self):
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.delete(self.detail_url()), status.HTTP_403_FORBIDDEN
+        )
+        self.assertTrue(Conversation.objects.filter(pk=self.group.pk).exists())
+
+    def test_a_stranger_gets_a_404_rather_than_a_403(self):
+        # A non-member is not told the conversation exists.
+        carol = make_user('carol')
+        self.client.force_authenticate(carol)
+        self.assertFailure(
+            self.client.delete(self.detail_url()), status.HTTP_404_NOT_FOUND
+        )
+
+    def test_a_one_to_one_conversation_cannot_be_deleted(self):
+        # It belongs to two people equally; neither can end it for both.
+        direct, _ = Conversation.start_direct(self.alice, self.bob)
+        self.assertFailure(
+            self.client.delete(
+                reverse('chat:conversation-detail', args=[direct.id])
+            )
+        )
+
+    # --- naming a phone-only member -----------------------------------------
+
+    def test_an_admin_names_a_member_who_joined_by_text(self):
+        mom = self.group.add_phone_participant('+639171111111', display_name='+63…1111')
+        data = self.assertSuccess(
+            self.client.post(
+                self.rename_url(),
+                {'participant': mom.pk, 'display_name': 'Mom'},
+                format='json',
+            )
+        )
+        self.assertEqual(data['display_label'], 'Mom')
+
+    def test_a_member_with_an_account_keeps_their_own_name(self):
+        # Otherwise an admin could relabel another person in the group.
+        bob_row = Participant.objects.get(conversation=self.group, user=self.bob)
+        self.assertFailure(
+            self.client.post(
+                self.rename_url(),
+                {'participant': bob_row.pk, 'display_name': 'Not Bob'},
+                format='json',
+            )
+        )
+
+    def test_a_plain_member_cannot_rename_anybody(self):
+        mom = self.group.add_phone_participant('+639171111111', display_name='Mom')
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.post(
+                self.rename_url(),
+                {'participant': mom.pk, 'display_name': 'Hijacked'},
+                format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GroupCreationWithSettingsTests(EnvelopeAssertions, APITestCase):
+    """One request: members, numbers to invite, and the group's policy."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', phone='+639170000001')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.client.force_authenticate(self.alice)
+
+    def create(self, **extra):
+        payload = {'name': 'Family', 'description': 'Home things'}
+        payload.update(extra)
+        return self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-group'), payload, format='json'
+            ),
+            status.HTTP_201_CREATED,
+        )
+
+    def test_everything_in_one_request(self):
+        data = self.create(
+            members=['bob'],
+            invite=[{'phone_number': '+639171111111', 'display_name': 'Mom'}],
+            settings={
+                'mode': 'broadcast',
+                'join_mode': 'code',
+                'add_member_permission': 'members',
+                'sms_replies_enabled': False,
+            },
+        )
+        group = Conversation.objects.get(pk=data['id'])
+
+        self.assertEqual(group.mode, Conversation.Mode.BROADCAST)
+        self.assertEqual(group.join_mode, Conversation.JoinMode.CODE)
+        self.assertEqual(group.add_member_permission, 'members')
+        self.assertFalse(group.sms_replies_enabled)
+
+        labels = {p.display_label for p in group.active_participants}
+        self.assertEqual(
+            labels,
+            {self.alice.profile.display_label, self.bob.profile.display_label, 'Mom'},
+        )
+
+    def test_settings_are_optional_and_default(self):
+        group = Conversation.objects.get(pk=self.create()['id'])
+        self.assertEqual(group.mode, Conversation.Mode.CHAT)
+        self.assertEqual(group.join_mode, Conversation.JoinMode.INVITE)
+        self.assertTrue(group.sms_delivery_enabled)
+
+    def test_an_invited_number_is_a_member_but_not_yet_consented(self):
+        data = self.create(
+            invite=[{'phone_number': '+639171111111', 'display_name': 'Mom'}]
+        )
+        mom = Participant.objects.get(
+            conversation_id=data['id'], phone_number='+639171111111'
+        )
+        self.assertEqual(mom.status, Participant.Status.ACTIVE)
+        self.assertEqual(mom.sms_consent, Participant.Consent.PENDING)
+
+    def test_an_unreachable_invite_does_not_lose_the_group(self):
+        # The group and its real members are already committed; losing them
+        # because one number failed helps nobody.
+        with mock.patch('chat.membership.invite_by_phone',
+                        side_effect=RuntimeError('provider down')):
+            data = self.create(
+                members=['bob'],
+                invite=[{'phone_number': '+639171111111', 'display_name': 'Mom'}],
+            )
+        group = Conversation.objects.get(pk=data['id'])
+        self.assertTrue(group.has_participant(self.bob))
+
+    def test_a_bad_number_is_rejected_before_anything_is_created(self):
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Family',
+                 'invite': [{'phone_number': '09171234567', 'display_name': 'Mom'}]},
+                format='json',
+            )
+        )
+        self.assertFalse(Conversation.objects.filter(name='Family').exists())
+
+
+class GroupPermissionSettingsTests(EnvelopeAssertions, APITestCase):
+    """add_member_permission and edit_group_permission, once enforced."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', phone='+639170000001')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.carol = make_user('carol', phone='+639170000003')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+
+    def settings_url(self):
+        return reverse('chat:conversation-settings', args=[self.group.id])
+
+    def set(self, **fields):
+        for k, v in fields.items():
+            setattr(self.group, k, v)
+        self.group.save(update_fields=list(fields))
+
+    # --- who may add people -------------------------------------------------
+
+    def test_by_default_only_an_admin_adds_people(self):
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-members', args=[self.group.id]),
+                {'members': ['carol']}, format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_members_may_add_when_the_group_says_so(self):
+        self.set(add_member_permission='members')
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-members', args=[self.group.id]),
+                {'members': ['carol']}, format='json',
+            )
+        )
+        self.assertTrue(self.group.has_participant(self.carol))
+
+    def test_the_same_rule_covers_inviting_by_number(self):
+        # Inviting a number IS adding somebody.
+        self.set(add_member_permission='members')
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-invite', args=[self.group.id]),
+                {'phone_number': '+639171111111', 'display_name': 'Mom'},
+                format='json',
+            ),
+            status.HTTP_201_CREATED,
+        )
+
+    # --- who may edit the group --------------------------------------------
+
+    def test_by_default_only_an_admin_edits_the_group(self):
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.patch(self.settings_url(), {'name': 'Renamed'},
+                              format='json'),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_members_may_rename_when_the_group_says_so(self):
+        self.set(edit_group_permission='members')
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.patch(self.settings_url(), {'name': 'Renamed'},
+                              format='json')
+        )
+
+    def test_but_a_member_can_never_change_the_policy_settings(self):
+        # Otherwise a member allowed to rename the group could simply grant
+        # themselves everything else.
+        self.set(edit_group_permission='members')
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.patch(
+                self.settings_url(),
+                {'settings': {'add_member_permission': 'members'}},
+                format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.group.refresh_from_db()
+        self.assertEqual(self.group.add_member_permission, 'admins')

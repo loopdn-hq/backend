@@ -13,6 +13,7 @@ from urllib.parse import parse_qs
 from channels.db import database_sync_to_async
 from channels.middleware import BaseMiddleware
 from django.contrib.auth.models import AnonymousUser
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
@@ -23,7 +24,14 @@ def user_from_token(raw_token):
     try:
         validated = authenticator.get_validated_token(raw_token)
         return authenticator.get_user(validated)
-    except (InvalidToken, TokenError, KeyError):
+    except (InvalidToken, TokenError, AuthenticationFailed, KeyError):
+        # AuthenticationFailed is DRF's, and is the PARENT of InvalidToken
+        # rather than a subclass, so it does not arrive here by way of the
+        # first entry. get_user raises it directly for a token whose user has
+        # since been deactivated ('User is inactive') or deleted ('User not
+        # found') - both perfectly ordinary once accounts can be banned. Uncaught
+        # it escapes the middleware and kills the ASGI call before the consumer
+        # runs, so the client sees a dropped connection instead of a clean 4401.
         return AnonymousUser()
 
 

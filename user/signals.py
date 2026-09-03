@@ -15,4 +15,14 @@ from user.models import Profile
 @receiver(post_save, sender=settings.AUTH_USER_MODEL, dispatch_uid='user.create_profile')
 def create_profile_for_new_user(sender, instance, created, **kwargs):
     if created:
-        Profile.objects.get_or_create(user=instance)
+        # A superuser is created by whoever has the database, not through
+        # registration, so there is no address to confirm and nobody to email.
+        # Without this the account exists but cannot use the API at all -
+        # LoginSerializer refuses every unverified account, and the two
+        # verification endpoints are the only cure. Deliberately narrow: an
+        # ordinary user made in the shell or a fixture stays unverified,
+        # because nobody has confirmed their address either.
+        Profile.objects.get_or_create(
+            user=instance,
+            defaults={'email_verified': instance.is_superuser},
+        )

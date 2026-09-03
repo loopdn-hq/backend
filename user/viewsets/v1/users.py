@@ -2,8 +2,8 @@
 
 One viewset covers the whole account lifecycle:
 
-    POST   /api/v1/users/register/        create an account (active; see settings)
-    POST   /api/v1/users/verify-email/    confirm the code -> account activated
+    POST   /api/v1/users/register/        create an account (unverified; must confirm)
+    POST   /api/v1/users/verify-email/    confirm the code -> account verified
     POST   /api/v1/users/resend-code/     issue a fresh verification code
     POST   /api/v1/users/google/          sign in or create an account with Google
     POST   /api/v1/users/login/           username-or-email + password -> tokens
@@ -23,6 +23,8 @@ Nothing here builds a response body by hand: `loopd.renderers`
 wraps every reply in the {code, message, data} envelope, so an action returns
 its payload and names its `message` in `success_messages`.
 """
+import logging
+
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import transaction
@@ -34,6 +36,7 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from otp.models import OtpError
 from otp.services import start_email_verification
 from user.lookups import search_users
 from user.models import Profile
@@ -51,6 +54,9 @@ from user.serializers import (
     UserSerializer,
     VerifyEmailSerializer,
 )
+from utils.mail import EmailError
+
+logger = logging.getLogger(__name__)
 
 
 def issue_tokens(user):
@@ -67,10 +73,12 @@ def verification_payload(otp):
         'resend_available_in': otp.seconds_until_resend,
     }
 
-    # Nothing delivers the code yet, so development returns it directly.
-    # Guarded on DEBUG: in production this line would hand the account to
-    # anyone who can call the endpoint with a known email address.
-    if settings.DEBUG:
+    # With Resend unconfigured nothing is actually delivered, so development
+    # returns the code directly. Both halves of the guard matter: DEBUG alone
+    # would hand a live, deliverable credential to anyone who can call this
+    # endpoint with a known email address. Same two-part guard as the phone
+    # equivalent in otp/viewsets/v1/otp.py.
+    if settings.DEBUG and not settings.RESEND_API_KEY:
         payload['debug_code'] = otp.code
 
     return payload
@@ -136,10 +144,15 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         job, so registering and authenticating stay separate steps and a
         client only has one place to get credentials from.
 
-        With REQUIRE_EMAIL_VERIFICATION off (the current setting) the account
-        is active immediately, so the caller can log in right away. With it
-        on, the account is created inactive and a verification code is
-        issued instead.
+        With REQUIRE_EMAIL_VERIFICATION on (the current setting) the account
+        is created UNVERIFIED and a code is emailed; login is refused until
+        verify-email confirms it. With it off, the account is marked verified
+        here and the caller can log in right away.
+
+        The account is always `is_active=True` either way: that field means
+        "not banned" and belongs to admins alone.
+
+        A delivery failure does not fail the request - see below.
         """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -148,8 +161,27 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         data = {'user': UserSerializer(user, context=self.get_serializer_context()).data}
 
         if settings.REQUIRE_EMAIL_VERIFICATION:
-            data['verification'] = verification_payload(start_email_verification(user))
-            message = 'Account created. Enter the verification code to activate it.'
+            try:
+                data['verification'] = verification_payload(
+                    start_email_verification(user)
+                )
+                message = 'Account created. Enter the verification code to activate it.'
+            except (EmailError, OtpError) as exc:
+                # The account is already committed - RegisterSerializer.create
+                # closed its transaction when save() returned - and only
+                # delivery failed. Failing the whole request would strand the
+                # user for good: registering again answers "that email already
+                # exists", and a client that has just been shown an error has
+                # no reason to call resend-code. So the account stands, and the
+                # message says what to do about it.
+                logger.warning(
+                    'Verification email failed for %s: %s', user.email, exc
+                )
+                data['verification'] = None
+                message = (
+                    'Account created, but the verification code could not be '
+                    'sent. Request a new one.'
+                )
         else:
             message = 'Account created successfully. You can now log in.'
 
@@ -190,6 +222,16 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         email = claims['email'].strip()
         user = User.objects.filter(email__iexact=email).first()
         if user:
+            # Google is a verification of this address, and a stronger one
+            # than our own six-digit code: GoogleCredentialSerializer refuses
+            # any token whose email_verified claim is not True, so arriving
+            # here means Google has vouched for it. Marking it lets someone who
+            # registered but never opened the email sign in with a password
+            # afterwards, and stops us mailing codes for an address already
+            # proven.
+            if not user.profile.email_verified:
+                user.profile.email_verified = True
+                user.profile.save(update_fields=['email_verified', 'updated_at'])
             return user, False
 
         user = User.objects.create_user(
@@ -199,7 +241,14 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
             last_name=claims.get('family_name', ''),
         )
         user.profile.display_name = claims.get('name', '')
-        user.profile.save(update_fields=['display_name', 'updated_at'])
+        # Same reasoning, and load-bearing here: create_user leaves the flag
+        # False, which would leave every Google account permanently unverified
+        # - unable to use password login later, and a standing target for
+        # verification codes it can never need.
+        user.profile.email_verified = True
+        user.profile.save(
+            update_fields=['display_name', 'email_verified', 'updated_at']
+        )
         return user, True
 
     @action(

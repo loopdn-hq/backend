@@ -1,0 +1,12 @@
+{{ product_name }}
+
+Enter this code to verify your email address:
+
+    {{ code }}
+
+The code expires in {{ expires_in_minutes }} minutes.
+
+If you did not create a {{ product_name }} account, you can ignore this email
+- nobody can use the code without it.
+
+Questions? Reach us at {{ support_address }}.
