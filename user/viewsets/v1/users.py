@@ -9,6 +9,9 @@ One viewset covers the whole account lifecycle:
     POST   /api/v1/users/login/           username-or-email + password -> tokens
     POST   /api/v1/users/logout/          blacklist the caller's refresh token
     POST   /api/v1/users/token/refresh/   trade a refresh token for a new pair
+    POST   /api/v1/users/forgot-password/ email a password reset link
+    POST   /api/v1/users/reset-password/  consume the link's uid/token -> new password
+    POST   /api/v1/users/change-password/ signed-in: old_password + new_password
     GET    /api/v1/users/me/              the signed-in account
     PATCH  /api/v1/users/me/              update account fields
     GET    /api/v1/users/me/profile/      the signed-in profile
@@ -38,6 +41,8 @@ from otp.services import start_email_verification
 from user.lookups import search_users
 from user.models import Profile
 from user.serializers import (
+    ChangePasswordSerializer,
+    ForgotPasswordSerializer,
     GoogleCredentialSerializer,
     LoginSerializer,
     LogoutSerializer,
@@ -45,6 +50,7 @@ from user.serializers import (
     PublicUserSerializer,
     RegisterSerializer,
     ResendCodeSerializer,
+    ResetPasswordSerializer,
     UserSerializer,
     VerifyEmailSerializer,
 )
@@ -99,6 +105,9 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         'login': LoginSerializer,
         'logout': LogoutSerializer,
         'refresh': TokenRefreshSerializer,
+        'forgot_password': ForgotPasswordSerializer,
+        'reset_password': ResetPasswordSerializer,
+        'change_password': ChangePasswordSerializer,
         'me': UserSerializer,
         'profile': ProfileSerializer,
     }
@@ -111,6 +120,9 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         'login': 'Login successful.',
         'logout': 'Logged out.',
         'refresh': 'Token refreshed.',
+        'forgot_password': 'If an account exists for that email, a reset link has been sent.',
+        'reset_password': 'Password reset. You can now log in with your new password.',
+        'change_password': 'Password changed.',
         'me:GET': 'Account fetched.',
         'me:PATCH': 'Account updated.',
         'profile:GET': 'Profile fetched.',
@@ -310,6 +322,58 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     @action(detail=False, methods=['post'])
     def logout(self, request):
         """Blacklist the caller's refresh token."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(None)
+
+    # -- passwords ----------------------------------------------------------
+
+    @action(
+        detail=False,
+        methods=['post'],
+        url_path='forgot-password',
+        url_name='forgot-password',
+        permission_classes=[AllowAny],
+    )
+    def forgot_password(self, request):
+        """Email a password reset link, if the address has an account.
+
+        Answers the same way whether or not the address is registered - see
+        ForgotPasswordSerializer - so this cannot be used to enumerate
+        accounts.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(None)
+
+    @action(
+        detail=False,
+        methods=['post'],
+        url_path='reset-password',
+        url_name='reset-password',
+        permission_classes=[AllowAny],
+    )
+    def reset_password(self, request):
+        """Consume a reset link's uid/token and set a new password."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(None)
+
+    @action(
+        detail=False,
+        methods=['post'],
+        url_path='change-password',
+        url_name='change-password',
+    )
+    def change_password(self, request):
+        """Change the signed-in user's password.
+
+        No AllowAny override here: this action keeps the viewset's default
+        IsAuthenticated, since it operates on request.user.
+        """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
