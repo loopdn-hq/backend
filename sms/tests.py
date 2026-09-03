@@ -1838,3 +1838,83 @@ class MaintenanceTests(TransactionTestCase):
                 participant=self.sender,
             )
         self.assertIn('over budget', maintenance.daily_spend_report())
+
+
+class GroupSmsSettingsTests(TransactionTestCase):
+    """The group's own two SMS switches, one per direction."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = User.objects.create_user(username='alice', password='x')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.join_mode = Conversation.JoinMode.OPEN
+        self.group.save(update_fields=['join_mode'])
+        GroupNumber.objects.create(
+            number='+14155551001', conversation=self.group,
+            status=GroupNumber.Status.ACTIVE,
+        )
+        self.mom = self.group.add_phone_participant('+639171111111', display_name='Mom')
+        self.mom.sms_consent = Participant.Consent.GRANTED
+        self.mom.save(update_fields=['sms_consent'])
+        self.sender = Participant.objects.get(
+            conversation=self.group, user=self.alice
+        )
+
+    def set(self, **fields):
+        for k, v in fields.items():
+            setattr(self.group, k, v)
+        self.group.save(update_fields=list(fields))
+
+    # --- outbound -----------------------------------------------------------
+
+    def test_delivery_off_stops_texts_going_out_and_says_why(self):
+        self.set(sms_delivery_enabled=False)
+        message = create_message(
+            conversation=self.group, sender=self.alice, text='Dinner at 7',
+            participant=self.sender,
+        )
+        row = SmsDelivery.objects.get(message=message, participant=self.mom)
+        self.assertEqual(row.status, SmsDelivery.Status.SKIPPED)
+        self.assertEqual(row.reason, 'sms is off for this group')
+
+    def test_delivery_on_is_the_default(self):
+        message = create_message(
+            conversation=self.group, sender=self.alice, text='Dinner at 7',
+            participant=self.sender,
+        )
+        row = SmsDelivery.objects.get(message=message, participant=self.mom)
+        self.assertEqual(row.status, SmsDelivery.Status.SENT)
+
+    # --- inbound ------------------------------------------------------------
+
+    def test_replies_off_refuses_an_inbound_text(self):
+        self.set(sms_replies_enabled=False)
+        result = inbound.handle_inbound(self.group, '+639171111111', 'I will be there')
+
+        self.assertEqual(result.action, 'refused_replies_off')
+        self.assertIn('does not take replies', result.reply)
+        self.assertEqual(Message.objects.count(), 0)
+
+    def test_replies_off_still_lets_them_leave_or_stop(self):
+        # A member must always be able to get out, whatever the group allows.
+        self.set(sms_replies_enabled=False)
+        self.assertEqual(
+            inbound.handle_inbound(self.group, '+639171111111', 'STOP').action,
+            'opted_out',
+        )
+
+    def test_the_two_directions_are_independent(self):
+        # Announcements out, no replies in.
+        self.set(sms_delivery_enabled=True, sms_replies_enabled=False)
+        message = create_message(
+            conversation=self.group, sender=self.alice, text='Dinner at 7',
+            participant=self.sender,
+        )
+        self.assertEqual(
+            SmsDelivery.objects.get(message=message, participant=self.mom).status,
+            SmsDelivery.Status.SENT,
+        )
+        self.assertEqual(
+            inbound.handle_inbound(self.group, '+639171111111', 'ok').action,
+            'refused_replies_off',
+        )

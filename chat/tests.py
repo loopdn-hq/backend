@@ -1515,7 +1515,7 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
     def test_an_admin_changes_how_people_join(self):
         data = self.assertSuccess(
             self.client.patch(
-                self.settings_url(), {'join_mode': 'approval'}, format='json'
+                self.settings_url(), {'settings': {'join_mode': 'approval'}}, format='json'
             )
         )
         self.assertEqual(data['join_mode'], 'approval')
@@ -1525,7 +1525,7 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
         # must not claim a mode the group cannot actually serve.
         Conversation.objects.filter(pk=self.group.pk).update(join_code=None)
         self.assertSuccess(
-            self.client.patch(self.settings_url(), {'join_mode': 'code'}, format='json')
+            self.client.patch(self.settings_url(), {'settings': {'join_mode': 'code'}}, format='json')
         )
         self.group.refresh_from_db()
         self.assertTrue(self.group.join_code)
@@ -1533,7 +1533,7 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
     def test_editing_settings_does_not_bump_the_group_up_the_list(self):
         before = Conversation.objects.get(pk=self.group.pk).updated_at
         self.assertSuccess(
-            self.client.patch(self.settings_url(), {'join_mode': 'open'}, format='json')
+            self.client.patch(self.settings_url(), {'settings': {'join_mode': 'open'}}, format='json')
         )
         self.assertEqual(Conversation.objects.get(pk=self.group.pk).updated_at, before)
 
@@ -1635,7 +1635,7 @@ class BroadcastModeTests(EnvelopeAssertions, APITestCase):
         self.assertSuccess(
             self.client.patch(
                 reverse('chat:conversation-settings', args=[self.group.id]),
-                {'mode': 'chat'},
+                {'settings': {'mode': 'chat'}},
                 format='json',
             )
         )
@@ -1914,3 +1914,176 @@ class GroupAdminActionsTests(EnvelopeAssertions, APITestCase):
             ),
             status.HTTP_403_FORBIDDEN,
         )
+
+
+class GroupCreationWithSettingsTests(EnvelopeAssertions, APITestCase):
+    """One request: members, numbers to invite, and the group's policy."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', phone='+639170000001')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.client.force_authenticate(self.alice)
+
+    def create(self, **extra):
+        payload = {'name': 'Family', 'description': 'Home things'}
+        payload.update(extra)
+        return self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-group'), payload, format='json'
+            ),
+            status.HTTP_201_CREATED,
+        )
+
+    def test_everything_in_one_request(self):
+        data = self.create(
+            members=['bob'],
+            invite=[{'phone_number': '+639171111111', 'display_name': 'Mom'}],
+            settings={
+                'mode': 'broadcast',
+                'join_mode': 'code',
+                'add_member_permission': 'members',
+                'sms_replies_enabled': False,
+            },
+        )
+        group = Conversation.objects.get(pk=data['id'])
+
+        self.assertEqual(group.mode, Conversation.Mode.BROADCAST)
+        self.assertEqual(group.join_mode, Conversation.JoinMode.CODE)
+        self.assertEqual(group.add_member_permission, 'members')
+        self.assertFalse(group.sms_replies_enabled)
+
+        labels = {p.display_label for p in group.active_participants}
+        self.assertEqual(
+            labels,
+            {self.alice.profile.display_label, self.bob.profile.display_label, 'Mom'},
+        )
+
+    def test_settings_are_optional_and_default(self):
+        group = Conversation.objects.get(pk=self.create()['id'])
+        self.assertEqual(group.mode, Conversation.Mode.CHAT)
+        self.assertEqual(group.join_mode, Conversation.JoinMode.INVITE)
+        self.assertTrue(group.sms_delivery_enabled)
+
+    def test_an_invited_number_is_a_member_but_not_yet_consented(self):
+        data = self.create(
+            invite=[{'phone_number': '+639171111111', 'display_name': 'Mom'}]
+        )
+        mom = Participant.objects.get(
+            conversation_id=data['id'], phone_number='+639171111111'
+        )
+        self.assertEqual(mom.status, Participant.Status.ACTIVE)
+        self.assertEqual(mom.sms_consent, Participant.Consent.PENDING)
+
+    def test_an_unreachable_invite_does_not_lose_the_group(self):
+        # The group and its real members are already committed; losing them
+        # because one number failed helps nobody.
+        with mock.patch('chat.membership.invite_by_phone',
+                        side_effect=RuntimeError('provider down')):
+            data = self.create(
+                members=['bob'],
+                invite=[{'phone_number': '+639171111111', 'display_name': 'Mom'}],
+            )
+        group = Conversation.objects.get(pk=data['id'])
+        self.assertTrue(group.has_participant(self.bob))
+
+    def test_a_bad_number_is_rejected_before_anything_is_created(self):
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Family',
+                 'invite': [{'phone_number': '09171234567', 'display_name': 'Mom'}]},
+                format='json',
+            )
+        )
+        self.assertFalse(Conversation.objects.filter(name='Family').exists())
+
+
+class GroupPermissionSettingsTests(EnvelopeAssertions, APITestCase):
+    """add_member_permission and edit_group_permission, once enforced."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', phone='+639170000001')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.carol = make_user('carol', phone='+639170000003')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+
+    def settings_url(self):
+        return reverse('chat:conversation-settings', args=[self.group.id])
+
+    def set(self, **fields):
+        for k, v in fields.items():
+            setattr(self.group, k, v)
+        self.group.save(update_fields=list(fields))
+
+    # --- who may add people -------------------------------------------------
+
+    def test_by_default_only_an_admin_adds_people(self):
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-members', args=[self.group.id]),
+                {'members': ['carol']}, format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_members_may_add_when_the_group_says_so(self):
+        self.set(add_member_permission='members')
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-members', args=[self.group.id]),
+                {'members': ['carol']}, format='json',
+            )
+        )
+        self.assertTrue(self.group.has_participant(self.carol))
+
+    def test_the_same_rule_covers_inviting_by_number(self):
+        # Inviting a number IS adding somebody.
+        self.set(add_member_permission='members')
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-invite', args=[self.group.id]),
+                {'phone_number': '+639171111111', 'display_name': 'Mom'},
+                format='json',
+            ),
+            status.HTTP_201_CREATED,
+        )
+
+    # --- who may edit the group --------------------------------------------
+
+    def test_by_default_only_an_admin_edits_the_group(self):
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.patch(self.settings_url(), {'name': 'Renamed'},
+                              format='json'),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_members_may_rename_when_the_group_says_so(self):
+        self.set(edit_group_permission='members')
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.patch(self.settings_url(), {'name': 'Renamed'},
+                              format='json')
+        )
+
+    def test_but_a_member_can_never_change_the_policy_settings(self):
+        # Otherwise a member allowed to rename the group could simply grant
+        # themselves everything else.
+        self.set(edit_group_permission='members')
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.patch(
+                self.settings_url(),
+                {'settings': {'add_member_permission': 'members'}},
+                format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.group.refresh_from_db()
+        self.assertEqual(self.group.add_member_permission, 'admins')

@@ -562,10 +562,14 @@ def invite_by_phone(conversation, phone_number, display_name, by):
     """
     from sms.outbound import send_notice
 
-    _require_admin(conversation, by)
+    # `may_add_members`, not `_require_admin`: a group whose
+    # add_member_permission is MEMBERS lets any member bring somebody in, and
+    # inviting by number is adding somebody.
+    if not conversation.may_add_members(by):
+        raise JoinRefused('You cannot add people to this group.')
 
     if conversation.kind != Conversation.Kind.GROUP:
-        raise JoinRefused('Only groups can have members invited.')
+        raise JoinRefused('Only groups have members to invite.')
 
     existing = _find_row(conversation, phone_number=phone_number)
     if existing is not None and existing.status == Participant.Status.BLOCKED:

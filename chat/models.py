@@ -119,6 +119,14 @@ class Conversation(models.Model):
         # Nobody can ask. Only an admin adds people.
         INVITE = 'invite', 'Invite only'
 
+    class MemberAddPermission(models.TextChoices):
+        ADMINS = 'admins', 'Admins only'
+        MEMBERS = 'members', 'All members'
+
+    class EditGroupPermission(models.TextChoices):
+        ADMINS = 'admins', 'Admins only'
+        MEMBERS = 'members', 'All members'
+
     kind = models.CharField(max_length=8, choices=Kind.choices)
 
     # Groups only. A direct conversation is named after the other person by
@@ -143,6 +151,8 @@ class Conversation(models.Model):
     # Direct conversations only: '<lower user id>:<higher user id>'.
     direct_key = models.CharField(max_length=64, unique=True, null=True, blank=True)
 
+    ## GROUP SETTINGS ##
+
     # Groups only. Whether members may post, or only admins.
     mode = models.CharField(
         max_length=9, choices=Mode.choices, default=Mode.CHAT, db_default=Mode.CHAT
@@ -165,10 +175,57 @@ class Conversation(models.Model):
     # has to identify which group they mean.
     join_code = models.CharField(max_length=12, unique=True, null=True, blank=True)
 
+    # Who may add/invite new members.
+    add_member_permission = models.CharField(
+        max_length=8,
+        choices=MemberAddPermission.choices,
+        default=MemberAddPermission.ADMINS,
+        db_default=MemberAddPermission.ADMINS,
+    )
+
+    # Who may change the group's name, image and description.
+    edit_group_permission = models.CharField(
+        max_length=8,
+        choices=EditGroupPermission.choices,
+        default=EditGroupPermission.ADMINS,
+        db_default=EditGroupPermission.ADMINS,
+    )
+
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='conversations_created',
+    )
+
+    # -------------------------
+    # SMS SETTINGS
+    # -------------------------
+
+    # OUTBOUND: a message posted here is texted to members.
+    #
+    # Named `sms_delivery_enabled` rather than `sms_enabled` because Profile and
+    # Participant each already have an `sms_enabled`, at different scopes.
+    sms_delivery_enabled = models.BooleanField(
+        default=True,
+        db_default=True,
+    )
+
+    # INBOUND: a text sent to this group's number is posted into the
+    # conversation.
+    sms_replies_enabled = models.BooleanField(
+        default=True,
+        db_default=True,
+    )
+
+    # -------------------------
+    # MEDIA SETTINGS
+    # -------------------------
+
+    # Whether members may record/upload voice messages in this conversation.
+    # Admins can disable this for groups where only text communication is wanted.
+    voice_messages_enabled = models.BooleanField(
+        default=True,
+        db_default=True,
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -426,6 +483,22 @@ class Conversation(models.Model):
 
     def has_phone_participant(self, phone_number):
         return self.active_participants.filter(phone_number=phone_number).exists()
+
+    def may_add_members(self, user):
+        """Whether this person may add or invite people."""
+        if self.add_member_permission == self.MemberAddPermission.MEMBERS:
+            return self.has_participant(user)
+        return self.is_admin(user)
+
+    def may_edit_group(self, user):
+        """Whether this person may change the name, image or description.
+
+        Never covers the policy settings - see ADMIN_ONLY_SETTINGS. A member who
+        could grant themselves permissions would make this setting pointless.
+        """
+        if self.edit_group_permission == self.EditGroupPermission.MEMBERS:
+            return self.has_participant(user)
+        return self.is_admin(user)
 
     def is_admin(self, user):
         return self.active_participants.filter(

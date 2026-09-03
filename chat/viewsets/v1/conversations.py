@@ -40,6 +40,7 @@ from rest_framework.response import Response
 from chat import membership
 from chat.models import Conversation, Message, Participant
 from chat.serializers import (
+    ADMIN_ONLY_SETTINGS,
     AddMembersSerializer,
     ConversationSerializer,
     DirectConversationSerializer,
@@ -196,8 +197,14 @@ class ConversationViewSet(
         if conversation.kind != Conversation.Kind.GROUP:
             raise ValidationError('Only groups have settings to edit.')
 
-        if not conversation.is_admin(request.user):
-            raise PermissionDenied('Only a group admin can edit the group.')
+        if not conversation.may_edit_group(request.user):
+            raise PermissionDenied('You cannot edit this group.')
+
+        # The policy settings stay with admins even where members may edit the
+        # name and photo, or a member could simply grant themselves the rest.
+        asked_for = set((request.data.get('settings') or {}))
+        if asked_for & ADMIN_ONLY_SETTINGS and not conversation.is_admin(request.user):
+            raise PermissionDenied('Only a group admin can change group settings.')
 
         serializer = self.get_serializer(conversation, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -218,8 +225,8 @@ class ConversationViewSet(
         if conversation.kind != Conversation.Kind.GROUP:
             raise ValidationError('Only groups can take extra members.')
 
-        if not conversation.is_admin(request.user):
-            raise PermissionDenied('Only a group admin can add people.')
+        if not conversation.may_add_members(request.user):
+            raise PermissionDenied('You cannot add people to this group.')
 
         serializer = self.get_serializer(
             data=request.data,
@@ -413,6 +420,9 @@ class ConversationViewSet(
         the group until they reply YES.
         """
         conversation = self.get_object()
+        if not conversation.may_add_members(request.user):
+            raise PermissionDenied('You cannot add people to this group.')
+
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 

@@ -161,6 +161,16 @@ def handle_inbound(conversation, phone_number, body, *, display_name=''):
 
 
 def _post(conversation, participant, body):
+    if not conversation.sms_replies_enabled:
+        # The group receives texts but does not accept them - announcements
+        # only. Worth one reply: they are a member in good standing who has
+        # just been ignored, and silence reads as the service being broken.
+        return InboundResult(
+            action='refused_replies_off',
+            participant=participant,
+            reply=f'{conversation.name} does not take replies by text.',
+        )
+
     text = (body or '').strip()
     if not text:
         # An empty body is an MMS with no caption, or a message that was
