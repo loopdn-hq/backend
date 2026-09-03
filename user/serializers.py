@@ -5,10 +5,17 @@ from write shapes (`RegisterSerializer`, `LoginSerializer`): the fields a
 client sends when signing up have almost nothing in common with the fields it
 gets back, and merging them is how write-only fields leak.
 """
+import logging
+
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth.tokens import default_token_generator
+from django.core.cache import cache
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from google.auth.exceptions import GoogleAuthError
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
@@ -20,6 +27,9 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from otp.models import OtpError
 from otp.services import start_email_verification, verify_email
 from user.models import Profile
+from utils.email import EmailError, send_email
+
+logger = logging.getLogger(__name__)
 
 
 class ProfileSerializer(serializers.ModelSerializer):
@@ -368,6 +378,190 @@ class LogoutSerializer(serializers.Serializer):
     def save(self, **kwargs):
         self.token.blacklist()
         return self.token
+
+
+class ForgotPasswordSerializer(serializers.Serializer):
+    """Emails a password reset link for an account, given its address.
+
+    Always succeeds from the caller's point of view - `save()` silently does
+    nothing when the address has no active account, and the same when the
+    address is over its rate limit - so this endpoint cannot be used to
+    discover which addresses are registered, or that a limit exists at all.
+    The same reasoning LoginSerializer uses for its one error message.
+    """
+
+    email = serializers.EmailField()
+
+    def save(self, **kwargs):
+        email = self.validated_data['email'].strip().lower()
+
+        # Checked - and recorded - on the submitted address itself, before
+        # the account lookup, so the limit applies identically whether or
+        # not that address has an account. Nothing here can be used to tell
+        # those two cases apart from the response.
+        rate_limited = _password_reset_rate_limited(email)
+        _record_password_reset_request(email)
+        if rate_limited:
+            return None
+
+        user = User.objects.filter(email__iexact=email, is_active=True).first()
+        if user is not None:
+            _send_password_reset_email(user)
+        return user
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    """Consumes a reset link's uid/token and sets a new password.
+
+    uid/token come from the query string of the link ForgotPasswordSerializer
+    emailed - see `_send_password_reset_email` below. The token is checked
+    with Django's own `default_token_generator`, so its lifetime is whatever
+    `settings.PASSWORD_RESET_TIMEOUT` says (30 minutes here) with no separate
+    token model or expiry column to keep in sync.
+    """
+
+    uid = serializers.CharField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+    confirm_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+
+    def validate(self, attrs):
+        try:
+            user_id = force_str(urlsafe_base64_decode(attrs['uid']))
+            user = User.objects.get(pk=user_id, is_active=True)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            raise serializers.ValidationError({'uid': 'This reset link is invalid.'})
+
+        # check_token also enforces the expiry, against PASSWORD_RESET_TIMEOUT -
+        # there is nothing here to expire by hand.
+        if not default_token_generator.check_token(user, attrs['token']):
+            raise serializers.ValidationError(
+                {'token': 'This reset link is invalid or has expired.'}
+            )
+
+        if attrs['new_password'] != attrs['confirm_password']:
+            raise serializers.ValidationError(
+                {'confirm_password': 'The two passwords do not match.'}
+            )
+
+        # Called here rather than as a field validator so that
+        # UserAttributeSimilarityValidator has the user to compare against -
+        # a field validator would run before `user` is known.
+        try:
+            validate_password(attrs['new_password'], user=user)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'new_password': exc.messages})
+
+        self.user = user
+        return attrs
+
+    def save(self, **kwargs):
+        self.user.set_password(self.validated_data['new_password'])
+        self.user.save(update_fields=['password'])
+        return self.user
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """Changes the signed-in user's password. Requires the current one."""
+
+    old_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+    new_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+
+    def validate_old_password(self, value):
+        if not self.context['request'].user.check_password(value):
+            raise serializers.ValidationError('Your current password is incorrect.')
+        return value
+
+    def validate_new_password(self, value):
+        try:
+            validate_password(value, user=self.context['request'].user)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.messages)
+        return value
+
+    def validate(self, attrs):
+        if attrs['old_password'] == attrs['new_password']:
+            raise serializers.ValidationError(
+                {'new_password': 'Your new password must be different from your current one.'}
+            )
+        return attrs
+
+    def save(self, **kwargs):
+        user = self.context['request'].user
+        user.set_password(self.validated_data['new_password'])
+        user.save(update_fields=['password'])
+        return user
+
+
+def _send_password_reset_email(user):
+    """Build a dynamic reset link and email it.
+
+    uid is the user's id, base64-encoded the way Django's own password-reset
+    views do it; token is single-use in effect - `check_token` bakes the
+    current password hash into what it verifies, so consuming the link
+    (which calls `set_password`) invalidates it for any second attempt.
+    """
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    reset_url = f'{settings.FRONTEND_URL}/reset-password?uid={uid}&token={token}'
+    minutes = settings.PASSWORD_RESET_TIMEOUT // 60
+
+    try:
+        send_email(
+            to=user.email,
+            subject="Reset your Loopd'n password",
+            html=(
+                f'<p>Tap the link below to set a new password. '
+                f'It expires in {minutes} minutes.</p>'
+                f'<p><a href="{reset_url}">{reset_url}</a></p>'
+                f'<p>If you did not request this, you can ignore this email.</p>'
+            ),
+        )
+    except EmailError:
+        # The provider failed, not the user, and the caller (forgot_password)
+        # must answer identically either way - see ForgotPasswordSerializer -
+        # so there is nothing useful to do with this here but log it.
+        logger.warning('Password reset email to %s could not be sent.', user.email)
+
+
+# --- forgot-password rate limiting ------------------------------------------
+#
+# Same cache-based fixed-window mechanism as otp/services.py's OTP send
+# limits: a cooldown key stops an immediate double-submit, and an hourly
+# counter stops a slow drip that waits the cooldown out each time. Keyed on
+# the submitted email address itself (not a resolved user), which is what
+# lets ForgotPasswordSerializer check - and record - a request the same way
+# whether or not that address has an account.
+
+
+def _password_reset_cache_keys(email):
+    return (
+        f'password_reset:cooldown:{email}',
+        f'password_reset:h:{email}',
+    )
+
+
+def _password_reset_rate_limited(email):
+    cooldown_key, hourly_key = _password_reset_cache_keys(email)
+    if cache.get(cooldown_key) is not None:
+        return True
+    return (cache.get(hourly_key) or 0) >= settings.PASSWORD_RESET_MAX_REQUESTS_PER_HOUR
+
+
+def _record_password_reset_request(email):
+    cooldown_key, hourly_key = _password_reset_cache_keys(email)
+    cache.set(cooldown_key, True, settings.PASSWORD_RESET_COOLDOWN_SECONDS)
+
+    # add() only writes when the key is absent, which is what starts the
+    # window; incr() then bumps it without extending the expiry - same
+    # pattern as otp/services.py's _record_send.
+    cache.add(hourly_key, 0, 3600)
+    try:
+        cache.incr(hourly_key)
+    except ValueError:
+        # Expired between the add and the incr. Losing one tick of the
+        # window is harmless.
+        cache.set(hourly_key, 1, 3600)
 
 
 def _validate_unique_email(value, exclude_user=None):
