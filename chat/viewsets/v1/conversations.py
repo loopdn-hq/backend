@@ -3,8 +3,24 @@
     GET  /api/v1/chat/conversations/               my conversations
     POST /api/v1/chat/conversations/direct/        start/find a 1-to-1 chat
     POST /api/v1/chat/conversations/group/         create a group (I am admin)
+                                                   name, and optionally a
+                                                   description and an image
     GET  /api/v1/chat/conversations/<id>/          one conversation
+    PATCH /api/v1/chat/conversations/<id>/settings/ admin edits the name,
+                                                   description or image
     POST /api/v1/chat/conversations/<id>/members/  admin adds people
+    POST /api/v1/chat/conversations/join/          join with a group code
+    POST /api/v1/chat/conversations/<id>/leave/    take myself out
+    GET  /api/v1/chat/conversations/<id>/requests/ admin: who is waiting
+    POST /api/v1/chat/conversations/<id>/requests/ admin: approve or decline
+    POST /api/v1/chat/conversations/<id>/remove/   admin removes or blocks
+    POST /api/v1/chat/conversations/<id>/delivery/ mute it, or turn its texts off
+    POST /api/v1/chat/conversations/<id>/role/     admin promotes or demotes
+    POST /api/v1/chat/conversations/<id>/rename/   admin names a phone-only member
+    POST /api/v1/chat/conversations/<id>/invite/   admin invites somebody by number
+    DELETE /api/v1/chat/conversations/<id>/        admin deletes it, number and all
+    GET  /api/v1/chat/conversations/<id>/join-code/ admin reads the code
+    POST /api/v1/chat/conversations/<id>/join-code/ admin issues a new one
     GET  /api/v1/chat/conversations/<id>/messages/ history, newest first
     POST /api/v1/chat/conversations/<id>/messages/ send text and/or files
 
@@ -21,19 +37,32 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from chat import membership
 from chat.models import Conversation, Message, Participant
 from chat.serializers import (
     AddMembersSerializer,
     ConversationSerializer,
     DirectConversationSerializer,
     GroupCreateSerializer,
+    GroupSettingsSerializer,
+    InviteByPhoneSerializer,
+    JoinGroupSerializer,
+    JoinRequestDecisionSerializer,
     MessageCreateSerializer,
     MessageSerializer,
+    DeliveryPreferenceSerializer,
+    ParticipantRoleSerializer,
+    RenameMemberSerializer,
+    ParticipantSerializer,
+    RemoveMemberSerializer,
 )
 
 
 class ConversationViewSet(
-    mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
 ):
     permission_classes = [IsAuthenticated]
     serializer_class = ConversationSerializer
@@ -41,7 +70,15 @@ class ConversationViewSet(
     serializer_classes = {
         'direct': DirectConversationSerializer,
         'group': GroupCreateSerializer,
+        'group_settings': GroupSettingsSerializer,
         'members': AddMembersSerializer,
+        'join': JoinGroupSerializer,
+        'requests': JoinRequestDecisionSerializer,
+        'remove': RemoveMemberSerializer,
+        'delivery': DeliveryPreferenceSerializer,
+        'role': ParticipantRoleSerializer,
+        'rename': RenameMemberSerializer,
+        'invite': InviteByPhoneSerializer,
     }
 
     success_messages = {
@@ -49,9 +86,22 @@ class ConversationViewSet(
         'retrieve': 'Conversation fetched.',
         'direct': 'Conversation ready.',
         'group': 'Group created.',
+        'group_settings': 'Group updated.',
         'members': 'Members added.',
         'messages:GET': 'Messages fetched.',
         'messages:POST': 'Message sent.',
+        'join': 'Join request handled.',
+        'leave': 'You have left the conversation.',
+        'requests:GET': 'Pending requests fetched.',
+        'requests:POST': 'Request handled.',
+        'remove': 'Member removed.',
+        'delivery': 'Delivery settings saved.',
+        'role': 'Role updated.',
+        'rename': 'Member renamed.',
+        'invite': 'Invitation sent.',
+        'destroy': 'Group deleted.',
+        'join_code:GET': 'Join code fetched.',
+        'join_code:POST': 'New join code issued.',
     }
 
     def get_serializer_class(self):
@@ -59,18 +109,30 @@ class ConversationViewSet(
 
     def get_queryset(self):
         return (
-            Conversation.objects.filter(participants__user=self.request.user)
+            Conversation.objects.filter(
+                participants__user=self.request.user,
+                # The whole access-control model in one clause. Without it a
+                # removed, departed or merely pending member still reads every
+                # conversation they were ever in.
+                participants__status=Participant.Status.ACTIVE,
+            )
             .distinct()
             .prefetch_related(
                 Prefetch(
                     'participants',
-                    queryset=Participant.objects.select_related('user__profile'),
+                    # The member list a client renders is who is *in* the
+                    # group, not everyone who ever was.
+                    queryset=Participant.objects.filter(
+                        status=Participant.Status.ACTIVE
+                    ).select_related('user__profile'),
                 ),
                 # One sliced prefetch instead of a query per row: the
                 # conversation list needs the latest message of each.
                 Prefetch(
                     'messages',
-                    queryset=Message.objects.select_related('sender__profile')
+                    queryset=Message.objects.select_related(
+                        'sender__profile', 'sender_participant__user__profile'
+                    )
                     .prefetch_related('attachments')
                     .order_by('-created_at')[:1],
                     to_attr='latest_messages',
@@ -92,15 +154,59 @@ class ConversationViewSet(
         conversation = serializer.save()
         return Response(self._as_conversation(conversation))
 
-    @action(detail=False, methods=['post'])
+    @action(
+        detail=False,
+        methods=['post'],
+        parser_classes=[MultiPartParser, FormParser, JSONParser],
+    )
     def group(self, request):
-        """Create a group. The caller becomes its admin."""
+        """Create a group. The caller becomes its admin.
+
+        The parsers are DRF's own defaults, listed here for the same reason
+        `messages` lists them: an endpoint that takes a file should say so
+        where it is defined, rather than relying on a setting we do not set.
+        """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         conversation = serializer.save()
         return Response(
             self._as_conversation(conversation), status=status.HTTP_201_CREATED
         )
+
+    @action(
+        detail=True,
+        methods=['patch'],
+        url_path='settings',
+        url_name='settings',
+        parser_classes=[MultiPartParser, FormParser, JSONParser],
+    )
+    def group_settings(self, request, pk=None):
+        """Edit a group's name, description or image. Admins only.
+
+        PATCH rather than PUT: a client changing the photo should not have to
+        resend the name and description to keep them.
+
+        Not called `settings`, tempting as the name is - APIView carries a
+        class attribute of that name, which DRF reads on every request
+        (`self.settings.FORMAT_SUFFIX_KWARG`, `self.settings.EXCEPTION_HANDLER`),
+        so a method would shadow it and 500 every route on this viewset.
+        """
+        conversation = self.get_object()
+
+        if conversation.kind != Conversation.Kind.GROUP:
+            raise ValidationError('Only groups have settings to edit.')
+
+        if not conversation.is_admin(request.user):
+            raise PermissionDenied('Only a group admin can edit the group.')
+
+        serializer = self.get_serializer(conversation, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        conversation = serializer.save()
+
+        # No re-fetch, unlike `members`: this writes the conversation row
+        # itself, so get_object()'s participant and message prefetches are
+        # still current.
+        return Response(self._as_conversation(conversation))
 
     # -- membership --------------------------------------------------------
 
@@ -128,6 +234,219 @@ class ConversationViewSet(
         conversation = self.get_queryset().get(pk=conversation.pk)
         return Response(self._as_conversation(conversation))
 
+    @action(detail=False, methods=['post'])
+    def join(self, request):
+        """Join a group with the code from its shareable link.
+
+        AllowAny is deliberately NOT used - joining still requires an account.
+        What makes this route different is that it does not go through
+        `get_object()`: by definition the caller is not yet a member, so the
+        access-control queryset would 404 them.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        participant = serializer.save()
+
+        conversation = self.get_queryset().filter(
+            pk=participant.conversation_id
+        ).first()
+        # PENDING members are not in `get_queryset` - they are not members yet -
+        # so there is no conversation to hand back, only the fact that they
+        # asked.
+        if conversation is None:
+            return Response({'status': participant.status})
+        return Response(self._as_conversation(conversation))
+
+    @action(detail=True, methods=['post'])
+    def leave(self, request, pk=None):
+        """Take myself out of this conversation."""
+        conversation = self.get_object()
+        participant = Participant.objects.get(
+            conversation=conversation, user=request.user
+        )
+        membership.leave(participant)
+        return Response({'status': participant.status})
+
+    @action(detail=True, methods=['get', 'post'])
+    def requests(self, request, pk=None):
+        """List people waiting to be let in, or approve/decline one."""
+        conversation = self.get_object()
+
+        if not conversation.is_admin(request.user):
+            raise PermissionDenied('Only a group admin can review requests.')
+
+        if request.method == 'GET':
+            # Participant.objects, not conversation.participants: the
+            # queryset above prefetches only ACTIVE rows, and a related manager
+            # filters that cache, so the relation would always come back empty.
+            pending = Participant.objects.filter(
+                conversation=conversation, status=Participant.Status.PENDING
+            ).select_related('user__profile')
+            return Response(ParticipantSerializer(pending, many=True).data)
+
+        serializer = self.get_serializer(
+            data=request.data,
+            context={**self.get_serializer_context(), 'conversation': conversation},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        decide = (
+            membership.approve
+            if serializer.validated_data['decision'] == 'approve'
+            else membership.decline
+        )
+        participant = decide(serializer.participant, request.user)
+        return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['post'])
+    def remove(self, request, pk=None):
+        """Take somebody out of a group, optionally blocking them for good."""
+        conversation = self.get_object()
+        serializer = self.get_serializer(
+            data=request.data,
+            context={**self.get_serializer_context(), 'conversation': conversation},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        participant = membership.remove(
+            serializer.participant,
+            request.user,
+            block=serializer.validated_data['block'],
+        )
+        return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['post'])
+    def delivery(self, request, pk=None):
+        """Change how this conversation reaches me.
+
+        `muted` silences it everywhere; `sms_enabled` decides whether texts are
+        one of its channels for me. Both are mine alone - an admin cannot set
+        them for somebody else, which is why this takes no participant id.
+        """
+        conversation = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        participant = Participant.objects.get(
+            conversation=conversation, user=request.user
+        )
+        membership.set_delivery(participant, **serializer.validated_data)
+        return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['post'])
+    def role(self, request, pk=None):
+        """Promote a member to admin, or demote them. Admins only.
+
+        This is also the way out for a group's only admin: `leave` and `remove`
+        both refuse to take the last one, so without a handover the founder is
+        stuck in the group permanently.
+        """
+        conversation = self.get_object()
+        serializer = self.get_serializer(
+            data=request.data,
+            context={**self.get_serializer_context(), 'conversation': conversation},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        participant = membership.set_role(
+            serializer.participant, serializer.validated_data['role'], request.user
+        )
+        return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['get', 'post'], url_path='join-code',
+            url_name='join-code')
+    def join_code(self, request, pk=None):
+        """Read the group's join code, or issue a new one. Admins only.
+
+        Kept off `ConversationSerializer` on purpose. The code is the thing that
+        lets a stranger in, so handing it to every member on every conversation
+        fetch would put it in far more logs, caches and screenshots than the
+        people who actually administer the group.
+
+        POST is how a leaked code is revoked: there is no separate delete,
+        because a group with no code and a mode that needs one is just broken.
+        """
+        conversation = self.get_object()
+
+        if conversation.kind != Conversation.Kind.GROUP:
+            raise ValidationError('Only groups have a join code.')
+
+        if not conversation.is_admin(request.user):
+            raise PermissionDenied('Only a group admin can see the join code.')
+
+        if request.method == 'POST':
+            conversation.regenerate_join_code()
+
+        return Response(
+            {'join_mode': conversation.join_mode, 'join_code': conversation.join_code}
+        )
+
+    @action(detail=True, methods=['post'])
+    def rename(self, request, pk=None):
+        """Give a member with no account a name. Admins only.
+
+        Somebody who joined by texting JOIN never gave one, so the group sees a
+        masked number until an admin puts a name to it.
+        """
+        conversation = self.get_object()
+
+        if not conversation.is_admin(request.user):
+            raise PermissionDenied('Only a group admin can rename a member.')
+
+        serializer = self.get_serializer(
+            data=request.data,
+            context={**self.get_serializer_context(), 'conversation': conversation},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        participant = serializer.participant
+        participant.display_name = serializer.validated_data['display_name']
+        participant.save(update_fields=['display_name'])
+        return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['post'])
+    def invite(self, request, pk=None):
+        """Invite somebody to a group by phone number. Admins only.
+
+        The way into an Invite Only group, and the only way to add somebody who
+        has no account. They are texted an invitation and receive nothing from
+        the group until they reply YES.
+        """
+        conversation = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        participant = membership.invite_by_phone(
+            conversation,
+            serializer.validated_data['phone_number'],
+            serializer.validated_data['display_name'],
+            request.user,
+        )
+        return Response(
+            ParticipantSerializer(participant).data, status=status.HTTP_201_CREATED
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete a group. Admins only, and it takes the number with it.
+
+        The number is released by a pre_delete signal rather than here, so that
+        it happens however the group is deleted - this endpoint, the admin, or a
+        management command. A number that outlives its group is one nobody is
+        watching and everybody is still paying for.
+        """
+        conversation = self.get_object()
+
+        if conversation.kind != Conversation.Kind.GROUP:
+            # A one-to-one conversation belongs to two people equally; there is
+            # nobody with the standing to delete it for both of them.
+            raise ValidationError('Only groups can be deleted.')
+
+        if not conversation.is_admin(request.user):
+            raise PermissionDenied('Only a group admin can delete the group.')
+
+        conversation.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     # -- messages ----------------------------------------------------------
 
     @action(
@@ -147,7 +466,13 @@ class ConversationViewSet(
             return self._send_message(request, conversation)
 
         history = (
-            conversation.messages.select_related('sender__profile')
+            conversation.messages.select_related(
+                'sender__profile',
+                # Messages that arrived by SMS have no `sender`, and the
+                # serializer falls back to the membership row for the name.
+                # Without this join that is one extra query per such message.
+                'sender_participant__user__profile',
+            )
             .prefetch_related('attachments')
         )
         page = self.paginate_queryset(history)

@@ -35,6 +35,10 @@ urlpatterns = [
 
     path('api/v1/users/', include('user.urls')),
     path('api/v1/chat/', include('chat.urls')),
+
+    # The one public route a phone network calls. Authenticated by signature
+    # rather than by a token - see sms/webhooks.py.
+    path('api/v1/sms/', include('sms.urls')),
 ]
 
 if settings.DEBUG:

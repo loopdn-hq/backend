@@ -10,7 +10,7 @@ Two channels, deliberately asymmetric because the providers are:
           generates or stores an SMS code; it asks Telnyx to send one, and later
           asks Telnyx whether what the user typed was right. The `SmsOtp` row
           survives only to hold the resend clock, the local attempt count, and
-          which number the code went to. See the header of utils/sms.py.
+          which number the code went to. See the header of sms/verification.py.
 
 Both raise OtpError for anything the user should be told about;
 loopd/exceptions.py turns that into a 400 inside the normal envelope.
@@ -22,14 +22,10 @@ from django.conf import settings
 from django.core.cache import cache
 
 from otp.models import EmailOtp, OtpError, SmsOtp
+from sms.client import SmsError, is_allowed_destination
+from sms.verification import check_verification_code, send_verification_code
 from user.models import Profile
 from utils.mail import VERIFICATION_CODE, EmailError, send_templated_email
-from utils.sms import (
-    SmsError,
-    check_verification_code,
-    is_allowed_destination,
-    send_verification_code,
-)
 
 logger = logging.getLogger(__name__)
 

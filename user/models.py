@@ -65,6 +65,27 @@ class Profile(models.Model):
     # mean nothing. Reset automatically in save() when the number changes.
     phone_no_verified = models.BooleanField(default=False)
 
+    # The master switch for every text this account could receive, across every
+    # group. It only ever SUBTRACTS: turning it on does not opt anybody into
+    # anything, because whether a given group texts you is decided per
+    # membership on `chat.Participant.sms_enabled`. The effective rule is
+    #
+    #     send = participant.sms_enabled and profile.sms_enabled
+    #
+    # so this is the one control that stops everything at once - which is why
+    # it defaults to True and is written from the profile endpoint, while the
+    # per-group flags default to False and are opted into individually.
+    #
+    # Members who have no account have no Profile and therefore no switch here:
+    # replying STOP is their only way out, which is why STOP handling is not
+    # optional.
+    sms_enabled = models.BooleanField(default=True, db_default=True)
+    # When they last turned it off, or replied STOP. Kept apart from the flag
+    # because "has never opted out" and "opted out and back in" are different
+    # facts, and a complaint turns on the second one.
+    sms_opt_out_at = models.DateTimeField(null=True, blank=True)
+    sms_consent_at = models.DateTimeField(null=True, blank=True)
+
     # Whether `user.email` has been confirmed with an emailed code. This is
     # the flag that gates signing in, not `user.is_active`.
     #

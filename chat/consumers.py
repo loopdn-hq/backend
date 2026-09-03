@@ -103,6 +103,33 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
     async def message_new(self, event):
         await self.send_json({'type': 'message.new', 'message': event['message']})
 
+    async def conversation_request(self, event):
+        """Somebody is waiting to be let into a group this socket administers."""
+        await self.send_json(
+            {
+                'type': 'conversation.request',
+                'conversation_id': event['conversation_id'],
+                'participant': event['participant'],
+            }
+        )
+
+    async def conversation_removed(self, event):
+        """Stop delivering a conversation this socket may no longer see.
+
+        Discarding the group is what actually revokes access on a live socket;
+        the client message is a courtesy so the UI can close the thread rather
+        than let it sit there going quiet.
+        """
+        await self.channel_layer.group_discard(
+            conversation_group(event['conversation_id']), self.channel_name
+        )
+        await self.send_json(
+            {
+                'type': 'conversation.removed',
+                'conversation_id': event['conversation_id'],
+            }
+        )
+
     async def conversation_added(self, event):
         # Join it now, so messages start arriving without a reconnect.
         await self.subscribe(conversation_group(event['conversation_id']))
@@ -125,10 +152,13 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
     @database_sync_to_async
     def conversation_ids(self):
+        # Active memberships only. A removed or blocked member keeps their row,
+        # and subscribing them to the channel group would push every future
+        # message straight to the socket of somebody who was shown the door.
         return list(
-            Participant.objects.filter(user=self.user).values_list(
-                'conversation_id', flat=True
-            )
+            Participant.objects.filter(
+                user=self.user, status=Participant.Status.ACTIVE
+            ).values_list('conversation_id', flat=True)
         )
 
     @database_sync_to_async
@@ -136,7 +166,9 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         if not conversation_id:
             return None
         return Conversation.objects.filter(
-            pk=conversation_id, participants__user=self.user
+            pk=conversation_id,
+            participants__user=self.user,
+            participants__status=Participant.Status.ACTIVE,
         ).first()
 
     @database_sync_to_async

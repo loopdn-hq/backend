@@ -2,17 +2,18 @@
 
 WHAT WE ARE DOING FOR SMS OTP
 -----------------------------
-Telnyx sells two different products that both end in "the user gets a text with
-a code", and this project uses the second one:
+Telnyx sells two different products that both end in "the user gets a text", and
+this project uses both, for different jobs:
 
-  1. Messages API - Telnyx is a dumb pipe. We generate the code, store it,
-     expire it, and check it ourselves. Requires owning a sending number.
-
-  2. Verify API - Telnyx owns the whole code lifecycle. We say "verify this
+  1. Verify API   - Telnyx owns the whole code lifecycle. We say "verify this
      number", Telnyx generates the code, sends it, remembers it, and later
-     answers "is 483920 correct?" with accepted or rejected.  <-- THIS ONE
+     answers "is 483920 correct?" with accepted or rejected.  <-- THIS MODULE
 
-So for SMS **we never see, generate or store the code**. That is why nothing
+  2. Messages API - Telnyx is a dumb pipe: we supply the text and a number we
+     own, it delivers it. That is group SMS. It is not built yet; when it is, it
+     lands in sms/outbound.py and shares the transport below.
+
+So for the OTP **we never see, generate or store the code**. That is why nothing
 here calls `otp.utils.generate_code`, and why `SmsOtp.code` is left empty - see
 the note in `otp/services.py`. The local `SmsOtp` row still exists, but only to
 hold the rate-limit clock and to remember which number a code went to; it is no
@@ -22,59 +23,28 @@ Email OTP is unaffected and still uses `EmailOtp` end to end, so the code
 generation, TTL, attempt cap and constant-time compare in `otp/models.py` are
 all still live - just not for SMS.
 
-Configuration is keyed on the environment, the same way the database, channel
-layer and file storage are: with `TELNYX_API_KEY` unset, `send_verification_code`
-logs instead of sending and `check_verification_code` accepts a fixed
-development code, so a laptop and the test suite need no account, no credentials
-and no network.
+Configuration is keyed on the environment: with `TELNYX_API_KEY` or
+`TELNYX_VERIFY_PROFILE_ID` unset, `send_verification_code` logs instead of
+sending and `check_verification_code` accepts a fixed development code, so a
+laptop and the test suite need no account, no credentials and no network.
+
+The HTTP transport, the error type and the country allowlist are shared with the
+Messages API and live in sms/client.py. Like that module, this one must never
+import `sms.models` - `otp` imports it, and it has to stay a leaf.
 """
-import json
 import logging
-import urllib.error
 import urllib.parse
-import urllib.request
 
 from django.conf import settings
 
-logger = logging.getLogger(__name__)
+from sms.client import TELNYX_API_ROOT, SmsError, _post, is_allowed_destination
 
-TELNYX_API_ROOT = 'https://api.telnyx.com/v2'
+logger = logging.getLogger(__name__)
 
 # Accepted by check_verification_code when Telnyx is not configured, so the
 # whole flow is exercisable locally. It is only ever honoured when there is no
 # API key, which a real deployment always has.
 DEV_BYPASS_CODE = '000000'
-
-# Sentinel for "caller said nothing", so that None stays a usable value for
-# treat_http_error_as below.
-_UNSET = object()
-
-
-class SmsError(Exception):
-    """Delivery or verification failed for a reason that is ours, not the user's.
-
-    The message is safe to show. Deliberately not a DRF exception - this module
-    has to stay usable from a management command or a Celery task, not just
-    from a view.
-    """
-
-
-def is_allowed_destination(phone_number):
-    """True when we are willing to send to this number's country.
-
-    The single most effective control against SMS pumping: an attacker points
-    verification at a premium-rate number in a country they control and collects
-    a share of the termination fee. Every message is a real charge, so the
-    cheapest defence is refusing to dial countries the product does not serve.
-
-    An empty allowlist means "no restriction" - a deployment that genuinely
-    serves everywhere should say so explicitly rather than have this silently
-    drop traffic.
-    """
-    allowed = settings.SMS_ALLOWED_COUNTRY_PREFIXES
-    if not allowed:
-        return True
-    return any(phone_number.startswith(prefix) for prefix in allowed)
 
 
 def send_verification_code(phone_number):
@@ -151,36 +121,3 @@ def check_verification_code(phone_number, code):
 
 def _is_configured():
     return bool(settings.TELNYX_API_KEY and settings.TELNYX_VERIFY_PROFILE_ID)
-
-
-def _post(url, payload, *, failure_message, treat_http_error_as=_UNSET):
-    """POST JSON to Telnyx and return the decoded body.
-
-    `treat_http_error_as` turns a 4xx into that value instead of an SmsError,
-    which is how a rejected code stays an ordinary answer.
-    """
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            'Authorization': f'Bearer {settings.TELNYX_API_KEY}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=settings.SMS_REQUEST_TIMEOUT) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Telnyx puts a human-readable reason in the body; worth logging, but
-        # not worth showing a user who can do nothing with "10008".
-        detail = exc.read().decode(errors='replace')[:500]
-        logger.warning('Telnyx returned %s for %s: %s', exc.code, url, detail)
-        if treat_http_error_as is not _UNSET:
-            return treat_http_error_as
-        raise SmsError(failure_message)
-    except Exception as exc:
-        # Timeout, DNS, TLS - anything meaning the request never landed.
-        logger.error('Telnyx unreachable at %s: %s', url, exc)
-        raise SmsError(failure_message)

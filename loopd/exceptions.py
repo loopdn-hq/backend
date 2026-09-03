@@ -15,9 +15,11 @@ from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
+from chat.membership import JoinRefused, NotAMember
+from chat.models import BlockedFromConversation, PostingNotAllowed
 from otp.models import OtpError
+from sms.client import SmsError
 from utils.mail import EmailError
-from utils.sms import SmsError
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,19 @@ def api_exception_handler(exc, context):
         return Response(
             {'detail': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE
         )
+
+    # Blocked is a 403 and not a 404: the caller already knows the conversation
+    # exists - they were in it - so hiding it now says nothing and only makes
+    # the app look broken to somebody who should be told plainly.
+    if isinstance(exc, (BlockedFromConversation, PostingNotAllowed)):
+        return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+
+    # Both carry a message written for the person who asked, including over
+    # SMS, so they are ordinary 400s rather than crashes.
+    if isinstance(exc, (JoinRefused, NotAMember)):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        exc = DRFValidationError({'detail': str(exc)})
 
     # TokenError is a plain Exception, so an expired or blacklisted refresh
     # token would otherwise fall through to the 500 branch below. This is the

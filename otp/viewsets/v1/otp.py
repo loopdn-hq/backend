@@ -8,7 +8,7 @@ HOW SMS OTP WORKS HERE
 These two endpoints drive the Telnyx **Verify** API, not a code this project
 generates. Telnyx creates the code, sends it, remembers it, and answers whether
 what the user typed matches. Nothing in this repo ever holds an SMS code. The
-reasoning, and what that means for `SmsOtp`, is at the top of utils/sms.py.
+reasoning, and what that means for `SmsOtp`, is at the top of sms/verification.py.
 
 Both endpoints require a signed-in user - unlike email verification, which has
 to work before the account is usable. That is most of the anti-abuse story on
@@ -26,8 +26,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from otp.serializers import RequestPhoneCodeSerializer, VerifyPhoneSerializer
+from sms.verification import DEV_BYPASS_CODE
 from user.serializers import ProfileSerializer
-from utils.sms import DEV_BYPASS_CODE
 
 
 def verification_payload(otp):
@@ -39,7 +39,7 @@ def verification_payload(otp):
     }
 
     # With Telnyx unconfigured nothing is actually sent, so development returns
-    # the code that utils.sms accepts instead. Guarded on DEBUG as well: in a
+    # the code that sms.verification accepts instead. Guarded on DEBUG as well: in a
     # live deployment this line would hand out a working code.
     if settings.DEBUG and not settings.TELNYX_API_KEY:
         payload['debug_code'] = DEV_BYPASS_CODE
