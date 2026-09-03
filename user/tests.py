@@ -937,7 +937,11 @@ class UserSearchTests(EnvelopeAssertions, APITestCase):
         self.me.profile.save()
 
         self.bob = User.objects.create_user(username='bobby', password='x')
+        # Verified in one save, which Profile.save() reads as the verification
+        # flow. Search deliberately ignores unverified numbers, so a fixture
+        # that skipped this would make the lookup test fail for the wrong reason.
         self.bob.profile.phone_number = '+639170000002'
+        self.bob.profile.phone_no_verified = True
         self.bob.profile.save()
 
         self.client.force_authenticate(self.me)
@@ -959,6 +963,16 @@ class UserSearchTests(EnvelopeAssertions, APITestCase):
     def test_finds_by_exact_phone_number(self):
         data = self.search('+639170000002')
         self.assertEqual([row['username'] for row in data['results']], ['bobby'])
+
+    def test_an_unverified_number_finds_nobody(self):
+        # Otherwise search routes around find_user: it hands back the squatter,
+        # the client shows them, the user taps, and the conversation is then
+        # started by USERNAME - which never re-checks the number at all.
+        eve = User.objects.create_user(username='eve', password='x')
+        eve.profile.phone_number = '+639179999999'
+        eve.profile.save()
+
+        self.assertEqual(self.search('+639179999999')['results'], [])
 
     def test_a_partial_phone_number_finds_nobody(self):
         # Otherwise the endpoint is a way to walk the phone directory.
@@ -1019,3 +1033,55 @@ class ProfileModelTests(APITestCase):
     def tearDownClass(cls):
         super().tearDownClass()
         shutil.rmtree(MEDIA_ROOT, ignore_errors=True)
+
+
+class FindUserByPhoneNumberTests(APITestCase):
+    """Looking somebody up by phone number requires that they proved it.
+
+    `Profile.phone_number` is unique but its uniqueness says nothing about
+    ownership: `phone_no_verified` is a separate flag, so anybody can type a
+    stranger's number into their own profile and sit on it. Before this rule,
+    that squatted row was the one a lookup returned - which is how a squatter
+    ends up added to a private group meant for the number's real owner, and,
+    once groups are also delivered over SMS, texted its contents.
+    """
+
+    def setUp(self):
+        self.number = '+639171234567'
+        self.squatter = User.objects.create_user(username='squatter', password='x')
+        # Exactly what the profile endpoint allows: set a number, prove nothing.
+        self.squatter.profile.phone_number = self.number
+        self.squatter.profile.save()
+
+    def test_an_unverified_number_resolves_to_nobody(self):
+        from user.lookups import find_user
+
+        self.assertIsNone(find_user(self.number))
+
+    def test_a_verified_number_resolves_to_its_owner(self):
+        from user.lookups import find_user
+
+        # Both fields in one save - Profile.save() reads that as the
+        # verification flow rather than a number change.
+        self.squatter.profile.phone_no_verified = True
+        self.squatter.profile.save()
+
+        self.assertEqual(find_user(self.number), self.squatter)
+
+    def test_a_squatter_cannot_be_added_to_a_group_by_the_real_number(self):
+        from chat.models import Conversation
+        from chat.serializers import resolve_members
+
+        owner = User.objects.create_user(username='owner', password='x')
+        Conversation.start_group(owner, name='Family')
+
+        with self.assertRaises(Exception) as caught:
+            resolve_members([self.number])
+        # Reported as an unknown identifier, which is the honest answer: no
+        # verified owner of that number exists.
+        self.assertIn(self.number, str(caught.exception))
+
+    def test_username_lookup_is_unaffected(self):
+        from user.lookups import find_user
+
+        self.assertEqual(find_user('squatter'), self.squatter)

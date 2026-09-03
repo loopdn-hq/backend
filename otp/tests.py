@@ -18,6 +18,8 @@ from rest_framework.test import APITestCase
 from otp.models import EmailOtp, OtpError, SmsOtp
 from otp.services import start_email_verification, start_phone_verification
 from otp.utils import default_expiry, generate_code
+from sms.client import SmsError
+from sms.verification import DEV_BYPASS_CODE
 from user.models import Profile
 from utils.mail import (
     VERIFICATION_CODE,
@@ -25,7 +27,6 @@ from utils.mail import (
     send_email,
     send_templated_email,
 )
-from utils.sms import DEV_BYPASS_CODE, SmsError
 
 
 class GenerateCodeTests(TestCase):
@@ -153,7 +154,7 @@ class PhoneVerificationApiTests(APITestCase):
     """The two endpoints at /api/v1/users/me/phone/.
 
     Telnyx is unconfigured throughout (no TELNYX_API_KEY), which is the path
-    utils.sms takes locally: nothing is sent and DEV_BYPASS_CODE is accepted.
+    sms.verification takes locally: nothing is sent and DEV_BYPASS_CODE is accepted.
     That keeps these tests offline while still exercising every branch this
     project owns - the ceilings, the cooldown, the attempt count and the
     both-fields-in-one-save rule on Profile.

@@ -143,6 +143,7 @@ INSTALLED_APPS = [
     'user',
     'otp',
     'chat',
+    'sms',
 ]
 
 MIDDLEWARE = [
@@ -375,7 +376,7 @@ OTP_RESEND_COOLDOWN = timedelta(
 
 # The cooldown alone only stops bursts: waiting 60 seconds between requests
 # still buys 1,440 messages a day. These are the ceilings that make an attack
-# uninteresting, and every SMS is a real charge - see utils/sms.py on pumping.
+# uninteresting, and every SMS is a real charge - see sms/client.py on pumping.
 # Enforced per profile AND per destination number, so neither one account
 # working through many numbers nor many accounts hammering one number gets
 # through. See otp/services.py.
@@ -387,13 +388,136 @@ OTP_MAX_SENDS_PER_DAY = int(os.environ.get('OTP_MAX_SENDS_PER_DAY', '10'))
 #
 # We use the Verify API, not the Messages API: Telnyx generates, sends, stores
 # and checks the code, so this project never holds an SMS code at all. The full
-# reasoning is at the top of utils/sms.py.
+# reasoning is at the top of sms/verification.py.
 #
-# Unset in development - utils/sms.py then logs instead of sending and accepts
+# Unset in development - sms/verification.py then logs instead of sending and accepts
 # a fixed code, so the flow works with no account and no network.
 
 TELNYX_API_KEY = os.environ.get('TELNYX_API_KEY', '')
 TELNYX_VERIFY_PROFILE_ID = os.environ.get('TELNYX_VERIFY_PROFILE_ID', '')
+
+# Group SMS, which is a different provider product from phone verification.
+# Unset, sms/client.py:send_text logs instead of sending, so the whole fan-out
+# runs on a laptop and in CI with no account - the same shape as every other
+# backend in this file.
+TELNYX_MESSAGING_PROFILE_ID = os.environ.get('TELNYX_MESSAGING_PROFILE_ID', '')
+
+# Comma-separated: rotating a signing key needs both the old and new one valid
+# at once. Empty means inbound webhook signatures are not checked, which is
+# only ever right in development.
+TELNYX_PUBLIC_KEYS = [
+    key.strip()
+    for key in os.environ.get('TELNYX_PUBLIC_KEYS', '').split(',')
+    if key.strip()
+]
+
+# How far out of step a webhook's timestamp may be before it is refused. Stops a
+# captured request being replayed days later.
+SMS_WEBHOOK_TOLERANCE_SECONDS = int(
+    os.environ.get('SMS_WEBHOOK_TOLERANCE_SECONDS', '300')
+)
+
+# The master switch for outbound group SMS. Off means the fan-out is never even
+# scheduled, so a deployment that has not finished provisioning cannot text
+# anybody by accident.
+SMS_SENDING_ENABLED = os.environ.get('SMS_SENDING_ENABLED', 'True').lower() in (
+    '1', 'true', 'yes'
+)
+
+# Spend ceilings, counted in SEGMENTS rather than messages, because a long
+# message is several charges. The same shape as the OTP ceilings above, for the
+# same reason: one inbound text can trigger a message to everybody in a group,
+# and nothing else bounds that.
+# A group's number belongs to the country of whoever created it, read from
+# their verified phone number. This is the prefix -> ISO table that decides it;
+# it only needs the countries the product actually serves, and it must stay in
+# step with SMS_ALLOWED_COUNTRY_PREFIXES above.
+SMS_COUNTRY_BY_PREFIX = {
+    '+63': 'PH',
+    '+1': 'US',
+    '+44': 'GB',
+    '+61': 'AU',
+    '+65': 'SG',
+}
+
+# Where to look when the creator's own country has nothing available - some
+# countries need regulatory paperwork that cannot be done from an API call, and
+# a group with a foreign number still works. Tried in order, so put the easiest
+# to buy in first.
+SMS_FALLBACK_COUNTRIES = [
+    country.strip()
+    for country in os.environ.get('SMS_FALLBACK_COUNTRIES', 'US,GB,CA').split(',')
+    if country.strip()
+]
+
+# Used when a group's creator has no verified number at all - a real case, since
+# a phone number is optional at registration. It is a guess, and it is logged
+# as one.
+SMS_DEFAULT_COUNTRY = os.environ.get('SMS_DEFAULT_COUNTRY', 'US')
+
+# Buying a number is slower than sending a text and nobody is waiting on a
+# screen for it, so it can afford a longer timeout than SMS_REQUEST_TIMEOUT.
+SMS_NUMBER_REQUEST_TIMEOUT = int(os.environ.get('SMS_NUMBER_REQUEST_TIMEOUT', '30'))
+
+# A search does not reserve anything, so another customer can take a number
+# between finding it and ordering it. Several candidates are fetched so the
+# order can move on to the next one instead of failing.
+SMS_NUMBER_SEARCH_CANDIDATES = 5
+
+# An order is accepted with status 'pending' and becomes 'success' shortly
+# after. US orders settle immediately in practice; these bound the wait for the
+# ones that do not.
+SMS_NUMBER_ORDER_POLLS = int(os.environ.get('SMS_NUMBER_ORDER_POLLS', '3'))
+SMS_NUMBER_ORDER_POLL_SECONDS = float(
+    os.environ.get('SMS_NUMBER_ORDER_POLL_SECONDS', '1.5')
+)
+
+# One message to a group is one text per SMS member. Above this many, the
+# message still reaches everybody in the app and the SMS leg is skipped and
+# recorded - because a single post to a very large group is a bill nobody
+# authorised, and finding out afterwards is too late.
+# Retrying a failed delivery is worth a few goes - carriers have bad minutes -
+# and no more. A disconnected number fails identically every time.
+SMS_MAX_DELIVERY_ATTEMPTS = int(os.environ.get('SMS_MAX_DELIVERY_ATTEMPTS', '3'))
+# And only while the message is still worth delivering. Nobody wants yesterday's
+# "dinner at 7".
+SMS_RETRY_WINDOW_HOURS = int(os.environ.get('SMS_RETRY_WINDOW_HOURS', '6'))
+
+# A row still SENDING after this belongs to a process that died: the provider
+# call sits between the two writes, so nothing else takes that long.
+SMS_STALLED_AFTER_MINUTES = int(os.environ.get('SMS_STALLED_AFTER_MINUTES', '15'))
+
+# How many numberless groups to try to provision per run. Bounded because each
+# one is a purchase.
+SMS_PROVISION_BATCH = int(os.environ.get('SMS_PROVISION_BATCH', '10'))
+
+# The delivery log gains a row per recipient per message and never loses one,
+# and it records who texts which private group. Not something to keep forever.
+SMS_RETENTION_DAYS = int(os.environ.get('SMS_RETENTION_DAYS', '90'))
+
+# Where the daily spend report goes. Unset, it only goes to the log.
+SMS_REPORT_EMAIL = os.environ.get('SMS_REPORT_EMAIL', '')
+
+SMS_MAX_RECIPIENTS_PER_MESSAGE = int(
+    os.environ.get('SMS_MAX_RECIPIENTS_PER_MESSAGE', '100')
+)
+
+# Join codes are six characters from a 29-letter alphabet. That is a lot of
+# guesses, but not if a number can guess without limit, so attempts are capped
+# per sending number.
+SMS_MAX_JOIN_ATTEMPTS_PER_HOUR = int(
+    os.environ.get('SMS_MAX_JOIN_ATTEMPTS_PER_HOUR', '5')
+)
+
+SMS_MAX_SEGMENTS_PER_GROUP_PER_DAY = int(
+    os.environ.get('SMS_MAX_SEGMENTS_PER_GROUP_PER_DAY', '2000')
+)
+SMS_MAX_SEGMENTS_PER_DAY = int(os.environ.get('SMS_MAX_SEGMENTS_PER_DAY', '20000'))
+# Replies to unauthenticated inbound texts (HELP, join refusals). Every one is a
+# billed message somebody else triggered, so it is capped per number.
+SMS_MAX_REPLIES_PER_NUMBER_PER_HOUR = int(
+    os.environ.get('SMS_MAX_REPLIES_PER_NUMBER_PER_HOUR', '3')
+)
 
 # Short on purpose. This call sits inside a request the user is waiting on, and
 # a provider that has stopped answering should surface as an error quickly
@@ -423,6 +547,12 @@ MEDIA_ROOT = BASE_DIR / 'var' / 'media'
 
 # Avatars are re-encoded thumbnails, not originals, so the ceiling is small.
 MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024
+
+# A group's image. The same number as an avatar today, but its own setting:
+# retuning what somebody may upload for themselves should not silently retune
+# what an admin may upload on behalf of a whole group - and the tests lower
+# these ceilings to reach the failure path, one app at a time.
+MAX_GROUP_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024
 
 # Chat attachments. The ceiling is per file, and the count is per message,
 # so one request can carry at most 10 x 25MB.
@@ -567,3 +697,30 @@ CELERY_TASK_SOFT_TIME_LIMIT = 9 * 60
 # Schedules live in the database and are editable from the admin, rather
 # than being frozen into a settings dict that needs a deploy to change.
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# The jobs that keep the SMS layer honest. DatabaseScheduler syncs these into
+# the database on start, so they are editable from the admin afterwards without
+# a deploy - which is the point of using it rather than a file-only schedule.
+CELERY_BEAT_SCHEDULE = {
+    'sms-retry-failed-deliveries': {
+        'task': 'sms.retry_failed_deliveries',
+        'schedule': 300.0,
+    },
+    'sms-requeue-stalled-deliveries': {
+        'task': 'sms.requeue_stalled_deliveries',
+        'schedule': 600.0,
+    },
+    'sms-provision-missing-numbers': {
+        'task': 'sms.provision_missing_numbers',
+        'schedule': 900.0,
+    },
+    'sms-purge-old-deliveries': {
+        'task': 'sms.purge_old_deliveries',
+        # Daily. Nothing here is urgent and it deletes rows.
+        'schedule': 86400.0,
+    },
+    'sms-daily-spend-report': {
+        'task': 'sms.daily_spend_report',
+        'schedule': 86400.0,
+    },
+}

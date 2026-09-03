@@ -3,7 +3,7 @@
 WHAT WE ARE DOING FOR EMAIL
 ---------------------------
 Resend sends the message; we own the content. That split is the opposite of the
-SMS arrangement next door in utils/sms.py, where Telnyx owns the code itself -
+SMS arrangement in sms/verification.py, where Telnyx owns the code itself -
 worth knowing before reading the two side by side.
 
 Resend can hold templates for you: its send endpoint accepts `template` and
@@ -55,7 +55,7 @@ RESEND_API_ROOT = 'https://api.resend.com'
 # `error code: 1010` - Cloudflare's "browser banned" page, not a Resend error -
 # so it survives every amount of fixing the payload, the key or the sending
 # domain, and the JSON decode of the error body fails too. Any explicit
-# User-Agent gets through. Telnyx has no such rule, which is why utils/sms.py
+# User-Agent gets through. Telnyx has no such rule, which is why sms/client.py
 # does not need one.
 USER_AGENT = 'loopd-backend'
 

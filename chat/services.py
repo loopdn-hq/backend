@@ -8,7 +8,13 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.db import transaction
 
-from chat.models import Attachment, Message
+from chat.models import (
+    Attachment,
+    Conversation,
+    Message,
+    Participant,
+    PostingNotAllowed,
+)
 from chat.utils import describe_upload
 
 
@@ -33,11 +39,43 @@ def send_to_group(group, payload):
 
 
 @transaction.atomic
-def create_message(conversation, sender, text='', uploads=None):
-    """Store a message with its attachments and touch the conversation."""
+def create_message(conversation, sender=None, text='', uploads=None, *,
+                   source=Message.Source.APP, participant=None):
+    """Store a message with its attachments and touch the conversation.
+
+    `sender` is the account that sent it, or None when the sender has no
+    account - somebody texting in from a number that is a member of the group.
+    `participant` is the membership row they sent it as; it is resolved from
+    `sender` when not given, so every existing caller keeps working unchanged
+    and gets the attribution for free.
+
+    The two are kept in step here rather than at each call site, because a
+    message whose `sender` and `sender_participant` disagree would render one
+    name in the app and credit a different one in the SMS fan-out.
+    """
+    if participant is None and sender is not None:
+        # Explicit queryset, and explicitly ACTIVE: a message is credited to a
+        # live membership or to none. Going through the relation would read the
+        # prefetch cache, which may or may not be filtered depending on how the
+        # caller fetched the conversation.
+        participant = Participant.objects.filter(
+            conversation=conversation,
+            user=sender,
+            status=Participant.Status.ACTIVE,
+        ).first()
+
+    # Enforced here rather than in each caller: this is the single write path
+    # for REST, the websocket and inbound SMS, so a broadcast group that three
+    # entry points had to remember to check would be a broadcast group in two
+    # of them.
+    if not conversation.allows_posting_by(participant):
+        raise PostingNotAllowed('Only admins can post in this group.')
+
     message = Message.objects.create(
         conversation=conversation,
         sender=sender,
+        sender_participant=participant,
+        source=source,
         text=text or '',
     )
 
@@ -53,6 +91,11 @@ def create_message(conversation, sender, text='', uploads=None):
     # Only broadcast once the row is really committed - subscribers on other
     # workers would otherwise race the transaction and fetch nothing.
     transaction.on_commit(lambda: broadcast_message(message))
+
+    # And out to anybody taking part by text. Scheduled, never run inline: this
+    # is N provider calls, and it must not happen inside the transaction that
+    # is still holding the row - see sms/outbound.py:schedule.
+    _schedule_sms_fanout(message)
     return message
 
 
@@ -75,6 +118,35 @@ def broadcast_message(message):
     )
 
 
+def announce_added_to_conversation(conversation, users):
+    """Queue the added-to-conversation event for after the transaction commits.
+
+    Two bugs in one, both of which only appear on a real deployment:
+
+    Publishing inside the transaction lets a socket on another worker receive
+    the event, subscribe, and read a conversation that has not been committed
+    yet - the same hazard `create_message` documents for message broadcasts.
+
+    Serialising `conversation` as the caller holds it renders whatever its
+    participant prefetch was populated with, which was fetched BEFORE the new
+    people existed. Each new member is then told a member list that does not
+    include them. Re-reading by pk after commit is what makes the payload true.
+    """
+    pks = [user.pk for user in users if user is not None]
+    if not pks:
+        return
+
+    def _publish():
+        from django.contrib.auth.models import User
+
+        fresh = Conversation.objects.filter(pk=conversation.pk).first()
+        if fresh is None:
+            return
+        broadcast_added_to_conversation(fresh, list(User.objects.filter(pk__in=pks)))
+
+    transaction.on_commit(_publish)
+
+
 def broadcast_added_to_conversation(conversation, users):
     """Tell people they are now in a conversation, so their socket joins it.
 
@@ -91,5 +163,71 @@ def broadcast_added_to_conversation(conversation, users):
                 'type': 'conversation.added',
                 'conversation_id': conversation.pk,
                 'conversation': payload,
+            },
+        )
+
+
+def broadcast_removed_from_conversation(conversation, users):
+    """Tell people they are no longer in a conversation, so their socket lets go.
+
+    Subscription is decided once, at connect, from the memberships that existed
+    then. Without this event a member who is removed or blocked keeps receiving
+    every message on the socket they already hold - for as long as they leave
+    the tab open - while every REST route correctly refuses them. The one place
+    the status column could not reach on its own.
+
+    Sent to each person's own group, because the thing being revoked is their
+    membership of the conversation group.
+    """
+    for user in users:
+        if user is None:
+            continue
+        send_to_group(
+            user_group(user.pk),
+            {'type': 'conversation.removed', 'conversation_id': conversation.pk},
+        )
+
+
+def _schedule_sms_fanout(message):
+    """Hand a new message to the SMS fan-out, if the app is installed.
+
+    A function-local import, which is the house style for the one direction
+    `chat` must not depend on at module level: `sms` imports `chat`, so the
+    reverse at import time would be a cycle.
+    """
+    try:
+        from sms.outbound import schedule
+    except ImportError:  # pragma: no cover - sms is always installed today
+        return
+    schedule(message)
+
+
+def broadcast_join_request(conversation, participant):
+    """Tell the admins of a group that somebody is waiting to be let in.
+
+    Over the websocket, to the admins only. A pending request is invisible
+    otherwise - it sits in a queue nobody is told about, and the person who
+    asked waits on an admin who does not know they asked.
+
+    Not by SMS: an admin may be in many groups, every text is a real charge, and
+    the app is where approving actually happens.
+    """
+    from chat.serializers import ParticipantSerializer
+
+    payload = ParticipantSerializer(participant).data
+    admins = Participant.objects.filter(
+        conversation=conversation,
+        status=Participant.Status.ACTIVE,
+        role=Participant.Role.ADMIN,
+        user__isnull=False,
+    ).select_related('user')
+
+    for admin in admins:
+        send_to_group(
+            user_group(admin.user_id),
+            {
+                'type': 'conversation.request',
+                'conversation_id': conversation.pk,
+                'participant': payload,
             },
         )
