@@ -152,6 +152,47 @@ class ParticipantSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class GroupSettingsFieldsSerializer(serializers.Serializer):
+    """How a group behaves - its policy, as opposed to what it is called.
+
+    One serializer used by BOTH create and update, so there is a single shape to
+    learn rather than two that drift apart. Every field optional; anything left
+    out keeps its default.
+
+    `name`, `description` and `image` are deliberately NOT here. They are the
+    group's identity, they are what `edit_group_permission` can be relaxed to
+    let ordinary members change, and the policy below must not travel with them.
+    """
+
+    mode = serializers.ChoiceField(choices=Conversation.Mode.choices, required=False)
+    join_mode = serializers.ChoiceField(
+        choices=Conversation.JoinMode.choices, required=False
+    )
+    add_member_permission = serializers.ChoiceField(
+        choices=Conversation.MemberAddPermission.choices, required=False
+    )
+    edit_group_permission = serializers.ChoiceField(
+        choices=Conversation.EditGroupPermission.choices, required=False
+    )
+    sms_delivery_enabled = serializers.BooleanField(required=False)
+    sms_replies_enabled = serializers.BooleanField(required=False)
+    voice_messages_enabled = serializers.BooleanField(required=False)
+
+
+#: Changing any of these is an admin decision even in a group where members may
+#: edit the name and photo. A member who could grant themselves permissions
+#: would make `edit_group_permission` meaningless.
+ADMIN_ONLY_SETTINGS = {
+    'mode',
+    'join_mode',
+    'add_member_permission',
+    'edit_group_permission',
+    'sms_delivery_enabled',
+    'sms_replies_enabled',
+    'voice_messages_enabled',
+}
+
+
 class GroupNumberSerializer(serializers.Serializer):
     """The group's own phone number, as a client needs to see it.
 
@@ -194,6 +235,12 @@ class ConversationSerializer(serializers.ModelSerializer):
     # for everybody: it is fixed for the life of the group, so there is no
     # writable form of this field for a client or an admin to reach.
     sms_number = serializers.SerializerMethodField()
+    # Nested to match what POST .../group/ and PATCH .../settings/ already
+    # accept (GroupSettingsFieldsSerializer). source='*' hands the whole
+    # Conversation instance through, since these are plain model fields
+    # rather than a related object - this endpoint used to leave `settings`
+    # out entirely, so the client's Admin Panel Settings tab always saw null.
+    settings = GroupSettingsFieldsSerializer(source='*', read_only=True)
 
     class Meta:
         model = Conversation
@@ -336,47 +383,6 @@ class DirectConversationSerializer(serializers.Serializer):
         if created:
             announce_added_to_conversation(conversation, [self.other])
         return conversation
-
-
-class GroupSettingsFieldsSerializer(serializers.Serializer):
-    """How a group behaves - its policy, as opposed to what it is called.
-
-    One serializer used by BOTH create and update, so there is a single shape to
-    learn rather than two that drift apart. Every field optional; anything left
-    out keeps its default.
-
-    `name`, `description` and `image` are deliberately NOT here. They are the
-    group's identity, they are what `edit_group_permission` can be relaxed to
-    let ordinary members change, and the policy below must not travel with them.
-    """
-
-    mode = serializers.ChoiceField(choices=Conversation.Mode.choices, required=False)
-    join_mode = serializers.ChoiceField(
-        choices=Conversation.JoinMode.choices, required=False
-    )
-    add_member_permission = serializers.ChoiceField(
-        choices=Conversation.MemberAddPermission.choices, required=False
-    )
-    edit_group_permission = serializers.ChoiceField(
-        choices=Conversation.EditGroupPermission.choices, required=False
-    )
-    sms_delivery_enabled = serializers.BooleanField(required=False)
-    sms_replies_enabled = serializers.BooleanField(required=False)
-    voice_messages_enabled = serializers.BooleanField(required=False)
-
-
-#: Changing any of these is an admin decision even in a group where members may
-#: edit the name and photo. A member who could grant themselves permissions
-#: would make `edit_group_permission` meaningless.
-ADMIN_ONLY_SETTINGS = {
-    'mode',
-    'join_mode',
-    'add_member_permission',
-    'edit_group_permission',
-    'sms_delivery_enabled',
-    'sms_replies_enabled',
-    'voice_messages_enabled',
-}
 
 
 class InviteEntrySerializer(serializers.Serializer):
