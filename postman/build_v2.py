@@ -238,20 +238,31 @@ CONVERSATIONS = [
             '**The group is given its own phone number**, in the country of '
             'whoever created it, read from their verified number. That number '
             'never changes, and it is deleted when the group is.\n\n'
-            'The number comes back as `sms_number` and may be `null` for a '
-            'moment: buying it is a call to the telecom provider, made after '
-            'the group is committed, so a slow provider cannot turn "create a '
-            'group" into "create nothing".\n\n'
+            'The number comes back as `sms_number`, an object of `number`, '
+            '`country`, `status` and `provider`. The whole object may be '
+            '`null` for a moment: buying it is a call to the telecom '
+            'provider, made after the group is committed, so a slow provider '
+            'cannot turn "create a group" into "create nothing".\n\n'
+            'An **empty `provider`** means no provider is configured and the '
+            'number is a placeholder - well-formed, but it belongs to nobody '
+            'and texting it does nothing. Do not tell a user to text a number '
+            'whose `provider` is empty.\n\n'
             '`members` takes usernames or **verified** `+E.164` numbers. Send '
             'an image by switching this request to form-data.'
         )),
     req('Get a conversation', 'GET', '/api/v1/chat/conversations/{{conversation_id}}/',
         desc=(
-            'One conversation, its active members, its latest message and its '
+            'One conversation: its settings, its latest message and its '
             '`sms_number`.\n\n'
+            '**No `participants`.** The member list is unbounded and every row '
+            'nests a user and a profile, so a group of two hundred would put '
+            'two hundred profiles in every fetch - and once per conversation '
+            'on the list endpoint. Use *List members* instead.\n\n'
             '`sms_number` is read-only everywhere and for everybody. It is '
             'saved in members\' phones as the group\'s name, so a number that '
-            'could be reassigned would deliver a stranger\'s messages.'
+            'could be reassigned would deliver a stranger\'s messages.\n\n'
+            'Fields: `number`, `country`, `status`, `provider`. An empty '
+            '`provider` marks a placeholder that cannot actually receive text.'
         )),
     req('Delete a group', 'DELETE', '/api/v1/chat/conversations/{{conversation_id}}/',
         desc=(
@@ -263,9 +274,23 @@ CONVERSATIONS = [
         )),
     req('Edit group settings', 'PATCH', '/api/v1/chat/conversations/{{conversation_id}}/settings/',
         body={'name': 'Family', 'description': 'Home things',
-              'join_mode': 'code', 'mode': 'chat'},
+              'settings': {'mode': 'chat', 'join_mode': 'code',
+                           'add_member_permission': 'admins',
+                           'edit_group_permission': 'admins',
+                           'sms_delivery_enabled': True,
+                           'sms_replies_enabled': True,
+                           'voice_messages_enabled': True}},
         desc=(
             'Admins only. Every field optional.\n\n'
+            'The seven settings go **inside `settings`**, the same object '
+            '`POST /group/` takes - there is one shape to learn. Sending them '
+            'at the top level is silently ignored: DRF drops fields a '
+            'serializer does not declare, so the request returns 200 and '
+            'changes nothing.\n\n'
+            'All seven come back under `settings` on the conversation object, '
+            'the same shape you sent - so a settings screen renders from one '
+            'fetch and there is one shape to learn. `join_code` does not: it '
+            'has its own admin-only endpoint.\n\n'
             '**`join_mode`** - how somebody who is not a member gets in:\n\n'
             '| Value | Meaning |\n'
             '| --- | --- |\n'
@@ -279,7 +304,9 @@ CONVERSATIONS = [
             'post; members still read). Enforced on every route at once, '
             'including inbound SMS.\n\n'
             'Editing settings deliberately does **not** bump the group up '
-            "everyone's conversation list. Only a message is activity."
+            "everyone's conversation list. Only a message is activity.\n\n"
+            'The reply is the conversation - which carries no `participants` '
+            'on any endpoint. Use *List members* for the member list.'
         )),
     req('Start direct chat', 'POST', '/api/v1/chat/conversations/direct/',
         body={'identifier': 'bob'},
@@ -294,6 +321,27 @@ CONVERSATIONS = [
 ]
 
 MEMBERSHIP = [
+    req('List members', 'GET', '/api/v1/chat/conversations/{{conversation_id}}/participants/',
+        query=[{'key': 'page', 'value': '1'},
+               {'key': 'page_size', 'value': '10'}],
+        desc=(
+            'Who is in this conversation, **ten at a time**.\n\n'
+            'Its own endpoint rather than a field on every conversation reply: '
+            'the member list is unbounded and each row carries a nested user '
+            'and profile, so a group of two hundred made every fetch of the '
+            'group carry two hundred profiles.\n\n'
+            'Returns the standard page envelope inside `data`:\n\n'
+            '```\n'
+            '{ "count": 17, "next": "...?page=2", "previous": null,\n'
+            '  "results": [ ...participants... ] }\n'
+            '```\n\n'
+            '`page_size` raises the page up to a maximum of 100. **Active '
+            'members only** - somebody who left, was removed or is waiting on '
+            'approval is not a member; pending requests have their own '
+            'endpoint, *Join requests*.\n\n'
+            'A non-member gets **404**, not 403 - access control here is the '
+            'queryset, so an outsider cannot learn the conversation exists.'
+        )),
     req('Add members', 'POST', '/api/v1/chat/conversations/{{conversation_id}}/members/',
         body={'members': ['bob', '+639170000003']},
         desc=(

@@ -37,6 +37,8 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from rest_framework.pagination import PageNumberPagination
+
 from chat import membership
 from chat.models import Conversation, Message, Participant
 from chat.serializers import (
@@ -57,6 +59,23 @@ from chat.serializers import (
     ParticipantSerializer,
     RemoveMemberSerializer,
 )
+
+
+class ParticipantPagination(PageNumberPagination):
+    """Ten members a page, because that is roughly one screen.
+
+    Its own class rather than the project default of 20: this list is rendered
+    as rows in a sheet a user scrolls, where the first page wants to be small
+    and fast, unlike a message history where 20 is one scrollback.
+
+    `page_size_query_param` lets a client that knows better ask for more - an
+    admin screen showing a whole group, say - and `max_page_size` stops that
+    becoming a way to ask the server for an unbounded serialization.
+    """
+
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
 
 
 class ConversationViewSet(
@@ -89,6 +108,7 @@ class ConversationViewSet(
         'group': 'Group created.',
         'group_settings': 'Group updated.',
         'members': 'Members added.',
+        'participants': 'Participants fetched.',
         'messages:GET': 'Messages fetched.',
         'messages:POST': 'Message sent.',
         'join': 'Join request handled.',
@@ -118,6 +138,10 @@ class ConversationViewSet(
                 participants__status=Participant.Status.ACTIVE,
             )
             .distinct()
+            # A reverse one-to-one, so it joins rather than costing a query per
+            # conversation - which it did, every time the list serialised the
+            # group's number.
+            .select_related('sms_number')
             .prefetch_related(
                 Prefetch(
                     'participants',
@@ -216,6 +240,47 @@ class ConversationViewSet(
         return Response(self._as_conversation(conversation))
 
     # -- membership --------------------------------------------------------
+
+    @action(detail=True, methods=['get'], pagination_class=ParticipantPagination)
+    def participants(self, request, pk=None):
+        """Who is in this conversation, ten at a time.
+
+        Its own endpoint rather than a field on every conversation reply,
+        because the member list is unbounded and each row carries a nested user
+        and profile: a group of two hundred made every fetch of the group carry
+        two hundred profiles.
+
+        ACTIVE rows only - the same set the conversation payload carries.
+        Somebody who left, was removed or is waiting on approval is not a
+        member; pending requests have their own endpoint (`requests`).
+
+        Ordered by `joined_at` **then `pk`**. Paginating on a non-unique sort
+        key can show one row on two pages and skip another entirely, and
+        `joined_at` is not unique - everybody added in a single request shares
+        a timestamp to the microsecond.
+
+        Access control is `get_object()`, which runs the member-scoped
+        queryset, so a non-member gets 404 here exactly as everywhere else.
+        """
+        conversation = self.get_object()
+
+        rows = (
+            Participant.objects.filter(
+                conversation=conversation, status=Participant.Status.ACTIVE
+            )
+            .select_related('user__profile')
+            .order_by('joined_at', 'pk')
+        )
+
+        page = self.paginate_queryset(rows)
+        serializer = ParticipantSerializer(
+            page if page is not None else rows,
+            many=True,
+            context=self.get_serializer_context(),
+        )
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
 
     @action(detail=True, methods=['post'])
     def members(self, request, pk=None):
