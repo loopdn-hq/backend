@@ -325,17 +325,41 @@ EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 # Resend dashboard or the API rejects the send with a 403.
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'no-reply@loopdn.com')
 
-# Unset in development - utils/mail.py then renders the message and logs it
-# instead of sending, so the whole flow works with no account and no network.
+# Transactional email (password reset today) goes through Resend's HTTP API -
+# see utils/email.py. Unset in development: send_email() then logs instead of
+# calling out, the same convention utils/sms.py uses for Telnyx, so the flow
+# works with no account and no network.
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 
-# Short on purpose, and for the same reason as SMS_REQUEST_TIMEOUT: this call
-# sits inside a request the user is waiting on.
+# Short on purpose, same reasoning as SMS_REQUEST_TIMEOUT: this call sits
+# inside a request the user is waiting on.
 EMAIL_REQUEST_TIMEOUT = 10
 
 # Available to every email template without the caller passing them.
 EMAIL_PRODUCT_NAME = os.environ.get('EMAIL_PRODUCT_NAME', 'Loopd')
 EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMAIL)
+
+# Where the frontend lives, for building links that go out in email (password
+# reset today). No trailing slash - callers append their own path.
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://loopdn.com').rstrip('/')
+
+# How long a password-reset link stays valid. This is a real Django setting -
+# django.contrib.auth.tokens.default_token_generator reads it directly, so
+# nothing else has to check the expiry by hand. Also governs any other use of
+# default_token_generator in the project (there is none today).
+PASSWORD_RESET_TIMEOUT = int(os.environ.get('PASSWORD_RESET_TIMEOUT_SECONDS', str(30 * 60)))
+
+# Stops forgot-password from being used to spam an address with reset links.
+# Same two-tier shape as OTP_RESEND_COOLDOWN / OTP_MAX_SENDS_PER_HOUR below:
+# the cooldown stops an immediate double-submit, the hourly ceiling stops a
+# slow drip that waits the cooldown out each time. See
+# _password_reset_rate_limited in user/serializers.py.
+PASSWORD_RESET_COOLDOWN_SECONDS = int(
+    os.environ.get('PASSWORD_RESET_COOLDOWN_SECONDS', '60')
+)
+PASSWORD_RESET_MAX_REQUESTS_PER_HOUR = int(
+    os.environ.get('PASSWORD_RESET_MAX_REQUESTS_PER_HOUR', '3')
+)
 
 
 # One-time passcodes
