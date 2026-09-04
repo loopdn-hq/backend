@@ -687,9 +687,16 @@ class ChatWebsocketTests(TransactionTestCase):
     `transaction.on_commit`, so the writes have to genuinely commit.
     """
 
-    # An Origin header is required - AllowedHostsOriginValidator rejects a
-    # handshake that has none.
-    HEADERS = [(b'origin', b'http://testserver')]
+    # An Origin header is required - the validator refuses a handshake that has
+    # none, whatever the allowed list says.
+    #
+    # This must be an origin from CORS_ALLOWED_ORIGINS, not ALLOWED_HOSTS.
+    # `testserver` passed only because the test runner appends it to
+    # ALLOWED_HOSTS; against CORS_ALLOWED_ORIGINS it is refused at the origin
+    # gate, which would fail the connect test AND make the two rejection tests
+    # pass for the wrong reason - never reaching the token check they exist to
+    # exercise.
+    HEADERS = [(b'origin', b'http://localhost:3000')]
 
     def setUp(self):
         self.alice = make_user('alice', '+639170000001')
@@ -736,6 +743,38 @@ class ChatWebsocketTests(TransactionTestCase):
         communicator = self.connect_as(self.alice)
         connected, _ = await communicator.connect()
         self.assertTrue(connected)
+
+    async def test_a_socket_from_an_unlisted_origin_is_refused(self):
+        # The whole point of the origin validator, and nothing else asserts it:
+        # without one, any website a logged-in user visits could open a socket
+        # as them and read their conversations. A VALID token is used
+        # deliberately - the refusal must come from the origin gate, so this
+        # fails if the validator is ever removed or pointed at a list that
+        # happens to contain everything.
+        from loopd.asgi import application
+
+        communicator = WebsocketCommunicator(
+            application,
+            f'/ws/chat/?token={self.tokens[self.alice.username]}',
+            headers=[(b'origin', b'http://evil.example.com')],
+        )
+        connected, _ = await communicator.connect()
+        self.assertFalse(connected)
+
+    async def test_a_socket_with_no_origin_at_all_is_refused(self):
+        # A handshake with no Origin header is refused unless the allowed list
+        # is '*'. Worth pinning: a non-browser client that sends no Origin -
+        # a native mobile app, say - cannot connect, and that is a deliberate
+        # property of the validator rather than an accident.
+        from loopd.asgi import application
+
+        communicator = WebsocketCommunicator(
+            application,
+            f'/ws/chat/?token={self.tokens[self.alice.username]}',
+            headers=[],
+        )
+        connected, _ = await communicator.connect()
+        self.assertFalse(connected)
         await communicator.disconnect()
 
     async def test_a_member_is_pushed_messages_as_they_are_sent(self):
