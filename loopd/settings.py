@@ -15,8 +15,17 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from dotenv import load_dotenv
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Local-only secrets (RESEND_API_KEY, etc.) live in a gitignored .env beside
+# manage.py - see .gitignore for the full list. load_dotenv() never
+# overrides a variable already in the environment, so a real env var set by
+# Docker/ECS in staging and production still wins; it's a silent no-op when
+# the file doesn't exist, which is the normal case outside local dev.
+load_dotenv(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
