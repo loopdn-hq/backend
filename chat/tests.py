@@ -32,6 +32,24 @@ from user.tests import EnvelopeAssertions, make_image_upload
 MEDIA_ROOT = tempfile.mkdtemp(prefix='loopd-chat-media-')
 
 
+def members_of(client, conversation_id):
+    """The active member list, fetched from its own paginated endpoint.
+
+    Conversation payloads deliberately do not carry `participants`: the list is
+    unbounded and every row nests a user and a profile, so a group of two
+    hundred would put two hundred profiles in every fetch of every
+    conversation.
+
+    `page_size` is raised past the default of 10 so a test asserting on the
+    whole membership is not silently reading only the first page.
+    """
+    response = client.get(
+        reverse('chat:conversation-participants', args=[conversation_id]),
+        {'page_size': 100},
+    )
+    return response.json()['data']['results']
+
+
 def make_user(username, phone=None, password='a-strong-passphrase-42'):
     user = User.objects.create_user(
         username=username, email=f'{username}@example.com', password=password
@@ -62,7 +80,7 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
             self.client.post(reverse('chat:conversation-direct'), {'identifier': 'bob'})
         )
         self.assertEqual(data['kind'], 'direct')
-        self.assertEqual(len(data['participants']), 2)
+        self.assertEqual(len(members_of(self.client, data['id'])), 2)
 
     def test_start_direct_by_phone_number(self):
         data = self.assertSuccess(
@@ -70,7 +88,9 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
                 reverse('chat:conversation-direct'), {'identifier': '+639170000002'}
             )
         )
-        usernames = {p['user']['username'] for p in data['participants']}
+        usernames = {
+            p['user']['username'] for p in members_of(self.client, data['id'])
+        }
         self.assertEqual(usernames, {'alice', 'bob'})
 
     def test_the_same_pair_never_gets_two_conversations(self):
@@ -131,7 +151,9 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
             ),
             status.HTTP_201_CREATED,
         )
-        usernames = {p['user']['username'] for p in data['participants']}
+        usernames = {
+            p['user']['username'] for p in members_of(self.client, data['id'])
+        }
         self.assertEqual(usernames, {'alice', 'bob', 'carol'})
 
     def test_group_creation_reports_unknown_members(self):
@@ -426,7 +448,9 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
                 format='json',
             )
         )
-        usernames = {p['user']['username'] for p in data['participants']}
+        usernames = {
+            p['user']['username'] for p in members_of(self.client, group.id)
+        }
         self.assertEqual(usernames, {'alice', 'bob'})
 
     def test_admin_can_add_a_member_by_phone_number(self):
@@ -885,20 +909,24 @@ class PhoneOnlyParticipantTests(EnvelopeAssertions, APITestCase):
 
     def test_the_group_still_lists_normally_for_a_real_member(self):
         self.add_mom()
-        data = self.assertSuccess(
+        # The group itself is readable...
+        self.assertSuccess(
             self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
         )
-        labels = {p['display_label'] for p in data['participants']}
+        # ...and its members come from the member endpoint.
+        rows = members_of(self.client, self.group.id)
+
+        labels = {p['display_label'] for p in rows}
         self.assertEqual(labels, {self.alice.profile.display_label, 'Mom'})
 
-        mom = next(p for p in data['participants'] if p['is_phone_only'])
+        mom = next(p for p in rows if p['is_phone_only'])
         self.assertIsNone(mom['user'])
         # Everybody receives texts by default. A member verifies their number
         # when they sign up precisely so their groups can reach them on it, and
         # having the app installed does not change that - the app and SMS are
         # two ways into one conversation.
         self.assertTrue(mom['sms_enabled'])
-        alice_row = next(p for p in data['participants'] if not p['is_phone_only'])
+        alice_row = next(p for p in rows if not p['is_phone_only'])
         self.assertTrue(alice_row['sms_enabled'])
 
     # --- registering later claims the row rather than duplicating it -------
@@ -1256,10 +1284,9 @@ class MembershipStateTests(EnvelopeAssertions, APITestCase):
         self.group.add_participant(carol)
         membership.leave(self.group.participants.get(user=carol))
 
-        data = self.assertSuccess(
-            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
-        )
-        labels = {p['display_label'] for p in data['participants']}
+        labels = {
+            p['display_label'] for p in members_of(self.client, self.group.id)
+        }
         self.assertEqual(
             labels,
             {self.alice.profile.display_label, self.bob.profile.display_label},
@@ -1576,6 +1603,86 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
         # admin-only endpoint rather than riding along on every fetch.
         self.assertNotIn('join_code', settings)
         self.assertNotIn('join_code', data)
+
+    def test_settings_replies_without_the_member_list(self):
+        # The endpoint changes the group, not who is in it. Returning every
+        # participant made the reply grow with the size of the group and
+        # re-send what the client already had.
+        data = self.assertSuccess(
+            self.client.patch(
+                self.settings_url(), {'name': 'Renamed'}, format='json'
+            )
+        )
+        self.assertNotIn('participants', data)
+        # But it is still the conversation - the rest of the shape is intact.
+        self.assertEqual(data['name'], 'Renamed')
+        self.assertIn('settings', data)
+        self.assertIn('sms_number', data)
+
+    # --- the member list ----------------------------------------------------
+
+    def participants_url(self):
+        return reverse('chat:conversation-participants', args=[self.group.id])
+
+    def test_the_member_list_is_paginated_ten_at_a_time(self):
+        # 10 rather than the project default of 20: this renders as rows in a
+        # sheet, where the first page wants to be one screen.
+        for i in range(15):
+            self.group.add_participant(make_user(f'member{i}'))
+
+        data = self.assertSuccess(self.client.get(self.participants_url()))
+
+        # alice + bob from setUp, plus 15 = 17 active members.
+        self.assertEqual(data['count'], 17)
+        self.assertEqual(len(data['results']), 10)
+        self.assertIsNotNone(data['next'])
+        self.assertIsNone(data['previous'])
+
+        page_two = self.assertSuccess(
+            self.client.get(self.participants_url(), {'page': 2})
+        )
+        self.assertEqual(len(page_two['results']), 7)
+
+        # No row appears on both pages: joined_at alone is not unique, so the
+        # sort has to fall back to pk or pagination silently drops people.
+        first = {row['id'] for row in data['results']}
+        second = {row['id'] for row in page_two['results']}
+        self.assertEqual(len(first | second), 17)
+        self.assertFalse(first & second)
+
+    def test_a_client_may_ask_for_a_bigger_page(self):
+        for i in range(15):
+            self.group.add_participant(make_user(f'member{i}'))
+
+        data = self.assertSuccess(
+            self.client.get(self.participants_url(), {'page_size': 50})
+        )
+        self.assertEqual(len(data['results']), 17)
+
+    def test_the_member_list_shows_only_active_members(self):
+        gone = make_user('gone')
+        self.group.add_participant(gone)
+        membership.remove(
+            Participant.objects.get(conversation=self.group, user=gone),
+            by=self.alice,
+        )
+
+        data = self.assertSuccess(self.client.get(self.participants_url()))
+
+        self.assertEqual(data['count'], 2)
+        self.assertNotIn(
+            'gone', [row['user']['username'] for row in data['results']]
+        )
+
+    def test_a_non_member_cannot_read_the_member_list(self):
+        # 404, not 403: access control is the queryset, so an outsider cannot
+        # even learn the conversation exists.
+        outsider = make_user('outsider')
+        self.client.force_authenticate(outsider)
+
+        response = self.client.get(self.participants_url())
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     # --- the join code ------------------------------------------------------
 

@@ -252,8 +252,12 @@ CONVERSATIONS = [
         )),
     req('Get a conversation', 'GET', '/api/v1/chat/conversations/{{conversation_id}}/',
         desc=(
-            'One conversation, its active members, its latest message and its '
+            'One conversation: its settings, its latest message and its '
             '`sms_number`.\n\n'
+            '**No `participants`.** The member list is unbounded and every row '
+            'nests a user and a profile, so a group of two hundred would put '
+            'two hundred profiles in every fetch - and once per conversation '
+            'on the list endpoint. Use *List members* instead.\n\n'
             '`sms_number` is read-only everywhere and for everybody. It is '
             'saved in members\' phones as the group\'s name, so a number that '
             'could be reassigned would deliver a stranger\'s messages.\n\n'
@@ -300,7 +304,9 @@ CONVERSATIONS = [
             'post; members still read). Enforced on every route at once, '
             'including inbound SMS.\n\n'
             'Editing settings deliberately does **not** bump the group up '
-            "everyone's conversation list. Only a message is activity."
+            "everyone's conversation list. Only a message is activity.\n\n"
+            'The reply is the conversation - which carries no `participants` '
+            'on any endpoint. Use *List members* for the member list.'
         )),
     req('Start direct chat', 'POST', '/api/v1/chat/conversations/direct/',
         body={'identifier': 'bob'},
@@ -315,6 +321,27 @@ CONVERSATIONS = [
 ]
 
 MEMBERSHIP = [
+    req('List members', 'GET', '/api/v1/chat/conversations/{{conversation_id}}/participants/',
+        query=[{'key': 'page', 'value': '1'},
+               {'key': 'page_size', 'value': '10'}],
+        desc=(
+            'Who is in this conversation, **ten at a time**.\n\n'
+            'Its own endpoint rather than a field on every conversation reply: '
+            'the member list is unbounded and each row carries a nested user '
+            'and profile, so a group of two hundred made every fetch of the '
+            'group carry two hundred profiles.\n\n'
+            'Returns the standard page envelope inside `data`:\n\n'
+            '```\n'
+            '{ "count": 17, "next": "...?page=2", "previous": null,\n'
+            '  "results": [ ...participants... ] }\n'
+            '```\n\n'
+            '`page_size` raises the page up to a maximum of 100. **Active '
+            'members only** - somebody who left, was removed or is waiting on '
+            'approval is not a member; pending requests have their own '
+            'endpoint, *Join requests*.\n\n'
+            'A non-member gets **404**, not 403 - access control here is the '
+            'queryset, so an outsider cannot learn the conversation exists.'
+        )),
     req('Add members', 'POST', '/api/v1/chat/conversations/{{conversation_id}}/members/',
         body={'members': ['bob', '+639170000003']},
         desc=(

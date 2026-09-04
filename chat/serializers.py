@@ -177,7 +177,15 @@ class GroupNumberSerializer(serializers.Serializer):
 
 
 class ConversationSerializer(serializers.ModelSerializer):
-    participants = ParticipantSerializer(many=True, read_only=True)
+    # No `participants`. The member list is unbounded and every row carries a
+    # nested user and profile, so a group of two hundred made every fetch of
+    # every conversation carry two hundred profiles - on the list endpoint,
+    # once per conversation. It lives on its own paginated endpoint instead:
+    # GET /conversations/<id>/participants/.
+    #
+    # The participants PREFETCH in ConversationViewSet.get_queryset stays even
+    # so: `get_title` walks it to name a direct conversation after the other
+    # person, and without it that is a query per row.
     title = serializers.SerializerMethodField()
     image_url = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
@@ -202,7 +210,6 @@ class ConversationSerializer(serializers.ModelSerializer):
             # and no longer do - they are inside `settings` with the other five.
             'settings',
             'sms_number',
-            'participants',
             'last_message',
             'created_at',
             'updated_at',
