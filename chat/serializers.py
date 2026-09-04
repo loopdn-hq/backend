@@ -157,6 +157,7 @@ class ConversationSerializer(serializers.ModelSerializer):
     title = serializers.SerializerMethodField()
     image_url = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
+    settings = serializers.SerializerMethodField()
     # The number members text to reach this group. Read-only everywhere and
     # for everybody: it is fixed for the life of the group, so there is no
     # writable form of this field for a client or an admin to reach.
@@ -171,6 +172,7 @@ class ConversationSerializer(serializers.ModelSerializer):
             'title',
             'description',
             'image_url',
+            'settings',
             'mode',
             'join_mode',
             'sms_number',
@@ -192,6 +194,17 @@ class ConversationSerializer(serializers.ModelSerializer):
             return None
         number = getattr(obj, 'sms_number', None)
         return number.number if number is not None else None
+
+    def get_settings(self, obj):
+        return {
+            'mode': obj.mode,
+            'join_mode': obj.join_mode,
+            'add_member_permission': obj.add_member_permission,
+            'edit_group_permission': obj.edit_group_permission,
+            'sms_delivery_enabled': obj.sms_delivery_enabled,
+            'sms_replies_enabled': obj.sms_replies_enabled,
+            'voice_messages_enabled': obj.voice_messages_enabled,
+        }
 
     def get_image_url(self, obj):
         """A group's image, or None. Direct conversations never have one.
