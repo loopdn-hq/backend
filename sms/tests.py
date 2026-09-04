@@ -944,13 +944,27 @@ class NumberProvisioningTests(TestCase):
     def test_the_api_exposes_the_number_but_never_accepts_one(self):
         yul = self.make_user('yul', phone='+639171111111')
         group = self.create_group(yul)
-        expected = GroupNumber.objects.get(conversation=group).number
+        number = GroupNumber.objects.get(conversation=group)
 
         client = APIClient()
         client.force_authenticate(yul)
         detail = client.get(reverse('chat:conversation-detail', args=[group.id]))
         # response.data is pre-render; the envelope is applied by the renderer.
-        self.assertEqual(detail.json()['data']['sms_number'], expected)
+        self.assertEqual(
+            detail.json()['data']['sms_number'],
+            {
+                'number': number.number,
+                'country': number.country,
+                'status': GroupNumber.Status.ACTIVE,
+                # Empty because no provider is configured under test - which is
+                # the whole point of exposing it: this number is a placeholder
+                # and a client can tell.
+                'provider': '',
+            },
+        )
+
+        # The lease's provider-side handle is never part of the response.
+        self.assertNotIn('provider_number_id', detail.json()['data']['sms_number'])
 
         # And there is no writable form of it anywhere.
         response = client.patch(
@@ -960,7 +974,7 @@ class NumberProvisioningTests(TestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
-            GroupNumber.objects.get(conversation=group).number, expected
+            GroupNumber.objects.get(conversation=group).number, number.number
         )
 
     # --- rule 3: deleting the group deletes the number ----------------------

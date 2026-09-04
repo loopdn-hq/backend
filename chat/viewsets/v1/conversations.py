@@ -118,6 +118,10 @@ class ConversationViewSet(
                 participants__status=Participant.Status.ACTIVE,
             )
             .distinct()
+            # A reverse one-to-one, so it joins rather than costing a query per
+            # conversation - which it did, every time the list serialised the
+            # group's number.
+            .select_related('sms_number')
             .prefetch_related(
                 Prefetch(
                     'participants',

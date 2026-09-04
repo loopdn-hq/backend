@@ -238,10 +238,15 @@ CONVERSATIONS = [
             '**The group is given its own phone number**, in the country of '
             'whoever created it, read from their verified number. That number '
             'never changes, and it is deleted when the group is.\n\n'
-            'The number comes back as `sms_number` and may be `null` for a '
-            'moment: buying it is a call to the telecom provider, made after '
-            'the group is committed, so a slow provider cannot turn "create a '
-            'group" into "create nothing".\n\n'
+            'The number comes back as `sms_number`, an object of `number`, '
+            '`country`, `status` and `provider`. The whole object may be '
+            '`null` for a moment: buying it is a call to the telecom '
+            'provider, made after the group is committed, so a slow provider '
+            'cannot turn "create a group" into "create nothing".\n\n'
+            'An **empty `provider`** means no provider is configured and the '
+            'number is a placeholder - well-formed, but it belongs to nobody '
+            'and texting it does nothing. Do not tell a user to text a number '
+            'whose `provider` is empty.\n\n'
             '`members` takes usernames or **verified** `+E.164` numbers. Send '
             'an image by switching this request to form-data.'
         )),
@@ -251,7 +256,9 @@ CONVERSATIONS = [
             '`sms_number`.\n\n'
             '`sms_number` is read-only everywhere and for everybody. It is '
             'saved in members\' phones as the group\'s name, so a number that '
-            'could be reassigned would deliver a stranger\'s messages.'
+            'could be reassigned would deliver a stranger\'s messages.\n\n'
+            'Fields: `number`, `country`, `status`, `provider`. An empty '
+            '`provider` marks a placeholder that cannot actually receive text.'
         )),
     req('Delete a group', 'DELETE', '/api/v1/chat/conversations/{{conversation_id}}/',
         desc=(
@@ -263,9 +270,22 @@ CONVERSATIONS = [
         )),
     req('Edit group settings', 'PATCH', '/api/v1/chat/conversations/{{conversation_id}}/settings/',
         body={'name': 'Family', 'description': 'Home things',
-              'join_mode': 'code', 'mode': 'chat'},
+              'settings': {'mode': 'chat', 'join_mode': 'code',
+                           'add_member_permission': 'admins',
+                           'edit_group_permission': 'admins',
+                           'sms_delivery_enabled': True,
+                           'sms_replies_enabled': True,
+                           'voice_messages_enabled': True}},
         desc=(
             'Admins only. Every field optional.\n\n'
+            'The seven settings go **inside `settings`**, the same object '
+            '`POST /group/` takes - there is one shape to learn. Sending them '
+            'at the top level is silently ignored: DRF drops fields a '
+            'serializer does not declare, so the request returns 200 and '
+            'changes nothing.\n\n'
+            'All seven come back on the conversation object in the response, '
+            'flat, so a settings screen renders from one fetch. `join_code` '
+            'does not - it has its own admin-only endpoint.\n\n'
             '**`join_mode`** - how somebody who is not a member gets in:\n\n'
             '| Value | Meaning |\n'
             '| --- | --- |\n'

@@ -152,6 +152,30 @@ class ParticipantSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class GroupNumberSerializer(serializers.Serializer):
+    """The group's own phone number, as a client needs to see it.
+
+    A bare string was enough while the only question was "what do I dial". It
+    cannot answer "can I dial it yet": with no provider configured, ordering
+    mints a well-formed placeholder that belongs to nobody, and a client that
+    renders it tells the user to text a dead line. An empty `provider` is
+    exactly that case, so it is the one field here that is not decoration.
+
+    A plain Serializer, not a ModelSerializer, so this module stays free of any
+    import of `sms` - `sms.models` imports `chat.models`, and chat's side of
+    that relationship is deliberately kept to function-local imports.
+
+    `provider_number_id` is deliberately absent: it is the lease's
+    account-management handle, used to reconfigure or release the number, and
+    no member of the group has any use for it.
+    """
+
+    number = serializers.CharField(read_only=True)
+    country = serializers.CharField(read_only=True)
+    status = serializers.CharField(read_only=True)
+    provider = serializers.CharField(read_only=True)
+
+
 class ConversationSerializer(serializers.ModelSerializer):
     participants = ParticipantSerializer(many=True, read_only=True)
     title = serializers.SerializerMethodField()
@@ -171,8 +195,22 @@ class ConversationSerializer(serializers.ModelSerializer):
             'title',
             'description',
             'image_url',
+            # The group's settings, the same seven a client PATCHes to
+            # /settings/. Read-only here: ADMIN_ONLY_SETTINGS governs who may
+            # CHANGE them, but every member may see them - a member who cannot
+            # tell whether SMS delivery is on cannot understand why their
+            # message did not reach anybody.
+            #
+            # `join_code` is deliberately NOT here. It is the thing that lets a
+            # stranger in, so it has its own admin-only endpoint rather than
+            # riding on every conversation fetch into logs and screenshots.
             'mode',
             'join_mode',
+            'add_member_permission',
+            'edit_group_permission',
+            'sms_delivery_enabled',
+            'sms_replies_enabled',
+            'voice_messages_enabled',
             'sms_number',
             'participants',
             'last_message',
@@ -182,16 +220,22 @@ class ConversationSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_sms_number(self, obj):
-        """The group's own number, or None while it has not got one yet.
+        """The group's number as an object, or None while it has not got one.
 
         Without this the product's central promise - text this number to reach
         your group - is unreachable: a member has no way to learn the number,
         so nobody can use SMS at all.
+
+        Nested rather than a bare string because "the number exists" and "the
+        number works" are different questions and only the object answers both;
+        see GroupNumberSerializer.
         """
         if obj.kind != Conversation.Kind.GROUP:
             return None
         number = getattr(obj, 'sms_number', None)
-        return number.number if number is not None else None
+        if number is None:
+            return None
+        return GroupNumberSerializer(number).data
 
     def get_image_url(self, obj):
         """A group's image, or None. Direct conversations never have one.

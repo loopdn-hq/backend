@@ -1537,6 +1537,39 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
         )
         self.assertEqual(Conversation.objects.get(pk=self.group.pk).updated_at, before)
 
+    def test_the_conversation_payload_carries_every_group_setting(self):
+        # A settings screen has to be renderable from one fetch. Without this a
+        # client can PATCH all seven and read back only two, so it cannot show
+        # the user what the group is actually set to.
+        response = self.client.patch(
+            self.settings_url(),
+            {
+                'settings': {
+                    'add_member_permission': 'admins',
+                    'edit_group_permission': 'admins',
+                    'sms_delivery_enabled': False,
+                    'sms_replies_enabled': False,
+                    'voice_messages_enabled': False,
+                }
+            },
+            format='json',
+        )
+        self.assertSuccess(response)
+
+        data = response.json()['data']
+        self.assertEqual(data['add_member_permission'], 'admins')
+        self.assertEqual(data['edit_group_permission'], 'admins')
+        self.assertFalse(data['sms_delivery_enabled'])
+        self.assertFalse(data['sms_replies_enabled'])
+        self.assertFalse(data['voice_messages_enabled'])
+        # The two that were already there, so this cannot pass by regression.
+        self.assertIn('mode', data)
+        self.assertIn('join_mode', data)
+
+        # But NOT the join code: it lets a stranger in, so it stays on its own
+        # admin-only endpoint rather than riding along on every fetch.
+        self.assertNotIn('join_code', data)
+
     # --- the join code ------------------------------------------------------
 
     def test_an_admin_reads_and_reissues_the_code(self):
