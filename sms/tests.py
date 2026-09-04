@@ -902,21 +902,70 @@ class NumberProvisioningTests(TestCase):
         self.assertEqual(number.country, 'US')
         self.assertTrue(number.number.startswith('+1'))
 
-    def test_an_unverified_number_does_not_decide_the_country(self):
-        # An unverified number is a string somebody typed, not evidence of
-        # where they are, so it falls back rather than being trusted.
+    def test_an_unverified_number_buys_nothing_and_turns_sms_off(self):
+        # An unverified number is a string somebody typed, not evidence of where
+        # they are. Rule 1a: there is no default country to fall back to,
+        # because a guess buys a number that can never be changed.
         eve = self.make_user('eve', phone='+639171111111', verified=False)
-        with override_settings(SMS_DEFAULT_COUNTRY='US'):
-            number = GroupNumber.objects.get(conversation=self.create_group(eve))
-        self.assertEqual(number.country, 'US')
+
+        group = self.create_group(eve)
+
+        self.assertFalse(GroupNumber.objects.filter(conversation=group).exists())
+        group.refresh_from_db()
+        self.assertFalse(group.sms_delivery_enabled)
+        self.assertFalse(group.sms_replies_enabled)
 
     def test_a_creator_with_no_number_at_all_still_gets_a_group(self):
         # A phone number is optional at registration, so this is a real case
-        # and must not stop somebody creating a group.
+        # and must not stop somebody creating a group. They get a group that
+        # works in the app and says, in its own settings, that SMS is not on.
         nobody = self.make_user('nobody')
-        with override_settings(SMS_DEFAULT_COUNTRY='PH'):
-            group = self.create_group(nobody)
-        self.assertEqual(GroupNumber.objects.get(conversation=group).country, 'PH')
+
+        group = self.create_group(nobody)
+
+        self.assertTrue(Conversation.objects.filter(pk=group.pk).exists())
+        self.assertFalse(GroupNumber.objects.filter(conversation=group).exists())
+        group.refresh_from_db()
+        self.assertFalse(group.sms_delivery_enabled)
+
+    def test_a_verified_number_in_a_country_we_cannot_buy_in_turns_sms_off(self):
+        # Same rule, reached the other way: the number is verified, but
+        # SMS_COUNTRY_BY_PREFIX has no entry for +55, so there is no country to
+        # buy in. Guessing here would be the same permanent mistake.
+        bruno = self.make_user('bruno', phone='+5511999999999')
+
+        group = self.create_group(bruno)
+
+        self.assertFalse(GroupNumber.objects.filter(conversation=group).exists())
+        group.refresh_from_db()
+        self.assertFalse(group.sms_delivery_enabled)
+
+    def test_verifying_a_number_later_lets_the_group_be_provisioned(self):
+        # The switch-off is not a dead end. Once there is a country to buy in
+        # and an admin turns delivery back on, the maintenance job finishes the
+        # job that could not be done at creation.
+        from sms import maintenance
+
+        late = self.make_user('late')
+        group = self.create_group(late)
+        self.assertFalse(GroupNumber.objects.filter(conversation=group).exists())
+
+        late.profile.phone_number = '+639171112222'
+        late.profile.phone_no_verified = True
+        late.profile.save()
+
+        # Still off, so the job leaves it alone rather than spending money on a
+        # group nobody has asked to switch back on.
+        self.assertEqual(maintenance.provision_missing_numbers(), 0)
+        self.assertFalse(GroupNumber.objects.filter(conversation=group).exists())
+
+        group.sms_delivery_enabled = True
+        group.save(update_fields=['sms_delivery_enabled'])
+
+        self.assertEqual(maintenance.provision_missing_numbers(), 1)
+        self.assertEqual(
+            GroupNumber.objects.get(conversation=group).country, 'PH'
+        )
 
     def test_every_group_gets_a_different_number(self):
         yul = self.make_user('yul', phone='+639171111111')
@@ -1355,7 +1404,13 @@ class CountryFallbackTests(TestCase):
 
     @override_settings(SMS_FALLBACK_COUNTRIES=['US'])
     def test_a_group_still_gets_created_when_no_country_works(self):
+        # A VERIFIED number, so this exercises "every order failed" rather than
+        # rule 1a's "there is no country to order in" - which returns earlier
+        # and is a decision, not an error.
         alice = User.objects.create_user(username='alice', password='x')
+        alice.profile.phone_number = '+14155552222'
+        alice.profile.phone_no_verified = True
+        alice.profile.save()
         group = Conversation.start_group(alice, name='Family')
 
         with mock.patch('sms.provisioning.order_number', return_value=None):

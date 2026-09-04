@@ -450,11 +450,6 @@ SMS_FALLBACK_COUNTRIES = [
     if country.strip()
 ]
 
-# Used when a group's creator has no verified number at all - a real case, since
-# a phone number is optional at registration. It is a guess, and it is logged
-# as one.
-SMS_DEFAULT_COUNTRY = os.environ.get('SMS_DEFAULT_COUNTRY', 'US')
-
 # Buying a number is slower than sending a text and nobody is waiting on a
 # screen for it, so it can afford a longer timeout than SMS_REQUEST_TIMEOUT.
 SMS_NUMBER_REQUEST_TIMEOUT = int(os.environ.get('SMS_NUMBER_REQUEST_TIMEOUT', '30'))
