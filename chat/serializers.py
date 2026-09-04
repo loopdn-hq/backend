@@ -305,6 +305,13 @@ class ConversationSerializer(serializers.ModelSerializer):
         return getattr(request, 'user', None) if request else None
 
 
+class ConversationSearchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Conversation
+        fields = ['id', 'name', 'join_mode', 'mode']
+        read_only_fields = fields
+
+
 class DirectConversationSerializer(serializers.Serializer):
     """Start (or find) a one-to-one conversation with somebody."""
 

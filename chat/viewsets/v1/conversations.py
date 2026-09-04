@@ -32,7 +32,7 @@ conversation exists.
 from django.db.models import Prefetch
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -45,6 +45,7 @@ from chat.serializers import (
     ADMIN_ONLY_SETTINGS,
     AddMembersSerializer,
     ConversationSerializer,
+    ConversationSearchSerializer,
     DirectConversationSerializer,
     GroupCreateSerializer,
     GroupSettingsSerializer,
@@ -99,11 +100,13 @@ class ConversationViewSet(
         'role': ParticipantRoleSerializer,
         'rename': RenameMemberSerializer,
         'invite': InviteByPhoneSerializer,
+        'search': ConversationSearchSerializer,
     }
 
     success_messages = {
         'list': 'Conversations fetched.',
         'retrieve': 'Conversation fetched.',
+        'search': 'Conversation search complete.',
         'direct': 'Conversation ready.',
         'group': 'Group created.',
         'group_settings': 'Group updated.',
@@ -166,6 +169,29 @@ class ConversationViewSet(
         )
 
     # -- starting conversations -------------------------------------------
+
+    @action(detail=False, methods=['get'])
+    def search(self, request):
+        """Find named groups that can be discovered and joined."""
+        term = (request.query_params.get('q') or '').strip()
+        matches = Conversation.objects.filter(
+            kind=Conversation.Kind.GROUP,
+            name__icontains=term,
+        ).exclude(
+            join_mode=Conversation.JoinMode.INVITE,
+        ).order_by('name', 'id')
+
+        if len(term) < 2:
+            matches = matches.none()
+
+        page = self.paginate_queryset(matches)
+        serializer = self.get_serializer(
+            page if page is not None else matches,
+            many=True,
+        )
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
 
     @action(detail=False, methods=['post'])
     def direct(self, request):
@@ -327,6 +353,29 @@ class ConversationViewSet(
         # asked.
         if conversation is None:
             return Response({'status': participant.status})
+        return Response(self._as_conversation(conversation))
+
+    @action(detail=True, methods=['post'], url_path='join', url_name='join-open')
+    def join_open(self, request, pk=None):
+        """Join an open group or request access to an approval group."""
+        conversation = Conversation.objects.filter(
+            pk=pk, kind=Conversation.Kind.GROUP
+        ).first()
+        if conversation is None:
+            raise NotFound('Conversation not found.')
+        if conversation.join_mode not in (
+            Conversation.JoinMode.OPEN,
+            Conversation.JoinMode.APPROVAL,
+        ):
+            raise ValidationError(
+                'This conversation is not open to joining or requesting access.'
+            )
+
+        participant = membership.request_to_join(conversation, user=request.user)
+        if participant.status == Participant.Status.PENDING:
+            return Response({'status': participant.status})
+
+        conversation = self.get_queryset().get(pk=conversation.pk)
         return Response(self._as_conversation(conversation))
 
     @action(detail=True, methods=['post'])

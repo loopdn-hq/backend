@@ -93,6 +93,30 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
         }
         self.assertEqual(usernames, {'alice', 'bob'})
 
+    def test_search_conversations_returns_joinable_groups_only(self):
+        open_group = Conversation.start_group(self.alice, 'Weekend Plans')
+        open_group.join_mode = Conversation.JoinMode.OPEN
+        open_group.mode = Conversation.Mode.BROADCAST
+        open_group.save(update_fields=['join_mode', 'mode'])
+        Conversation.start_group(self.alice, 'Weekend Private')
+
+        data = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-search'), {'q': 'weekend'}
+            )
+        )
+
+        self.assertEqual(len(data['results']), 1)
+        self.assertEqual(
+            data['results'][0],
+            {
+                'id': open_group.id,
+                'name': 'Weekend Plans',
+                'join_mode': 'open',
+                'mode': 'broadcast',
+            },
+        )
+
     def test_the_same_pair_never_gets_two_conversations(self):
         first = self.assertSuccess(
             self.client.post(reverse('chat:conversation-direct'), {'identifier': 'bob'})
@@ -1126,6 +1150,46 @@ class MembershipStateTests(EnvelopeAssertions, APITestCase):
         self.set_mode(Conversation.JoinMode.OPEN)
         self.assertSuccess(self.join_as(self.bob))
         self.assertTrue(self.group.has_participant(self.bob))
+
+    def test_open_group_can_be_joined_without_a_code(self):
+        self.set_mode(Conversation.JoinMode.OPEN)
+        self.client.force_authenticate(self.bob)
+
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-join-open', args=[self.group.id])
+            )
+        )
+
+        self.assertEqual(data['id'], self.group.id)
+        self.assertEqual(
+            self.group.participants.get(user=self.bob).status,
+            Participant.Status.ACTIVE,
+        )
+
+    def test_approval_group_creates_a_pending_join_request_without_a_code(self):
+        self.set_mode(Conversation.JoinMode.APPROVAL)
+        self.client.force_authenticate(self.bob)
+
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-join-open', args=[self.group.id])
+            )
+        )
+
+        self.assertEqual(data, {'status': Participant.Status.PENDING})
+        self.assertEqual(
+            self.group.participants.get(user=self.bob).status,
+            Participant.Status.PENDING,
+        )
+
+        self.client.force_authenticate(self.alice)
+        requests = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-requests', args=[self.group.id])
+            )
+        )
+        self.assertEqual(requests[0]['user']['username'], 'bob')
 
     def test_a_wrong_code_is_refused(self):
         self.set_mode(Conversation.JoinMode.OPEN)
