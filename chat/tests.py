@@ -32,6 +32,24 @@ from user.tests import EnvelopeAssertions, make_image_upload
 MEDIA_ROOT = tempfile.mkdtemp(prefix='loopd-chat-media-')
 
 
+def members_of(client, conversation_id):
+    """The active member list, fetched from its own paginated endpoint.
+
+    Conversation payloads deliberately do not carry `participants`: the list is
+    unbounded and every row nests a user and a profile, so a group of two
+    hundred would put two hundred profiles in every fetch of every
+    conversation.
+
+    `page_size` is raised past the default of 10 so a test asserting on the
+    whole membership is not silently reading only the first page.
+    """
+    response = client.get(
+        reverse('chat:conversation-participants', args=[conversation_id]),
+        {'page_size': 100},
+    )
+    return response.json()['data']['results']
+
+
 def make_user(username, phone=None, password='a-strong-passphrase-42'):
     user = User.objects.create_user(
         username=username, email=f'{username}@example.com', password=password
@@ -62,7 +80,7 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
             self.client.post(reverse('chat:conversation-direct'), {'identifier': 'bob'})
         )
         self.assertEqual(data['kind'], 'direct')
-        self.assertEqual(len(data['participants']), 2)
+        self.assertEqual(len(members_of(self.client, data['id'])), 2)
 
     def test_start_direct_by_phone_number(self):
         data = self.assertSuccess(
@@ -70,8 +88,34 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
                 reverse('chat:conversation-direct'), {'identifier': '+639170000002'}
             )
         )
-        usernames = {p['user']['username'] for p in data['participants']}
+        usernames = {
+            p['user']['username'] for p in members_of(self.client, data['id'])
+        }
         self.assertEqual(usernames, {'alice', 'bob'})
+
+    def test_search_conversations_returns_joinable_groups_only(self):
+        open_group = Conversation.start_group(self.alice, 'Weekend Plans')
+        open_group.join_mode = Conversation.JoinMode.OPEN
+        open_group.mode = Conversation.Mode.BROADCAST
+        open_group.save(update_fields=['join_mode', 'mode'])
+        Conversation.start_group(self.alice, 'Weekend Private')
+
+        data = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-search'), {'q': 'weekend'}
+            )
+        )
+
+        self.assertEqual(len(data['results']), 1)
+        self.assertEqual(
+            data['results'][0],
+            {
+                'id': open_group.id,
+                'name': 'Weekend Plans',
+                'join_mode': 'open',
+                'mode': 'broadcast',
+            },
+        )
 
     def test_the_same_pair_never_gets_two_conversations(self):
         first = self.assertSuccess(
@@ -131,7 +175,9 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
             ),
             status.HTTP_201_CREATED,
         )
-        usernames = {p['user']['username'] for p in data['participants']}
+        usernames = {
+            p['user']['username'] for p in members_of(self.client, data['id'])
+        }
         self.assertEqual(usernames, {'alice', 'bob', 'carol'})
 
     def test_group_creation_reports_unknown_members(self):
@@ -426,7 +472,9 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
                 format='json',
             )
         )
-        usernames = {p['user']['username'] for p in data['participants']}
+        usernames = {
+            p['user']['username'] for p in members_of(self.client, group.id)
+        }
         self.assertEqual(usernames, {'alice', 'bob'})
 
     def test_admin_can_add_a_member_by_phone_number(self):
@@ -663,9 +711,16 @@ class ChatWebsocketTests(TransactionTestCase):
     `transaction.on_commit`, so the writes have to genuinely commit.
     """
 
-    # An Origin header is required - AllowedHostsOriginValidator rejects a
-    # handshake that has none.
-    HEADERS = [(b'origin', b'http://testserver')]
+    # An Origin header is required - the validator refuses a handshake that has
+    # none, whatever the allowed list says.
+    #
+    # This must be an origin from CORS_ALLOWED_ORIGINS, not ALLOWED_HOSTS.
+    # `testserver` passed only because the test runner appends it to
+    # ALLOWED_HOSTS; against CORS_ALLOWED_ORIGINS it is refused at the origin
+    # gate, which would fail the connect test AND make the two rejection tests
+    # pass for the wrong reason - never reaching the token check they exist to
+    # exercise.
+    HEADERS = [(b'origin', b'http://localhost:3000')]
 
     def setUp(self):
         self.alice = make_user('alice', '+639170000001')
@@ -712,6 +767,38 @@ class ChatWebsocketTests(TransactionTestCase):
         communicator = self.connect_as(self.alice)
         connected, _ = await communicator.connect()
         self.assertTrue(connected)
+
+    async def test_a_socket_from_an_unlisted_origin_is_refused(self):
+        # The whole point of the origin validator, and nothing else asserts it:
+        # without one, any website a logged-in user visits could open a socket
+        # as them and read their conversations. A VALID token is used
+        # deliberately - the refusal must come from the origin gate, so this
+        # fails if the validator is ever removed or pointed at a list that
+        # happens to contain everything.
+        from loopd.asgi import application
+
+        communicator = WebsocketCommunicator(
+            application,
+            f'/ws/chat/?token={self.tokens[self.alice.username]}',
+            headers=[(b'origin', b'http://evil.example.com')],
+        )
+        connected, _ = await communicator.connect()
+        self.assertFalse(connected)
+
+    async def test_a_socket_with_no_origin_at_all_is_refused(self):
+        # A handshake with no Origin header is refused unless the allowed list
+        # is '*'. Worth pinning: a non-browser client that sends no Origin -
+        # a native mobile app, say - cannot connect, and that is a deliberate
+        # property of the validator rather than an accident.
+        from loopd.asgi import application
+
+        communicator = WebsocketCommunicator(
+            application,
+            f'/ws/chat/?token={self.tokens[self.alice.username]}',
+            headers=[],
+        )
+        connected, _ = await communicator.connect()
+        self.assertFalse(connected)
         await communicator.disconnect()
 
     async def test_a_member_is_pushed_messages_as_they_are_sent(self):
@@ -885,20 +972,24 @@ class PhoneOnlyParticipantTests(EnvelopeAssertions, APITestCase):
 
     def test_the_group_still_lists_normally_for_a_real_member(self):
         self.add_mom()
-        data = self.assertSuccess(
+        # The group itself is readable...
+        self.assertSuccess(
             self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
         )
-        labels = {p['display_label'] for p in data['participants']}
+        # ...and its members come from the member endpoint.
+        rows = members_of(self.client, self.group.id)
+
+        labels = {p['display_label'] for p in rows}
         self.assertEqual(labels, {self.alice.profile.display_label, 'Mom'})
 
-        mom = next(p for p in data['participants'] if p['is_phone_only'])
+        mom = next(p for p in rows if p['is_phone_only'])
         self.assertIsNone(mom['user'])
         # Everybody receives texts by default. A member verifies their number
         # when they sign up precisely so their groups can reach them on it, and
         # having the app installed does not change that - the app and SMS are
         # two ways into one conversation.
         self.assertTrue(mom['sms_enabled'])
-        alice_row = next(p for p in data['participants'] if not p['is_phone_only'])
+        alice_row = next(p for p in rows if not p['is_phone_only'])
         self.assertTrue(alice_row['sms_enabled'])
 
     # --- registering later claims the row rather than duplicating it -------
@@ -1059,6 +1150,46 @@ class MembershipStateTests(EnvelopeAssertions, APITestCase):
         self.set_mode(Conversation.JoinMode.OPEN)
         self.assertSuccess(self.join_as(self.bob))
         self.assertTrue(self.group.has_participant(self.bob))
+
+    def test_open_group_can_be_joined_without_a_code(self):
+        self.set_mode(Conversation.JoinMode.OPEN)
+        self.client.force_authenticate(self.bob)
+
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-join-open', args=[self.group.id])
+            )
+        )
+
+        self.assertEqual(data['id'], self.group.id)
+        self.assertEqual(
+            self.group.participants.get(user=self.bob).status,
+            Participant.Status.ACTIVE,
+        )
+
+    def test_approval_group_creates_a_pending_join_request_without_a_code(self):
+        self.set_mode(Conversation.JoinMode.APPROVAL)
+        self.client.force_authenticate(self.bob)
+
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-join-open', args=[self.group.id])
+            )
+        )
+
+        self.assertEqual(data, {'status': Participant.Status.PENDING})
+        self.assertEqual(
+            self.group.participants.get(user=self.bob).status,
+            Participant.Status.PENDING,
+        )
+
+        self.client.force_authenticate(self.alice)
+        requests = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-requests', args=[self.group.id])
+            )
+        )
+        self.assertEqual(requests[0]['user']['username'], 'bob')
 
     def test_a_wrong_code_is_refused(self):
         self.set_mode(Conversation.JoinMode.OPEN)
@@ -1256,10 +1387,9 @@ class MembershipStateTests(EnvelopeAssertions, APITestCase):
         self.group.add_participant(carol)
         membership.leave(self.group.participants.get(user=carol))
 
-        data = self.assertSuccess(
-            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
-        )
-        labels = {p['display_label'] for p in data['participants']}
+        labels = {
+            p['display_label'] for p in members_of(self.client, self.group.id)
+        }
         self.assertEqual(
             labels,
             {self.alice.profile.display_label, self.bob.profile.display_label},
@@ -1518,7 +1648,7 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
                 self.settings_url(), {'settings': {'join_mode': 'approval'}}, format='json'
             )
         )
-        self.assertEqual(data['join_mode'], 'approval')
+        self.assertEqual(data['settings']['join_mode'], 'approval')
 
     def test_switching_to_code_mode_guarantees_there_is_a_code(self):
         # A group can predate join codes, or have had one revoked; the setting
@@ -1536,6 +1666,126 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
             self.client.patch(self.settings_url(), {'settings': {'join_mode': 'open'}}, format='json')
         )
         self.assertEqual(Conversation.objects.get(pk=self.group.pk).updated_at, before)
+
+    def test_the_conversation_payload_carries_every_group_setting(self):
+        # A settings screen has to be renderable from one fetch. Without this a
+        # client can PATCH all seven and read back only two, so it cannot show
+        # the user what the group is actually set to.
+        response = self.client.patch(
+            self.settings_url(),
+            {
+                'settings': {
+                    'add_member_permission': 'admins',
+                    'edit_group_permission': 'admins',
+                    'sms_delivery_enabled': False,
+                    'sms_replies_enabled': False,
+                    'voice_messages_enabled': False,
+                }
+            },
+            format='json',
+        )
+        self.assertSuccess(response)
+
+        data = response.json()['data']
+        settings = data['settings']
+        self.assertEqual(settings['add_member_permission'], 'admins')
+        self.assertEqual(settings['edit_group_permission'], 'admins')
+        self.assertFalse(settings['sms_delivery_enabled'])
+        self.assertFalse(settings['sms_replies_enabled'])
+        self.assertFalse(settings['voice_messages_enabled'])
+        # The two that were already exposed, now in here with the rest.
+        self.assertIn('mode', settings)
+        self.assertIn('join_mode', settings)
+
+        # One object, not two places to look: they are no longer at the top
+        # level, so a client has exactly one shape to read.
+        self.assertNotIn('mode', data)
+        self.assertNotIn('join_mode', data)
+
+        # And NOT the join code: it lets a stranger in, so it stays on its own
+        # admin-only endpoint rather than riding along on every fetch.
+        self.assertNotIn('join_code', settings)
+        self.assertNotIn('join_code', data)
+
+    def test_settings_replies_without_the_member_list(self):
+        # The endpoint changes the group, not who is in it. Returning every
+        # participant made the reply grow with the size of the group and
+        # re-send what the client already had.
+        data = self.assertSuccess(
+            self.client.patch(
+                self.settings_url(), {'name': 'Renamed'}, format='json'
+            )
+        )
+        self.assertNotIn('participants', data)
+        # But it is still the conversation - the rest of the shape is intact.
+        self.assertEqual(data['name'], 'Renamed')
+        self.assertIn('settings', data)
+        self.assertIn('sms_number', data)
+
+    # --- the member list ----------------------------------------------------
+
+    def participants_url(self):
+        return reverse('chat:conversation-participants', args=[self.group.id])
+
+    def test_the_member_list_is_paginated_ten_at_a_time(self):
+        # 10 rather than the project default of 20: this renders as rows in a
+        # sheet, where the first page wants to be one screen.
+        for i in range(15):
+            self.group.add_participant(make_user(f'member{i}'))
+
+        data = self.assertSuccess(self.client.get(self.participants_url()))
+
+        # alice + bob from setUp, plus 15 = 17 active members.
+        self.assertEqual(data['count'], 17)
+        self.assertEqual(len(data['results']), 10)
+        self.assertIsNotNone(data['next'])
+        self.assertIsNone(data['previous'])
+
+        page_two = self.assertSuccess(
+            self.client.get(self.participants_url(), {'page': 2})
+        )
+        self.assertEqual(len(page_two['results']), 7)
+
+        # No row appears on both pages: joined_at alone is not unique, so the
+        # sort has to fall back to pk or pagination silently drops people.
+        first = {row['id'] for row in data['results']}
+        second = {row['id'] for row in page_two['results']}
+        self.assertEqual(len(first | second), 17)
+        self.assertFalse(first & second)
+
+    def test_a_client_may_ask_for_a_bigger_page(self):
+        for i in range(15):
+            self.group.add_participant(make_user(f'member{i}'))
+
+        data = self.assertSuccess(
+            self.client.get(self.participants_url(), {'page_size': 50})
+        )
+        self.assertEqual(len(data['results']), 17)
+
+    def test_the_member_list_shows_only_active_members(self):
+        gone = make_user('gone')
+        self.group.add_participant(gone)
+        membership.remove(
+            Participant.objects.get(conversation=self.group, user=gone),
+            by=self.alice,
+        )
+
+        data = self.assertSuccess(self.client.get(self.participants_url()))
+
+        self.assertEqual(data['count'], 2)
+        self.assertNotIn(
+            'gone', [row['user']['username'] for row in data['results']]
+        )
+
+    def test_a_non_member_cannot_read_the_member_list(self):
+        # 404, not 403: access control is the queryset, so an outsider cannot
+        # even learn the conversation exists.
+        outsider = make_user('outsider')
+        self.client.force_authenticate(outsider)
+
+        response = self.client.get(self.participants_url())
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     # --- the join code ------------------------------------------------------
 
@@ -1571,7 +1821,9 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
             self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
         )
         self.assertNotIn('join_code', data)
-        self.assertIn('join_mode', data)
+        # Nor inside the settings object, which is where the rest of them live.
+        self.assertNotIn('join_code', data['settings'])
+        self.assertIn('join_mode', data['settings'])
 
 
 class BroadcastModeTests(EnvelopeAssertions, APITestCase):

@@ -32,10 +32,12 @@ conversation exists.
 from django.db.models import Prefetch
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+
+from rest_framework.pagination import PageNumberPagination
 
 from chat import membership
 from chat.models import Conversation, Message, Participant
@@ -43,6 +45,7 @@ from chat.serializers import (
     ADMIN_ONLY_SETTINGS,
     AddMembersSerializer,
     ConversationSerializer,
+    ConversationSearchSerializer,
     DirectConversationSerializer,
     GroupCreateSerializer,
     GroupSettingsSerializer,
@@ -57,6 +60,23 @@ from chat.serializers import (
     ParticipantSerializer,
     RemoveMemberSerializer,
 )
+
+
+class ParticipantPagination(PageNumberPagination):
+    """Ten members a page, because that is roughly one screen.
+
+    Its own class rather than the project default of 20: this list is rendered
+    as rows in a sheet a user scrolls, where the first page wants to be small
+    and fast, unlike a message history where 20 is one scrollback.
+
+    `page_size_query_param` lets a client that knows better ask for more - an
+    admin screen showing a whole group, say - and `max_page_size` stops that
+    becoming a way to ask the server for an unbounded serialization.
+    """
+
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
 
 
 class ConversationViewSet(
@@ -80,15 +100,18 @@ class ConversationViewSet(
         'role': ParticipantRoleSerializer,
         'rename': RenameMemberSerializer,
         'invite': InviteByPhoneSerializer,
+        'search': ConversationSearchSerializer,
     }
 
     success_messages = {
         'list': 'Conversations fetched.',
         'retrieve': 'Conversation fetched.',
+        'search': 'Conversation search complete.',
         'direct': 'Conversation ready.',
         'group': 'Group created.',
         'group_settings': 'Group updated.',
         'members': 'Members added.',
+        'participants': 'Participants fetched.',
         'messages:GET': 'Messages fetched.',
         'messages:POST': 'Message sent.',
         'join': 'Join request handled.',
@@ -118,6 +141,10 @@ class ConversationViewSet(
                 participants__status=Participant.Status.ACTIVE,
             )
             .distinct()
+            # A reverse one-to-one, so it joins rather than costing a query per
+            # conversation - which it did, every time the list serialised the
+            # group's number.
+            .select_related('sms_number')
             .prefetch_related(
                 Prefetch(
                     'participants',
@@ -142,6 +169,29 @@ class ConversationViewSet(
         )
 
     # -- starting conversations -------------------------------------------
+
+    @action(detail=False, methods=['get'])
+    def search(self, request):
+        """Find named groups that can be discovered and joined."""
+        term = (request.query_params.get('q') or '').strip()
+        matches = Conversation.objects.filter(
+            kind=Conversation.Kind.GROUP,
+            name__icontains=term,
+        ).exclude(
+            join_mode=Conversation.JoinMode.INVITE,
+        ).order_by('name', 'id')
+
+        if len(term) < 2:
+            matches = matches.none()
+
+        page = self.paginate_queryset(matches)
+        serializer = self.get_serializer(
+            page if page is not None else matches,
+            many=True,
+        )
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
 
     @action(detail=False, methods=['post'])
     def direct(self, request):
@@ -217,6 +267,47 @@ class ConversationViewSet(
 
     # -- membership --------------------------------------------------------
 
+    @action(detail=True, methods=['get'], pagination_class=ParticipantPagination)
+    def participants(self, request, pk=None):
+        """Who is in this conversation, ten at a time.
+
+        Its own endpoint rather than a field on every conversation reply,
+        because the member list is unbounded and each row carries a nested user
+        and profile: a group of two hundred made every fetch of the group carry
+        two hundred profiles.
+
+        ACTIVE rows only - the same set the conversation payload carries.
+        Somebody who left, was removed or is waiting on approval is not a
+        member; pending requests have their own endpoint (`requests`).
+
+        Ordered by `joined_at` **then `pk`**. Paginating on a non-unique sort
+        key can show one row on two pages and skip another entirely, and
+        `joined_at` is not unique - everybody added in a single request shares
+        a timestamp to the microsecond.
+
+        Access control is `get_object()`, which runs the member-scoped
+        queryset, so a non-member gets 404 here exactly as everywhere else.
+        """
+        conversation = self.get_object()
+
+        rows = (
+            Participant.objects.filter(
+                conversation=conversation, status=Participant.Status.ACTIVE
+            )
+            .select_related('user__profile')
+            .order_by('joined_at', 'pk')
+        )
+
+        page = self.paginate_queryset(rows)
+        serializer = ParticipantSerializer(
+            page if page is not None else rows,
+            many=True,
+            context=self.get_serializer_context(),
+        )
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
+
     @action(detail=True, methods=['post'])
     def members(self, request, pk=None):
         """Add people to a group by username or phone number. Admins only."""
@@ -262,6 +353,29 @@ class ConversationViewSet(
         # asked.
         if conversation is None:
             return Response({'status': participant.status})
+        return Response(self._as_conversation(conversation))
+
+    @action(detail=True, methods=['post'], url_path='join', url_name='join-open')
+    def join_open(self, request, pk=None):
+        """Join an open group or request access to an approval group."""
+        conversation = Conversation.objects.filter(
+            pk=pk, kind=Conversation.Kind.GROUP
+        ).first()
+        if conversation is None:
+            raise NotFound('Conversation not found.')
+        if conversation.join_mode not in (
+            Conversation.JoinMode.OPEN,
+            Conversation.JoinMode.APPROVAL,
+        ):
+            raise ValidationError(
+                'This conversation is not open to joining or requesting access.'
+            )
+
+        participant = membership.request_to_join(conversation, user=request.user)
+        if participant.status == Participant.Status.PENDING:
+            return Response({'status': participant.status})
+
+        conversation = self.get_queryset().get(pk=conversation.pk)
         return Response(self._as_conversation(conversation))
 
     @action(detail=True, methods=['post'])

@@ -193,11 +193,44 @@ ADMIN_ONLY_SETTINGS = {
 }
 
 
+class GroupNumberSerializer(serializers.Serializer):
+    """The group's own phone number, as a client needs to see it.
+
+    A bare string was enough while the only question was "what do I dial". It
+    cannot answer "can I dial it yet": with no provider configured, ordering
+    mints a well-formed placeholder that belongs to nobody, and a client that
+    renders it tells the user to text a dead line. An empty `provider` is
+    exactly that case, so it is the one field here that is not decoration.
+
+    A plain Serializer, not a ModelSerializer, so this module stays free of any
+    import of `sms` - `sms.models` imports `chat.models`, and chat's side of
+    that relationship is deliberately kept to function-local imports.
+
+    `provider_number_id` is deliberately absent: it is the lease's
+    account-management handle, used to reconfigure or release the number, and
+    no member of the group has any use for it.
+    """
+
+    number = serializers.CharField(read_only=True)
+    country = serializers.CharField(read_only=True)
+    status = serializers.CharField(read_only=True)
+    provider = serializers.CharField(read_only=True)
+
+
 class ConversationSerializer(serializers.ModelSerializer):
-    participants = ParticipantSerializer(many=True, read_only=True)
+    # No `participants`. The member list is unbounded and every row carries a
+    # nested user and profile, so a group of two hundred made every fetch of
+    # every conversation carry two hundred profiles - on the list endpoint,
+    # once per conversation. It lives on its own paginated endpoint instead:
+    # GET /conversations/<id>/participants/.
+    #
+    # The participants PREFETCH in ConversationViewSet.get_queryset stays even
+    # so: `get_title` walks it to name a direct conversation after the other
+    # person, and without it that is a query per row.
     title = serializers.SerializerMethodField()
     image_url = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
+    settings = serializers.SerializerMethodField()
     # The number members text to reach this group. Read-only everywhere and
     # for everybody: it is fixed for the life of the group, so there is no
     # writable form of this field for a client or an admin to reach.
@@ -218,11 +251,12 @@ class ConversationSerializer(serializers.ModelSerializer):
             'title',
             'description',
             'image_url',
-            'mode',
-            'join_mode',
-            'sms_number',
+            # One object, the same shape a client PATCHes to /settings/, so
+            # there is one thing to learn rather than a nested request and a
+            # flat response. `mode` and `join_mode` used to sit out here too
+            # and no longer do - they are inside `settings` with the other five.
             'settings',
-            'participants',
+            'sms_number',
             'last_message',
             'created_at',
             'updated_at',
@@ -230,16 +264,43 @@ class ConversationSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_sms_number(self, obj):
-        """The group's own number, or None while it has not got one yet.
+        """The group's number as an object, or None while it has not got one.
 
         Without this the product's central promise - text this number to reach
         your group - is unreachable: a member has no way to learn the number,
         so nobody can use SMS at all.
+
+        Nested rather than a bare string because "the number exists" and "the
+        number works" are different questions and only the object answers both;
+        see GroupNumberSerializer.
         """
         if obj.kind != Conversation.Kind.GROUP:
             return None
         number = getattr(obj, 'sms_number', None)
-        return number.number if number is not None else None
+        if number is None:
+            return None
+        return GroupNumberSerializer(number).data
+
+    def get_settings(self, obj):
+        """Every group setting, in one object.
+
+        Read-only here. ADMIN_ONLY_SETTINGS governs who may CHANGE these, but
+        every member may SEE them: a member who cannot tell whether SMS
+        delivery is on cannot understand why their message reached nobody.
+
+        `join_code` is deliberately absent. It is the thing that lets a
+        stranger in, so it keeps its own admin-only endpoint rather than riding
+        every conversation fetch into logs, caches and screenshots.
+        """
+        return {
+            'mode': obj.mode,
+            'join_mode': obj.join_mode,
+            'add_member_permission': obj.add_member_permission,
+            'edit_group_permission': obj.edit_group_permission,
+            'sms_delivery_enabled': obj.sms_delivery_enabled,
+            'sms_replies_enabled': obj.sms_replies_enabled,
+            'voice_messages_enabled': obj.voice_messages_enabled,
+        }
 
     def get_image_url(self, obj):
         """A group's image, or None. Direct conversations never have one.
@@ -289,6 +350,13 @@ class ConversationSerializer(serializers.ModelSerializer):
     def _viewer(self):
         request = self.context.get('request')
         return getattr(request, 'user', None) if request else None
+
+
+class ConversationSearchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Conversation
+        fields = ['id', 'name', 'join_mode', 'mode']
+        read_only_fields = fields
 
 
 class DirectConversationSerializer(serializers.Serializer):

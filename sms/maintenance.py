@@ -109,11 +109,21 @@ def provision_missing_numbers():
     that way, because nothing tries again. Its members can talk in the app and
     cannot be reached by text at all, which looks like the SMS feature being
     broken rather than one order having failed.
+
+    Only groups whose delivery is switched ON are considered. A group with SMS
+    off either had it turned off by an admin or never qualified for a number
+    (rule 1a - its creator has no verified number), and buying one for either is
+    spending money on a channel nobody asked for. Turning delivery back on is
+    the signal to provision, and this job acts on it the next time it runs.
     """
     from sms.provisioning import provision_for
 
     groups = (
-        Conversation.objects.filter(kind=Conversation.Kind.GROUP, sms_number=None)
+        Conversation.objects.filter(
+            kind=Conversation.Kind.GROUP,
+            sms_number=None,
+            sms_delivery_enabled=True,
+        )
         .select_related('created_by__profile')
         .order_by('created_at')[:settings.SMS_PROVISION_BATCH]
     )

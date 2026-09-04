@@ -2,10 +2,15 @@
 
 THE RULES, which are product decisions and not implementation details:
 
-  1. A group's number belongs to the COUNTRY OF WHOEVER CREATED IT. A Philippine
-     admin's group gets a +63 number, so their members are texting a local
-     number at local rates rather than dialling internationally to reach the
-     family group.
+  1. A group's number belongs to the COUNTRY OF WHOEVER CREATED IT, read from
+     their VERIFIED phone number. A Philippine admin's group gets a +63 number,
+     so their members are texting a local number at local rates rather than
+     dialling internationally to reach the family group.
+  1a. NO VERIFIED NUMBER MEANS NO SMS. There is no default country and no guess:
+     the group is created, works normally in the app, and has its two SMS
+     settings switched off. Guessing would buy a permanent foreign number
+     (rule 2) that bills every member international rates forever, and the
+     first anyone would know is the phone bill.
   2. THE NUMBER NEVER CHANGES. Not by a member, not by an admin, not through the
      API. It is printed in people's phones as "Family" the moment anyone saves
      it, and a number that can be reassigned is a number that delivers a
@@ -49,33 +54,30 @@ logger = logging.getLogger(__name__)
 
 
 def country_for(user):
-    """Which country's number this person's group should get.
+    """Which country's number this person's group should get, or None.
 
     Read from their verified phone number, because that is the only evidence
     the product has of where somebody actually is - a profile field they typed
     would be a guess, and an IP address is worse.
 
-    Falls back to `SMS_DEFAULT_COUNTRY` when they have no verified number, which
-    is a real case: a phone number is optional at registration, so somebody can
-    create a group having never given one. Giving them a default country's
-    number is better than refusing to create the group, but it IS a guess, and
-    it is logged as one.
+    None means "we do not know", and the caller must not turn that into a
+    guess. Two cases reach it, and both are real: a phone number is optional at
+    registration, so somebody can create a group having never given one; and a
+    verified number in a country `SMS_COUNTRY_BY_PREFIX` does not map is a
+    country we cannot buy in anyway.
+
+    Returning a default country instead would buy a number that can never be
+    changed (rule 2) in a country the group has nothing to do with, and every
+    member would pay international rates to text it - discovered, at the
+    earliest, on a phone bill.
     """
     profile = getattr(user, 'profile', None)
     number = getattr(profile, 'phone_number', None) if profile else None
     verified = getattr(profile, 'phone_no_verified', False) if profile else False
 
     if number and verified:
-        country = country_for_number(number)
-        if country:
-            return country
-
-    logger.info(
-        'No verified number for user %s; defaulting group number country to %s',
-        getattr(user, 'pk', None),
-        settings.SMS_DEFAULT_COUNTRY,
-    )
-    return settings.SMS_DEFAULT_COUNTRY
+        return country_for_number(number)
+    return None
 
 
 def country_for_number(e164):
@@ -111,6 +113,10 @@ def provision_for(conversation, creator):
         return existing
 
     country = country_for(creator)
+    if country is None:
+        # Rule 1a. Nothing to buy, because there is no country to buy in.
+        _disable_sms(conversation)
+        return None
 
     # A spare of the right country, if one is already leased. Locked, because
     # two groups created at the same instant must not claim the same number.
@@ -142,6 +148,30 @@ def provision_for(conversation, creator):
         provider_number_id=ordered.get('provider_number_id', ''),
         country=bought_in,
     )
+
+
+def _disable_sms(conversation):
+    """Switch a group's SMS legs off, because it can never have a number.
+
+    The group itself is untouched and works normally in the app - only the two
+    SMS settings change, so they say what is true rather than advertising a
+    channel that would accept messages and silently deliver nothing.
+
+    Reversible on purpose. If the creator verifies a number later, an admin can
+    turn delivery back on and `provision_missing_numbers` buys the group a
+    number the next time it runs.
+
+    `updated_at` is deliberately NOT in update_fields: it is auto_now and it
+    orders the conversation list, so writing it here would push a group to the
+    top as though somebody had posted in it.
+    """
+    logger.info(
+        'Conversation %s: creator has no verified number, so SMS is off for it',
+        conversation.pk,
+    )
+    conversation.sms_delivery_enabled = False
+    conversation.sms_replies_enabled = False
+    conversation.save(update_fields=['sms_delivery_enabled', 'sms_replies_enabled'])
 
 
 def _order_with_fallback(country):
