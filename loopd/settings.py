@@ -36,9 +36,8 @@ JWT_SIGNING_KEY = os.environ.get('JWT_SIGNING_KEY', SECRET_KEY)
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DEBUG', 'True').lower() not in ('0', 'false', 'no')
 
-# Comma-separated in the environment. This also gates websockets:
-# AllowedHostsOriginValidator refuses every handshake when DEBUG is off and
-# this list is empty.
+# Comma-separated in the environment. Which Host headers this server answers
+# to - nothing to do with websockets; see CORS_ALLOWED_ORIGINS for those.
 ALLOWED_HOSTS = [
     host.strip() for host in os.environ.get('ALLOWED_HOSTS', '').split(',') if host.strip()
 ]
@@ -108,6 +107,12 @@ CSRF_TRUSTED_ORIGINS = [
 
 # A browser frontend on another local port needs an explicit CORS response.
 # Production origins are supplied by CORS_ALLOWED_ORIGINS instead.
+#
+# THIS ALSO GATES WEBSOCKETS. loopd/asgi.py validates the handshake's Origin
+# against this list, so with DEBUG off and this unset it is EMPTY and every
+# socket is refused - silently, because a rejected handshake looks to a browser
+# exactly like a server that is not there. Set it wherever ALLOWED_HOSTS is
+# set, with the scheme included: matching is on scheme, host and port.
 _default_cors_origins = 'http://localhost:3000,http://127.0.0.1:3000' if DEBUG else ''
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
