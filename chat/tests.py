@@ -1518,7 +1518,7 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
                 self.settings_url(), {'settings': {'join_mode': 'approval'}}, format='json'
             )
         )
-        self.assertEqual(data['join_mode'], 'approval')
+        self.assertEqual(data['settings']['join_mode'], 'approval')
 
     def test_switching_to_code_mode_guarantees_there_is_a_code(self):
         # A group can predate join codes, or have had one revoked; the setting
@@ -1557,17 +1557,24 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
         self.assertSuccess(response)
 
         data = response.json()['data']
-        self.assertEqual(data['add_member_permission'], 'admins')
-        self.assertEqual(data['edit_group_permission'], 'admins')
-        self.assertFalse(data['sms_delivery_enabled'])
-        self.assertFalse(data['sms_replies_enabled'])
-        self.assertFalse(data['voice_messages_enabled'])
-        # The two that were already there, so this cannot pass by regression.
-        self.assertIn('mode', data)
-        self.assertIn('join_mode', data)
+        settings = data['settings']
+        self.assertEqual(settings['add_member_permission'], 'admins')
+        self.assertEqual(settings['edit_group_permission'], 'admins')
+        self.assertFalse(settings['sms_delivery_enabled'])
+        self.assertFalse(settings['sms_replies_enabled'])
+        self.assertFalse(settings['voice_messages_enabled'])
+        # The two that were already exposed, now in here with the rest.
+        self.assertIn('mode', settings)
+        self.assertIn('join_mode', settings)
 
-        # But NOT the join code: it lets a stranger in, so it stays on its own
+        # One object, not two places to look: they are no longer at the top
+        # level, so a client has exactly one shape to read.
+        self.assertNotIn('mode', data)
+        self.assertNotIn('join_mode', data)
+
+        # And NOT the join code: it lets a stranger in, so it stays on its own
         # admin-only endpoint rather than riding along on every fetch.
+        self.assertNotIn('join_code', settings)
         self.assertNotIn('join_code', data)
 
     # --- the join code ------------------------------------------------------
@@ -1604,7 +1611,9 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
             self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
         )
         self.assertNotIn('join_code', data)
-        self.assertIn('join_mode', data)
+        # Nor inside the settings object, which is where the rest of them live.
+        self.assertNotIn('join_code', data['settings'])
+        self.assertIn('join_mode', data['settings'])
 
 
 class BroadcastModeTests(EnvelopeAssertions, APITestCase):

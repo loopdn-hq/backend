@@ -181,6 +181,7 @@ class ConversationSerializer(serializers.ModelSerializer):
     title = serializers.SerializerMethodField()
     image_url = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
+    settings = serializers.SerializerMethodField()
     # The number members text to reach this group. Read-only everywhere and
     # for everybody: it is fixed for the life of the group, so there is no
     # writable form of this field for a client or an admin to reach.
@@ -195,22 +196,11 @@ class ConversationSerializer(serializers.ModelSerializer):
             'title',
             'description',
             'image_url',
-            # The group's settings, the same seven a client PATCHes to
-            # /settings/. Read-only here: ADMIN_ONLY_SETTINGS governs who may
-            # CHANGE them, but every member may see them - a member who cannot
-            # tell whether SMS delivery is on cannot understand why their
-            # message did not reach anybody.
-            #
-            # `join_code` is deliberately NOT here. It is the thing that lets a
-            # stranger in, so it has its own admin-only endpoint rather than
-            # riding on every conversation fetch into logs and screenshots.
-            'mode',
-            'join_mode',
-            'add_member_permission',
-            'edit_group_permission',
-            'sms_delivery_enabled',
-            'sms_replies_enabled',
-            'voice_messages_enabled',
+            # One object, the same shape a client PATCHes to /settings/, so
+            # there is one thing to learn rather than a nested request and a
+            # flat response. `mode` and `join_mode` used to sit out here too
+            # and no longer do - they are inside `settings` with the other five.
+            'settings',
             'sms_number',
             'participants',
             'last_message',
@@ -236,6 +226,27 @@ class ConversationSerializer(serializers.ModelSerializer):
         if number is None:
             return None
         return GroupNumberSerializer(number).data
+
+    def get_settings(self, obj):
+        """Every group setting, in one object.
+
+        Read-only here. ADMIN_ONLY_SETTINGS governs who may CHANGE these, but
+        every member may SEE them: a member who cannot tell whether SMS
+        delivery is on cannot understand why their message reached nobody.
+
+        `join_code` is deliberately absent. It is the thing that lets a
+        stranger in, so it keeps its own admin-only endpoint rather than riding
+        every conversation fetch into logs, caches and screenshots.
+        """
+        return {
+            'mode': obj.mode,
+            'join_mode': obj.join_mode,
+            'add_member_permission': obj.add_member_permission,
+            'edit_group_permission': obj.edit_group_permission,
+            'sms_delivery_enabled': obj.sms_delivery_enabled,
+            'sms_replies_enabled': obj.sms_replies_enabled,
+            'voice_messages_enabled': obj.voice_messages_enabled,
+        }
 
     def get_image_url(self, obj):
         """A group's image, or None. Direct conversations never have one.
