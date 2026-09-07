@@ -478,13 +478,30 @@ SMS_COUNTRY_BY_PREFIX = {
     '+65': 'SG',
 }
 
-# Where to look when the creator's own country has nothing available - some
-# countries need regulatory paperwork that cannot be done from an API call, and
-# a group with a foreign number still works. Tried in order, so put the easiest
-# to buy in first.
+# Buy every group's number in THIS country, whatever the creator's own country
+# is. Empty means the creator's country decides, which is rule 1 and the way
+# production is meant to run.
+#
+# Set to 'US' while the SMS feature is being tested. Telnyx sells no SMS-capable
+# number in most of SMS_COUNTRY_BY_PREFIX - a search for a local PH, GB, AU or
+# SG number with filter[features][]=sms answers HTTP 400 'No coverage found',
+# because the numbers that exist there are voice/fax only. US and CA are the
+# only two that can actually be bought and texted from, so without this the
+# feature cannot be exercised from a +63 test account at all.
+SMS_FORCE_COUNTRY = os.environ.get('SMS_FORCE_COUNTRY', '').strip().upper()
+
+# Where to look when the creator's own country has nothing available. EMPTY BY
+# DEFAULT, which means a group whose country has nothing gets no number at all
+# rather than a foreign one.
+#
+# It used to default to US,GB,CA. That silently bought a +1 number for a
+# Philippine family group - the number can never be changed afterwards (rule 2)
+# and every member pays international rates to text it, discovered on a phone
+# bill. Null is the honest answer: `conversation.sms_number` is null, the group
+# works in the app, and the backfill retries later.
 SMS_FALLBACK_COUNTRIES = [
     country.strip()
-    for country in os.environ.get('SMS_FALLBACK_COUNTRIES', 'US,GB,CA').split(',')
+    for country in os.environ.get('SMS_FALLBACK_COUNTRIES', '').split(',')
     if country.strip()
 ]
 
