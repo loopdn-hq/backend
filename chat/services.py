@@ -6,7 +6,7 @@ matter how it arrived.
 """
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
-from django.db import transaction
+from django.db import IntegrityError, transaction
 
 from chat.models import (
     Attachment,
@@ -40,7 +40,7 @@ def send_to_group(group, payload):
 
 @transaction.atomic
 def create_message(conversation, sender=None, text='', uploads=None, *,
-                   source=Message.Source.APP, participant=None):
+                   source=Message.Source.APP, participant=None, client_id=''):
     """Store a message with its attachments and touch the conversation.
 
     `sender` is the account that sent it, or None when the sender has no
@@ -71,13 +71,44 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     if not conversation.allows_posting_by(participant):
         raise PostingNotAllowed('Only admins can post in this group.')
 
-    message = Message.objects.create(
-        conversation=conversation,
-        sender=sender,
-        sender_participant=participant,
-        source=source,
-        text=text or '',
-    )
+    if client_id:
+        # A retry of something already stored. Returned rather than re-created,
+        # and WITHOUT re-broadcasting or re-scheduling the SMS fan-out: the
+        # first call already did both, and doing them twice would text every
+        # member's phone a second time and charge for it.
+        existing = Message.objects.filter(
+            conversation=conversation, client_id=client_id
+        ).first()
+        if existing is not None:
+            return existing
+
+    try:
+        # A SAVEPOINT, because this function is atomic: two sends racing on the
+        # same client_id both pass the check above, and the loser's
+        # IntegrityError would otherwise poison the whole transaction rather
+        # than being recoverable. The unique index is the real guarantee; the
+        # check above only saves the round trip in the common case.
+        with transaction.atomic():
+            message = Message.objects.create(
+                conversation=conversation,
+                client_id=client_id,
+                sender=sender,
+                sender_participant=participant,
+                source=source,
+                text=text or '',
+            )
+    except IntegrityError:
+        duplicate = (
+            Message.objects.filter(
+                conversation=conversation, client_id=client_id
+            ).first()
+            if client_id
+            else None
+        )
+        if duplicate is None:
+            # Not the collision we are prepared for.
+            raise
+        return duplicate
 
     for upload in uploads or []:
         Attachment.objects.create(

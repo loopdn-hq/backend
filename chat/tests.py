@@ -768,6 +768,34 @@ class ChatWebsocketTests(TransactionTestCase):
         connected, _ = await communicator.connect()
         self.assertTrue(connected)
 
+    async def test_a_refused_send_does_not_drop_the_socket(self):
+        # A member posting into a broadcast group used to raise
+        # PostingNotAllowed out of the consumer, past Channels (which catches
+        # only StopConsumer), and Daphne tore the connection down. The user saw
+        # a dropped socket instead of "only admins can post", reconnected, and
+        # lost everything broadcast in the gap. Any handler bug did the same.
+        group = await database_sync_to_async(Conversation.start_group)(
+            self.alice, name='Announcements'
+        )
+        await database_sync_to_async(group.add_participant)(self.bob)
+        group.mode = Conversation.Mode.BROADCAST
+        await database_sync_to_async(group.save)(update_fields=['mode'])
+
+        communicator = self.connect_as(self.bob)
+        await communicator.connect()
+
+        await communicator.send_json_to(
+            {'type': 'message.send', 'conversation_id': group.pk, 'text': 'hi'}
+        )
+
+        reply = await communicator.receive_json_from()
+        self.assertEqual(reply['type'], 'error')
+        # Still up, and still usable - not merely "not crashed".
+        await communicator.send_json_to({'type': 'nonsense'})
+        follow_up = await communicator.receive_json_from()
+        self.assertEqual(follow_up['type'], 'error')
+        await communicator.disconnect()
+
     async def test_a_socket_from_an_unlisted_origin_is_refused(self):
         # The whole point of the origin validator, and nothing else asserts it:
         # without one, any website a logged-in user visits could open a socket
@@ -1824,6 +1852,102 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
         # Nor inside the settings object, which is where the rest of them live.
         self.assertNotIn('join_code', data['settings'])
         self.assertIn('join_mode', data['settings'])
+
+
+class SeamlessReconnectTests(EnvelopeAssertions, APITestCase):
+    """What a client needs for a dropped socket to be invisible.
+
+    A socket always drops eventually - a sleeping laptop, a mobile handoff, a
+    deploy cycling tasks. These are the three things that decide whether that
+    costs the user anything.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.alice)
+
+    def messages_url(self):
+        return reverse('chat:conversation-messages', args=[self.group.id])
+
+    # --- resuming -----------------------------------------------------------
+
+    def test_a_client_can_fetch_exactly_what_it_missed(self):
+        seen = create_message(self.group, self.bob, text='before you left')
+        missed = [
+            create_message(self.group, self.bob, text=f'missed {i}')
+            for i in range(3)
+        ]
+
+        data = self.assertSuccess(
+            self.client.get(self.messages_url(), {'after_id': seen.pk})
+        )
+
+        self.assertEqual(
+            [row['id'] for row in data['results']], [m.pk for m in missed]
+        )
+
+    def test_resuming_from_the_newest_message_returns_nothing(self):
+        newest = create_message(self.group, self.bob, text='up to date')
+
+        data = self.assertSuccess(
+            self.client.get(self.messages_url(), {'after_id': newest.pk})
+        )
+
+        self.assertEqual(data['results'], [])
+
+    def test_a_junk_cursor_is_refused_rather_than_ignored(self):
+        # Silently ignoring it would hand back the whole history as though the
+        # client were resuming from nothing, and it would never know.
+        self.assertFailure(
+            self.client.get(self.messages_url(), {'after_id': 'yesterday'})
+        )
+
+    # --- retrying -----------------------------------------------------------
+
+    def test_a_retried_send_does_not_post_twice(self):
+        first = create_message(
+            self.group, self.alice, text='did that land?', client_id='abc-123'
+        )
+        again = create_message(
+            self.group, self.alice, text='did that land?', client_id='abc-123'
+        )
+
+        self.assertEqual(first.pk, again.pk)
+        self.assertEqual(Message.objects.filter(conversation=self.group).count(), 1)
+
+    def test_two_different_keys_are_two_messages(self):
+        create_message(self.group, self.alice, text='one', client_id='a')
+        create_message(self.group, self.alice, text='two', client_id='b')
+
+        self.assertEqual(Message.objects.filter(conversation=self.group).count(), 2)
+
+    def test_an_unkeyed_send_is_never_deduplicated(self):
+        # Inbound SMS and older clients send no key. Two identical texts are two
+        # messages, and collapsing them would silently drop somebody's message.
+        create_message(self.group, self.alice, text='same')
+        create_message(self.group, self.alice, text='same')
+
+        self.assertEqual(Message.objects.filter(conversation=self.group).count(), 2)
+
+    def test_the_same_key_in_another_group_is_a_different_message(self):
+        # The key is the SENDER's, scoped to a conversation. A client numbering
+        # its sends per-thread must not have one group swallow another's.
+        other = Conversation.start_group(self.alice, name='Work')
+
+        here = create_message(self.group, self.alice, text='hi', client_id='1')
+        there = create_message(other, self.alice, text='hi', client_id='1')
+
+        self.assertNotEqual(here.pk, there.pk)
+
+    def test_the_key_comes_back_so_a_client_can_match_its_own_message(self):
+        create_message(self.group, self.alice, text='hello', client_id='xyz')
+
+        data = self.assertSuccess(self.client.get(self.messages_url()))
+
+        self.assertEqual(data['results'][0]['client_id'], 'xyz')
 
 
 class BroadcastModeTests(EnvelopeAssertions, APITestCase):

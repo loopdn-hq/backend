@@ -56,6 +56,10 @@ class MessageSerializer(serializers.ModelSerializer):
             'sender',
             'text',
             'source',
+            # Echoed so a sender can match this against the optimistic entry it
+            # already rendered, instead of showing the message twice. Empty for
+            # anything the client did not key - inbound SMS, older clients.
+            'client_id',
             'attachments',
             'created_at',
         ]
@@ -93,6 +97,11 @@ class MessageCreateSerializer(serializers.Serializer):
     """
 
     text = serializers.CharField(required=False, allow_blank=True)
+    # The same retry key the websocket send takes. A REST POST that times out
+    # is exactly as ambiguous to a client as a dropped socket.
+    client_id = serializers.CharField(
+        required=False, allow_blank=True, max_length=64
+    )
     attachments = serializers.ListField(
         child=serializers.FileField(),
         required=False,
@@ -126,6 +135,7 @@ class MessageCreateSerializer(serializers.Serializer):
             sender=validated_data['sender'],
             text=validated_data.get('text', ''),
             uploads=validated_data.get('attachments'),
+            client_id=validated_data.get('client_id', ''),
         )
 
 
