@@ -22,6 +22,13 @@ THE RULES, which are product decisions and not implementation details:
      not a guess - set to 'US' on staging because Telnyx sells no SMS-capable
      number in most of the countries this product serves, and the feature would
      otherwise be untestable. Empty in production.
+  1c. A NUMBER IS ONLY BOUGHT FOR A GROUP THAT USES SMS. Both `sms_delivery_enabled`
+     and `sms_replies_enabled` off means nobody can send a text to this group
+     and nobody can text it back, so a number would be a lease paid every month
+     for a channel the creator explicitly switched off. Checked before the
+     country, because "should we buy at all" comes before "where".
+     Reversible: turning either setting on later is what
+     `provision_missing_numbers` keys on, and it buys the number on its next run.
   2. THE NUMBER NEVER CHANGES. Not by a member, not by an admin, not through the
      API. It is printed in people's phones as "Family" the moment anyone saves
      it, and a number that can be reassigned is a number that delivers a
@@ -120,6 +127,18 @@ def country_for_number(e164):
     return best[1] if best else None
 
 
+def uses_sms(conversation):
+    """Whether this group has any SMS leg switched on.
+
+    Either one is enough: delivery alone is an announcement group people read
+    by text, and replies alone is a group people text INTO. Both off is the
+    only combination that needs no number.
+    """
+    return bool(
+        conversation.sms_delivery_enabled or conversation.sms_replies_enabled
+    )
+
+
 def provision_for(conversation, creator):
     """Give this group its own number. Returns the GroupNumber, or None.
 
@@ -133,6 +152,16 @@ def provision_for(conversation, creator):
     if existing is not None:
         # Rule 2. Already has one, and it does not change.
         return existing
+
+    if not uses_sms(conversation):
+        # Rule 1c. Both legs are off, so a number would be billed monthly for a
+        # channel nobody can use. NOT _disable_sms: the settings already say
+        # this, and writing them again would be a pointless UPDATE.
+        logger.info(
+            'Conversation %s has both SMS settings off, so no number was bought',
+            conversation.pk,
+        )
+        return None
 
     country = country_for(creator)
     if country is None:
