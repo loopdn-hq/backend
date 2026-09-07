@@ -673,7 +673,17 @@ if REDIS_URL:
     CHANNEL_LAYERS = {
         'default': {
             'BACKEND': 'channels_redis.core.RedisChannelLayer',
-            'CONFIG': {'hosts': [REDIS_URL]},
+            # socket_timeout has to exceed channels_redis's brpop_timeout (5s).
+            # The receive loop parks on a blocking BZPOPMIN for that long, and
+            # redis-py 8 changed its default socket_timeout from None to 5 - the
+            # exact same number - so the read aborts in a dead heat with the
+            # server's reply. Every consumer then dies with "Timeout reading
+            # from redis:6379" about every five seconds and the browser sits in
+            # a reconnect loop. Anything comfortably above 5 restores the old
+            # behaviour while still failing fast on a genuinely dead Redis.
+            'CONFIG': {
+                'hosts': [{'address': REDIS_URL, 'socket_timeout': 10}],
+            },
         },
     }
 else:
