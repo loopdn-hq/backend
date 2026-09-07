@@ -241,6 +241,9 @@ class ConversationSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
     settings = serializers.SerializerMethodField()
+    created_by = serializers.SerializerMethodField()
+    is_admin = serializers.SerializerMethodField()
+    admin_details = serializers.SerializerMethodField()
     # The number members text to reach this group. Read-only everywhere and
     # for everybody: it is fixed for the life of the group, so there is no
     # writable form of this field for a client or an admin to reach.
@@ -266,6 +269,9 @@ class ConversationSerializer(serializers.ModelSerializer):
             # flat response. `mode` and `join_mode` used to sit out here too
             # and no longer do - they are inside `settings` with the other five.
             'settings',
+            'created_by',
+            'is_admin',
+            'admin_details',
             'sms_number',
             'last_message',
             'created_at',
@@ -360,6 +366,86 @@ class ConversationSerializer(serializers.ModelSerializer):
     def _viewer(self):
         request = self.context.get('request')
         return getattr(request, 'user', None) if request else None
+
+    def _person(self, user):
+        """One person as {username, avatar}, or None.
+
+        `avatar` carries the same absolute URL as `avatar_url` elsewhere in the
+        API - built from the request so a mobile client does not have to know
+        the host - and is None when they have not set one.
+        """
+        if user is None:
+            return None
+        profile = getattr(user, 'profile', None)
+        avatar = getattr(profile, 'avatar', None) if profile else None
+        url = None
+        if avatar:
+            request = self.context.get('request')
+            url = request.build_absolute_uri(avatar.url) if request else avatar.url
+        return {'username': user.username, 'avatar': url}
+
+    def get_created_by(self, obj):
+        """Whoever started this conversation."""
+        return self._person(obj.created_by)
+
+    def get_is_admin(self, obj):
+        """Whether the person asking administers this group.
+
+        The creator counts automatically; anyone else has to hold the admin
+        role on their membership row.
+
+        NOTE the one case where this is more generous than the server: a
+        creator who has been DEMOTED still reads True here, while
+        `conversation.is_admin()` - which every admin-only endpoint actually
+        enforces - reads False. A client trusting this flag would offer them
+        controls the API then refuses with 403. It cannot happen to a creator
+        who merely left, because a non-member cannot fetch the conversation at
+        all, and it needs a second admin to exist before the first can be
+        demoted at all.
+        """
+        viewer = self._viewer()
+        if viewer is None or not getattr(viewer, 'is_authenticated', False):
+            return False
+        if obj.kind != Conversation.Kind.GROUP:
+            # Nobody administers a one-to-one conversation.
+            return False
+        if obj.created_by_id == viewer.pk:
+            return True
+        return any(
+            row.user_id == viewer.pk and row.role == Participant.Role.ADMIN
+            for row in obj.participants.all()
+        )
+
+    def get_admin_details(self, obj):
+        """Who administers this group, as {username, avatar}.
+
+        The creator when they are asking, otherwise the admin found on the
+        membership rows.
+
+        A group can have SEVERAL admins - `set_role` promotes people - and this
+        field is one object, so it has to choose. It prefers the creator when
+        they still hold the role, then the earliest to have joined, which makes
+        the answer stable between requests rather than dependent on row order.
+        """
+        if obj.kind != Conversation.Kind.GROUP:
+            return None
+
+        viewer = self._viewer()
+        if (
+            viewer is not None
+            and getattr(viewer, 'is_authenticated', False)
+            and obj.created_by_id == viewer.pk
+        ):
+            return self._person(obj.created_by)
+
+        admins = [
+            row for row in obj.participants.all()
+            if row.role == Participant.Role.ADMIN and row.user_id is not None
+        ]
+        if not admins:
+            return None
+        admins.sort(key=lambda row: (row.user_id != obj.created_by_id, row.joined_at))
+        return self._person(admins[0].user)
 
 
 class ConversationSearchSerializer(serializers.ModelSerializer):

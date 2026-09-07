@@ -4,6 +4,8 @@ import tempfile
 from unittest import mock
 
 from channels.db import database_sync_to_async
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from channels.testing import WebsocketCommunicator
 from django.contrib.auth.models import User
 from django.core.cache import cache
@@ -1852,6 +1854,103 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
         # Nor inside the settings object, which is where the rest of them live.
         self.assertNotIn('join_code', data['settings'])
         self.assertIn('join_mode', data['settings'])
+
+
+class ConversationAdminFieldsTests(EnvelopeAssertions, APITestCase):
+    """Who started this group, who runs it, and whether you do."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+
+    def detail(self, user):
+        self.client.force_authenticate(user)
+        return self.assertSuccess(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
+        )
+
+    def test_created_by_is_a_person_not_an_id(self):
+        data = self.detail(self.alice)
+
+        self.assertEqual(
+            data['created_by'], {'username': 'alice', 'avatar': None}
+        )
+
+    def test_the_creator_is_an_admin(self):
+        self.assertTrue(self.detail(self.alice)['is_admin'])
+
+    def test_an_ordinary_member_is_not(self):
+        self.assertFalse(self.detail(self.bob)['is_admin'])
+
+    def test_a_promoted_member_is(self):
+        # The other half of the rule: not the creator, so it has to come from
+        # the membership row.
+        membership.set_role(
+            Participant.objects.get(conversation=self.group, user=self.bob),
+            Participant.Role.ADMIN,
+            by=self.alice,
+        )
+
+        self.assertTrue(self.detail(self.bob)['is_admin'])
+
+    def test_admin_details_names_the_admin_to_a_member(self):
+        # Bob does not administer the group, so this tells him who does.
+        self.assertEqual(
+            self.detail(self.bob)['admin_details'],
+            {'username': 'alice', 'avatar': None},
+        )
+
+    def test_admin_details_prefers_the_creator_over_a_later_admin(self):
+        # Two admins, one object to return: the answer must be stable rather
+        # than whichever row the database hands back first.
+        membership.set_role(
+            Participant.objects.get(conversation=self.group, user=self.bob),
+            Participant.Role.ADMIN,
+            by=self.alice,
+        )
+        carol = make_user('carol')
+        self.group.add_participant(carol)
+
+        self.assertEqual(
+            self.detail(carol)['admin_details']['username'], 'alice'
+        )
+
+    def test_a_direct_conversation_has_no_admin(self):
+        # Nobody administers a one-to-one, so claiming somebody does would put
+        # admin controls on a screen that has none.
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        self.client.force_authenticate(self.alice)
+
+        data = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-detail', args=[conversation.id])
+            )
+        )
+
+        self.assertFalse(data['is_admin'])
+        self.assertIsNone(data['admin_details'])
+        self.assertEqual(data['created_by']['username'], 'alice')
+
+    def test_the_new_fields_do_not_cost_a_query_per_conversation(self):
+        # created_by and its avatar are on every row of the list. Without the
+        # select_related this is two extra queries per conversation, which only
+        # shows up once somebody has a lot of them.
+        for i in range(6):
+            Conversation.start_group(self.alice, name=f'Group {i}')
+        self.client.force_authenticate(self.alice)
+        url = reverse('chat:conversation-list')
+
+        with CaptureQueriesContext(connection) as first:
+            self.client.get(url)
+
+        for i in range(6, 12):
+            Conversation.start_group(self.alice, name=f'Group {i}')
+        with CaptureQueriesContext(connection) as second:
+            self.client.get(url)
+
+        self.assertEqual(len(second), len(first))
 
 
 class SeamlessReconnectTests(EnvelopeAssertions, APITestCase):

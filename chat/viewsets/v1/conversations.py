@@ -144,7 +144,10 @@ class ConversationViewSet(
             # A reverse one-to-one, so it joins rather than costing a query per
             # conversation - which it did, every time the list serialised the
             # group's number.
-            .select_related('sms_number')
+            # `created_by` is serialized on every row, and its avatar lives on
+            # the profile - without both joins that is two queries per
+            # conversation on the list.
+            .select_related('sms_number', 'created_by__profile')
             .prefetch_related(
                 Prefetch(
                     'participants',
