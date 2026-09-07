@@ -17,10 +17,25 @@ def active_users():
 
 
 def find_user(identifier, exclude=None):
-    """Resolve a username or a phone number to exactly one user, or None.
+    """Resolve a username, an email address or a phone number to one user.
+
+    Returns None if nothing matches.
 
     A leading '+' means the input is a phone number - the only form profiles
     store - so there is never any ambiguity with a numeric username.
+
+    An email only matches when its owner has **verified** it, for exactly the
+    reason the phone rule exists. `email` is not unique and nothing stops an
+    account PATCHing its address to one it does not own: that clears
+    `email_verified` but leaves `is_active` True and existing tokens valid, so
+    without this filter the squatter is who a lookup returns - and typing the
+    real owner's address into a group would put the squatter inside it.
+    `is_active` is NOT that gate; it means an admin has not banned the account.
+
+    An '@' means an email address is worth trying, and it is only ever a TRY:
+    the username branch still runs afterwards. Django allows '@' in a username,
+    so treating the character as proof would make such an account unaddressable
+    the moment email lookup was added.
 
     A number only matches when its owner has **verified** it. `phone_number` is
     unique independently of `phone_no_verified`, so anybody can type somebody
@@ -41,6 +56,13 @@ def find_user(identifier, exclude=None):
         return queryset.filter(
             profile__phone_number=identifier, profile__phone_no_verified=True
         ).first()
+
+    if '@' in identifier:
+        by_email = queryset.filter(
+            email__iexact=identifier, profile__email_verified=True
+        ).first()
+        if by_email is not None:
+            return by_email
 
     return queryset.filter(username__iexact=identifier).first()
 

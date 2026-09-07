@@ -16,7 +16,7 @@ from django.test import TransactionTestCase, override_settings
 from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
 from django.urls import reverse
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APITestCase, APITransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from chat import membership
@@ -2615,3 +2615,291 @@ class GroupPermissionSettingsTests(EnvelopeAssertions, APITestCase):
         )
         self.group.refresh_from_db()
         self.assertEqual(self.group.add_member_permission, 'admins')
+
+class EmailInvitationTests(EnvelopeAssertions, APITransactionTestCase):
+    """Adding somebody to a group by an address they may not have registered.
+
+    TransactionTestCase, like InviteAndNotifyTests: the invitation is sent from
+    a transaction.on_commit callback, which never fires inside a TestCase whose
+    transaction is rolled back.
+
+    Two outcomes from one input, decided by the address rather than by the
+    caller: a VERIFIED account is added outright, and anybody else is emailed
+    and becomes a member only when they prove they read that mailbox.
+
+    Nothing in the invitation is a credential - the link carries them to the
+    signup form and no further - so a forwarded invitation gives the reader
+    nothing at all.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(username='yul', password='x')
+        self.group = Conversation.start_group(self.admin, name='Family HQ')
+
+    def a_verified_account(self, username, email):
+        user = User.objects.create_user(username=username, email=email, password='x')
+        user.profile.email_verified = True
+        user.profile.save(update_fields=['email_verified'])
+        return user
+
+    # --- the address belongs to somebody -------------------------------
+
+    def test_a_verified_account_is_added_outright(self):
+        mara = self.a_verified_account('mara', 'mara@example.com')
+
+        with mock.patch('utils.mail.send_templated_email') as sent:
+            row = membership.invite_by_email(self.group, 'mara@example.com', self.admin)
+
+        self.assertEqual(row.user, mara)
+        self.assertEqual(row.status, Participant.Status.ACTIVE)
+        self.assertIsNone(row.email)
+        sent.assert_not_called()
+
+    def test_matching_an_account_ignores_case(self):
+        mara = self.a_verified_account('mara', 'mara@example.com')
+        row = membership.invite_by_email(self.group, 'MARA@Example.COM', self.admin)
+        self.assertEqual(row.user, mara)
+
+    def test_an_unverified_address_is_invited_not_added(self):
+        """The squat, again. An unproven address is not that person."""
+        squatter = User.objects.create_user(
+            username='mallory', email='finance@acme.com', password='x'
+        )
+        squatter.profile.email_verified = False
+        squatter.profile.save(update_fields=['email_verified'])
+
+        with mock.patch('utils.mail.send_templated_email'):
+            row = membership.invite_by_email(self.group, 'finance@acme.com', self.admin)
+
+        self.assertIsNone(row.user)
+        self.assertEqual(row.email, 'finance@acme.com')
+        self.assertFalse(
+            Participant.objects.filter(conversation=self.group, user=squatter).exists()
+        )
+
+    # --- nobody has the address yet ------------------------------------
+
+    def test_an_unknown_address_creates_a_row_and_emails_them(self):
+        with mock.patch('utils.mail.send_templated_email') as sent:
+            row = membership.invite_by_email(self.group, 'Ana@Example.com', self.admin)
+
+        self.assertIsNone(row.user)
+        self.assertEqual(row.email, 'ana@example.com')
+        self.assertTrue(row.is_email_only)
+        self.assertFalse(row.is_phone_only)
+        sent.assert_called_once()
+        context = sent.call_args.kwargs['context']
+        self.assertEqual(context['group_name'], 'Family HQ')
+        self.assertIn('ana%40example.com', context['join_url'])
+
+    def test_the_label_is_the_local_part_not_the_address(self):
+        # It goes out to everybody in the group; the full address must not.
+        with mock.patch('utils.mail.send_templated_email'):
+            row = membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+        self.assertEqual(row.display_label, 'ana')
+
+    def test_re_inviting_sends_again_without_a_second_row(self):
+        with mock.patch('utils.mail.send_templated_email') as sent:
+            first = membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+            second = membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(sent.call_count, 2)
+        self.assertEqual(
+            Participant.objects.filter(conversation=self.group, email='ana@example.com').count(), 1
+        )
+
+    def test_a_blocked_address_cannot_be_re_invited(self):
+        with mock.patch('utils.mail.send_templated_email'):
+            row = membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+        row.status = Participant.Status.BLOCKED
+        row.save(update_fields=['status'])
+
+        with self.assertRaises(BlockedFromConversation):
+            membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+
+    def test_a_non_admin_cannot_invite(self):
+        outsider = User.objects.create_user(username='nobody', password='x')
+        with self.assertRaises(membership.JoinRefused):
+            membership.invite_by_email(self.group, 'ana@example.com', outsider)
+
+    def test_a_failed_send_does_not_undo_the_row(self):
+        from utils.mail import EmailError
+
+        with mock.patch('utils.mail.send_templated_email',
+                        side_effect=EmailError('resend is down')):
+            row = membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+
+        self.assertTrue(Participant.objects.filter(pk=row.pk).exists())
+
+    # --- claiming on verification ---------------------------------------
+
+    def claim(self, email):
+        user = User.objects.create_user(username='ana', email=email, password='x')
+        user.profile.email_verified = True
+        user.profile.save(update_fields=['email_verified'])
+        return user, membership.claim_email_invitations(user)
+
+    def test_verifying_the_address_turns_the_invitation_into_membership(self):
+        with mock.patch('utils.mail.send_templated_email'):
+            row = membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+
+        user, claimed = self.claim('ana@example.com')
+
+        self.assertEqual(claimed, 1)
+        row.refresh_from_db()
+        self.assertEqual(row.user, user)
+        self.assertIsNone(row.email)
+        self.assertEqual(row.status, Participant.Status.ACTIVE)
+
+    def test_an_unverified_account_claims_nothing(self):
+        with mock.patch('utils.mail.send_templated_email'):
+            membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+
+        user = User.objects.create_user(
+            username='ana', email='ana@example.com', password='x'
+        )
+        self.assertEqual(membership.claim_email_invitations(user), 0)
+
+    def test_a_blocked_invitation_is_never_claimed(self):
+        with mock.patch('utils.mail.send_templated_email'):
+            row = membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+        row.status = Participant.Status.BLOCKED
+        row.save(update_fields=['status'])
+
+        _, claimed = self.claim('ana@example.com')
+
+        self.assertEqual(claimed, 0)
+        row.refresh_from_db()
+        self.assertEqual(row.status, Participant.Status.BLOCKED)
+        self.assertIsNone(row.user)
+
+    def test_claiming_merges_with_an_account_row_that_already_exists(self):
+        user = self.a_verified_account('ana', 'ana@example.com')
+        # Invited by address BEFORE the account verified, then added directly.
+        row = Participant.objects.create(
+            conversation=self.group, email='ana@example.com',
+            display_name='ana', role=Participant.Role.MEMBER,
+        )
+        account_row = self.group.add_participant(user)
+
+        claimed = membership.claim_email_invitations(user)
+
+        self.assertEqual(claimed, 1)
+        self.assertFalse(Participant.objects.filter(pk=row.pk).exists())
+        self.assertTrue(Participant.objects.filter(pk=account_row.pk).exists())
+        self.assertEqual(
+            Participant.objects.filter(conversation=self.group, user=user).count(), 1
+        )
+
+    def test_claiming_spans_every_group_they_were_invited_to(self):
+        other = Conversation.start_group(self.admin, name='Book Club')
+        with mock.patch('utils.mail.send_templated_email'):
+            membership.invite_by_email(self.group, 'ana@example.com', self.admin)
+            membership.invite_by_email(other, 'ana@example.com', self.admin)
+
+        _, claimed = self.claim('ana@example.com')
+        self.assertEqual(claimed, 2)
+
+    # --- through the API ------------------------------------------------
+
+    def test_creating_a_group_invites_the_addresses_given(self):
+        self.client.force_authenticate(self.admin)
+        with mock.patch('utils.mail.send_templated_email') as sent:
+            response = self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Trip', 'invite_email': ['ana@example.com']},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created = Conversation.objects.get(name='Trip')
+        self.assertTrue(
+            Participant.objects.filter(conversation=created, email='ana@example.com').exists()
+        )
+        sent.assert_called_once()
+
+    def test_an_unknown_address_does_not_fail_the_whole_request(self):
+        """Unlike `members`, which is all-or-nothing on purpose."""
+        self.client.force_authenticate(self.admin)
+        with mock.patch('utils.mail.send_templated_email'):
+            response = self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Trip', 'invite_email': ['nobody@example.com']},
+                format='json',
+            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+class SettingsChangeBroadcastTests(EnvelopeAssertions, APITestCase):
+    """Changing a group's settings has to reach the people looking at it.
+
+    `mode` decides which list a client files the group under and whether it
+    offers a compose box at all. Before this event only the admin who made the
+    change saw it: every other member kept a Broadcast group filed under Chat,
+    with a compose box that the server would refuse.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(username='yul', password='x')
+        self.member = User.objects.create_user(username='yul_2', password='x')
+        self.group = Conversation.start_group(self.admin, name='Pickle 5')
+        self.group.add_participant(self.member)
+        self.client.force_authenticate(self.admin)
+        self.url = reverse('chat:conversation-settings', args=[self.group.pk])
+
+    def patch_settings(self, settings_payload):
+        with mock.patch('chat.serializers.broadcast_conversation_updated') as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.patch(
+                    self.url, {'settings': settings_payload}, format='json'
+                )
+        return response, sent
+
+    def test_switching_to_broadcast_is_announced(self):
+        response, sent = self.patch_settings({'mode': 'broadcast'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.group.refresh_from_db()
+        self.assertEqual(self.group.mode, Conversation.Mode.BROADCAST)
+        sent.assert_called_once()
+        self.assertEqual(sent.call_args.args[0].pk, self.group.pk)
+
+    def test_the_response_carries_the_new_mode(self):
+        # The admin's own client updates from this payload rather than waiting
+        # for its own broadcast to come back.
+        response, _ = self.patch_settings({'mode': 'broadcast'})
+        self.assertEqual(response.json()['data']['settings']['mode'], 'broadcast')
+
+    def test_switching_back_is_announced_too(self):
+        self.group.mode = Conversation.Mode.BROADCAST
+        self.group.save(update_fields=['mode'])
+
+        response, sent = self.patch_settings({'mode': 'chat'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.group.refresh_from_db()
+        self.assertEqual(self.group.mode, Conversation.Mode.CHAT)
+        sent.assert_called_once()
+
+    def test_a_join_mode_change_is_announced(self):
+        _, sent = self.patch_settings({'join_mode': 'open'})
+        sent.assert_called_once()
+
+    def test_nothing_is_announced_when_nothing_changed(self):
+        with mock.patch('chat.serializers.broadcast_conversation_updated') as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.client.patch(self.url, {}, format='json')
+        sent.assert_not_called()
+
+    def test_broadcast_mode_actually_refuses_a_member_posting(self):
+        # The event is cosmetic unless the rule behind it holds.
+        self.patch_settings({'mode': 'broadcast'})
+        self.group.refresh_from_db()
+
+        member_row = Participant.objects.get(conversation=self.group, user=self.member)
+        admin_row = Participant.objects.get(conversation=self.group, user=self.admin)
+        self.assertFalse(self.group.allows_posting_by(member_row))
+        self.assertTrue(self.group.allows_posting_by(admin_row))
+

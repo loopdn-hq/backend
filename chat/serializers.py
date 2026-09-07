@@ -12,7 +12,11 @@ from chat.models import (
     Message,
     Participant,
 )
-from chat.services import announce_added_to_conversation, create_message
+from chat.services import (
+    announce_added_to_conversation,
+    broadcast_conversation_updated,
+    create_message,
+)
 from user.lookups import find_user
 from user.models import phone_number_validator
 from user.serializers import PublicUserSerializer
@@ -516,7 +520,7 @@ class GroupCreateSerializer(serializers.Serializer):
     members = serializers.ListField(
         child=serializers.CharField(),
         required=False,
-        help_text='Usernames or verified +E.164 numbers of EXISTING accounts.',
+        help_text='Usernames, emails or verified +E.164 numbers of EXISTING accounts.',
     )
     # Separate from `members`, not merged into it, because the two behave
     # differently when something is wrong: `members` means "these people exist,
@@ -526,6 +530,16 @@ class GroupCreateSerializer(serializers.Serializer):
         many=True,
         required=False,
         help_text='People with no account, added by number and texted an invitation.',
+    )
+    # Separate from `members` for the opposite reason `invite` is: an address
+    # that resolves to nobody is not a typo to reject, it is somebody who has
+    # not signed up yet. `members` fails the whole request on a miss; this one
+    # emails them instead.
+    invite_email = serializers.ListField(
+        child=serializers.EmailField(),
+        required=False,
+        help_text='Email addresses. A verified account is added outright; '
+                  'anyone else is emailed an invitation.',
     )
     settings = GroupSettingsFieldsSerializer(required=False)
 
@@ -558,6 +572,9 @@ class GroupCreateSerializer(serializers.Serializer):
         self._invite_by_number(
             conversation, validated_data.get('invite') or [], creator
         )
+        self._invite_by_email(
+            conversation, validated_data.get('invite_email') or [], creator
+        )
 
         return conversation
 
@@ -582,6 +599,29 @@ class GroupCreateSerializer(serializers.Serializer):
             announce_added_to_conversation(conversation, members)
 
         return conversation
+
+    def _invite_by_email(self, conversation, addresses, creator):
+        """Add or invite each address, after the group exists.
+
+        Same shape as `_invite_by_number` and for the same reason: each is
+        handled on its own and never allowed to fail the whole request. The
+        group and its real members are already committed, and losing them
+        because one address bounced helps nobody.
+        """
+        from chat import membership
+
+        invited = []
+        for address in addresses:
+            try:
+                invited.append(
+                    membership.invite_by_email(conversation, address, creator)
+                )
+            except Exception:
+                logger.exception(
+                    'Could not invite %s to conversation %s',
+                    address, conversation.pk,
+                )
+        return invited
 
     def _invite_by_number(self, conversation, entries, creator):
         """Add the people who have no account, after the group exists.
@@ -662,6 +702,13 @@ class GroupSettingsSerializer(serializers.ModelSerializer):
         # the group to the top of every member's conversation list because
         # somebody fixed a typo in the description. Only a message is activity.
         instance.save(update_fields=fields)
+
+        # After commit, and only once the row is really written: every other
+        # member is looking at a stale copy until this lands, and `mode` in
+        # particular moves the group between lists in their sidebar.
+        transaction.on_commit(
+            lambda: broadcast_conversation_updated(instance)
+        )
         return instance
 
 

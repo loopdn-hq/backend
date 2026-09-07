@@ -110,10 +110,19 @@ VERIFICATION_CODE = EmailTemplate(
     context_keys=('code', 'expires_in_minutes'),
 )
 
+# Somebody with no account was added to a group by their address. The link is
+# a convenience, not a credential: membership is granted by VERIFYING the
+# address, so a forwarded invitation gives the reader nothing.
+GROUP_INVITATION = EmailTemplate(
+    slug='group_invitation',
+    context_keys=('group_name', 'inviter_name', 'join_url'),
+)
+
 CATALOGUE = {
     template.slug: template
     for template in (
         VERIFICATION_CODE,
+        GROUP_INVITATION,
     )
 }
 

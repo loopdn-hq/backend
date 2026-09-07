@@ -181,6 +181,20 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
             {'type': 'conversation.added', 'conversation': event['conversation']}
         )
 
+    async def conversation_updated(self, event):
+        """The group's settings changed - mode, join mode, permissions.
+
+        The whole conversation is sent rather than a diff so the client applies
+        one shape it already knows how to read.
+        """
+        await self.send_json(
+            {
+                'type': 'conversation.updated',
+                'conversation_id': event['conversation_id'],
+                'conversation': event['conversation'],
+            }
+        )
+
     async def typing(self, event):
         if event['user_id'] == self.user.pk:
             return  # nobody needs to be told they are typing

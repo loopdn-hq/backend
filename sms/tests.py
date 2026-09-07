@@ -1546,6 +1546,132 @@ class CountryFallbackTests(TestCase):
         self.assertTrue(Conversation.objects.filter(pk=group.pk).exists())
 
 
+class SmsSettingsGateTests(TestCase):
+    """Rule 1c: a number is only bought for a group that actually uses SMS.
+
+    Both legs off is a deliberate choice at creation - the two Features
+    checkboxes are unticked - and buying anyway would lease a number, billed
+    every month, for a channel the creator switched off before the group
+    existed.
+    """
+
+    def setUp(self):
+        self.creator = User.objects.create_user(username='yul', password='x')
+        self.creator.profile.phone_number = '+14155550000'
+        self.creator.profile.phone_no_verified = True
+        self.creator.profile.save()
+        self.bought = {'number': '+14155550123', 'provider': 'telnyx',
+                       'provider_number_id': 'num-1'}
+
+    def a_group(self, *, delivery, replies):
+        group = Conversation.start_group(self.creator, name='Family')
+        group.sms_delivery_enabled = delivery
+        group.sms_replies_enabled = replies
+        group.save(update_fields=['sms_delivery_enabled', 'sms_replies_enabled'])
+        return group
+
+    def provision(self, group):
+        with mock.patch('sms.provisioning.messaging_is_configured',
+                        return_value=True):
+            with mock.patch('sms.provisioning.order_number',
+                            return_value=self.bought) as order:
+                result = provisioning.provision_for(group, self.creator)
+        return result, order
+
+    def test_both_off_buys_nothing(self):
+        group = self.a_group(delivery=False, replies=False)
+        result, order = self.provision(group)
+
+        self.assertIsNone(result)
+        order.assert_not_called()
+        self.assertEqual(GroupNumber.objects.count(), 0)
+
+    def test_delivery_alone_is_enough(self):
+        group = self.a_group(delivery=True, replies=False)
+        result, order = self.provision(group)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.number, '+14155550123')
+        order.assert_called_once()
+
+    def test_replies_alone_is_enough(self):
+        """A group people text INTO still needs a number to text."""
+        group = self.a_group(delivery=False, replies=True)
+        result, order = self.provision(group)
+
+        self.assertIsNotNone(result)
+        order.assert_called_once()
+
+    def test_both_on_buys_one(self):
+        group = self.a_group(delivery=True, replies=True)
+        result, _ = self.provision(group)
+        self.assertIsNotNone(result)
+
+    def test_the_settings_are_left_exactly_as_they_were(self):
+        # Not _disable_sms: they already say this, and rewriting them would be
+        # a pointless UPDATE on a row the conversation list is ordered by.
+        group = self.a_group(delivery=False, replies=False)
+        before = group.updated_at
+        self.provision(group)
+
+        group.refresh_from_db()
+        self.assertFalse(group.sms_delivery_enabled)
+        self.assertFalse(group.sms_replies_enabled)
+        self.assertEqual(group.updated_at, before)
+
+    def test_an_available_spare_is_not_claimed_either(self):
+        # The gate is checked before the spare lookup, so a group that wants no
+        # number cannot consume one somebody else is holding.
+        GroupNumber.objects.create(
+            number='+14155559999', status=GroupNumber.Status.AVAILABLE,
+            country='US', provider='telnyx',
+        )
+        group = self.a_group(delivery=False, replies=False)
+        result, _ = self.provision(group)
+
+        self.assertIsNone(result)
+        spare = GroupNumber.objects.get(number='+14155559999')
+        self.assertEqual(spare.status, GroupNumber.Status.AVAILABLE)
+        self.assertIsNone(spare.conversation)
+
+    def test_uses_sms_reads_both_legs(self):
+        self.assertFalse(provisioning.uses_sms(
+            self.a_group(delivery=False, replies=False)))
+        self.assertTrue(provisioning.uses_sms(
+            self.a_group(delivery=True, replies=False)))
+        self.assertTrue(provisioning.uses_sms(
+            self.a_group(delivery=False, replies=True)))
+
+    def test_turning_a_leg_on_later_is_picked_up_by_the_backfill(self):
+        """Rule 1c is reversible - that is what makes it safe to default off."""
+        group = self.a_group(delivery=False, replies=False)
+        self.provision(group)
+        self.assertEqual(GroupNumber.objects.count(), 0)
+
+        group.sms_replies_enabled = True
+        group.save(update_fields=['sms_replies_enabled'])
+
+        with mock.patch('sms.provisioning.messaging_is_configured',
+                        return_value=True):
+            with mock.patch('sms.provisioning.order_number',
+                            return_value=self.bought):
+                self.assertEqual(maintenance.provision_missing_numbers(), 1)
+
+        self.assertTrue(GroupNumber.objects.filter(conversation=group).exists())
+
+    def test_the_backfill_leaves_a_both_off_group_alone(self):
+        self.a_group(delivery=False, replies=False)
+
+        with mock.patch('sms.provisioning.messaging_is_configured',
+                        return_value=True):
+            with mock.patch('sms.provisioning.order_number',
+                            return_value=self.bought) as order:
+                self.assertEqual(maintenance.provision_missing_numbers(), 0)
+
+        order.assert_not_called()
+        self.assertEqual(GroupNumber.objects.count(), 0)
+
+
 class ForcedCountryTests(TestCase):
     """`SMS_FORCE_COUNTRY`: buy everything in one country, whoever asks.
 

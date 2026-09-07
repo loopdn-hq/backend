@@ -95,6 +95,21 @@ def verify_email(user, code):
     profile.email_verified = True
     profile.save(update_fields=['email_verified', 'updated_at'])
 
+    # Proving the address is what turns an email invitation into membership -
+    # see chat.membership.claim_email_invitations. Imported here rather than at
+    # module scope because otp loads early and must not drag chat's models in
+    # with it. Never allowed to fail verification: the account is already
+    # verified by this point, and the backfill is a convenience on top.
+    try:
+        from chat.membership import claim_email_invitations
+
+        claim_email_invitations(user)
+    except Exception:
+        logger.exception(
+            'Could not claim email invitations for user %s after verification',
+            user.pk,
+        )
+
     return user
 
 

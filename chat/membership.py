@@ -14,6 +14,10 @@ Nothing here is a DRF exception, for the same reason as the provider clients:
 this has to stay usable from a management command, a Celery task and the webhook
 handler, none of which have a request. loopd/exceptions.py maps them.
 """
+import logging
+from urllib.parse import quote
+
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -22,8 +26,11 @@ from chat.models import (
     BlockedFromConversation,
     Conversation,
     Participant,
+    local_part,
     mask_number,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class JoinRefused(Exception):
@@ -547,6 +554,161 @@ def _admin_count(conversation, lock=False):
 def _require_admin(conversation, by):
     if by is None or not conversation.is_admin(by):
         raise JoinRefused('Only a group admin can do that.')
+
+
+def invite_by_email(conversation, email, by):
+    """Add somebody to a group by their email address.
+
+    Two outcomes, and which one happens is decided by the address, not by the
+    caller:
+
+      THE ADDRESS BELONGS TO A VERIFIED ACCOUNT - they are added outright, the
+      same as being named by username. `find_user` requires the address to be
+      verified, so this can never hand a group to somebody who merely typed
+      that address into their profile.
+
+      NOBODY HAS IT - a row is created against the address and an invitation is
+      emailed. It becomes real membership when they verify that address, in
+      `claim_email_invitations`. Until then they are in no group they can see.
+
+    Returns the Participant either way.
+    """
+    from user.lookups import find_user
+
+    if not conversation.may_add_members(by):
+        raise JoinRefused('You cannot add people to this group.')
+
+    if conversation.kind != Conversation.Kind.GROUP:
+        raise JoinRefused('Only groups have members to invite.')
+
+    address = (email or '').strip().lower()
+    if not address:
+        raise JoinRefused('That is not an email address.')
+
+    owner = find_user(address)
+    if owner is not None:
+        # A real account. add_participant carries the blocked checks and the
+        # phone-row folding, so there is nothing to duplicate here.
+        return conversation.add_participant(owner)
+
+    existing = Participant.objects.filter(
+        conversation=conversation, email__iexact=address
+    ).first()
+    if existing is not None and existing.status == Participant.Status.BLOCKED:
+        raise BlockedFromConversation('That person is blocked from this group.')
+
+    participant = existing or Participant.objects.create(
+        conversation=conversation,
+        email=address,
+        display_name=local_part(address),
+        added_by=by,
+        role=Participant.Role.MEMBER,
+    )
+
+    # Re-inviting someone who has not claimed their row sends the invitation
+    # again, which is the only way to recover from a bounced first attempt.
+    transaction.on_commit(
+        lambda: _email_invitation(conversation, participant, by)
+    )
+    return participant
+
+
+def _email_invitation(conversation, participant, by):
+    """Send one group invitation. Never raises.
+
+    An invitation that cannot be sent must not undo a group that is already
+    committed - and this runs in an on_commit callback, where an exception
+    becomes a 500 on a request that already succeeded.
+    """
+    from utils.mail import GROUP_INVITATION, EmailError, send_templated_email
+
+    inviter = getattr(getattr(by, 'profile', None), 'display_label', None)
+    address = participant.email
+    if not address:
+        return
+
+    try:
+        send_templated_email(
+            GROUP_INVITATION,
+            to=address,
+            context={
+                'group_name': conversation.name,
+                'inviter_name': inviter or 'Somebody',
+                # Deliberately not a token. Membership is granted by verifying
+                # the address, so this only needs to carry them to the right
+                # form with the right address in it.
+                'join_url': f'{settings.FRONTEND_URL}/signup?email={quote(address)}',
+            },
+        )
+    except EmailError:
+        logger.exception(
+            'Could not email the invitation for conversation %s', conversation.pk
+        )
+
+
+def claim_email_invitations(user):
+    """Fold every pending email invitation for this user into their account.
+
+    Called when an address is VERIFIED, which is the whole security model for
+    email invitations: the row is created against an address, and only proving
+    you read that mailbox turns it into membership. Nothing in the invitation
+    email is a credential, so forwarding it gives the recipient nothing.
+
+    The mirror of `Conversation._claim_phone_participant`, with one deliberate
+    difference: this never raises. It runs inside email verification, and a
+    blocked row in one group must not be able to stop somebody verifying their
+    account. Blocked rows are skipped and stay blocked - registering against a
+    blocked address is not a way back in.
+
+    Returns the number of rows claimed.
+    """
+    profile = getattr(user, 'profile', None)
+    address = (user.email or '').strip()
+    if profile is None or not profile.email_verified or not address:
+        return 0
+
+    pending = Participant.objects.filter(
+        user__isnull=True, email__iexact=address
+    ).select_related('conversation')
+
+    claimed = 0
+    for row in pending:
+        if row.status == Participant.Status.BLOCKED:
+            continue
+
+        existing = Participant.objects.filter(
+            conversation_id=row.conversation_id, user=user
+        ).first()
+
+        if existing is None:
+            # The address has done its job; the account carries it from here,
+            # and clearing it frees the slot for a future invitation.
+            row.user = user
+            row.email = None
+            row.status = Participant.Status.ACTIVE
+            row.save(update_fields=['user', 'email', 'status'])
+            claimed += 1
+            _announce_membership(row)
+            continue
+
+        # Already in as an account and as an address: one human, two rows.
+        # Keep the account row and move the history across before dropping the
+        # duplicate - `sender_participant` is SET_NULL, so deleting first would
+        # orphan anything they posted.
+        row.messages_sent.update(sender_participant=existing)
+        row.delete()
+
+        if existing.status == Participant.Status.BLOCKED:
+            continue
+        if existing.status != Participant.Status.ACTIVE:
+            existing.status = Participant.Status.ACTIVE
+            existing.save(update_fields=['status'])
+        claimed += 1
+        _announce_membership(existing)
+
+    if claimed:
+        logger.info('Claimed %s email invitation(s) for user %s', claimed, user.pk)
+    return claimed
 
 
 def invite_by_phone(conversation, phone_number, display_name, by):
