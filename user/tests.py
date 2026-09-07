@@ -1085,3 +1085,105 @@ class FindUserByPhoneNumberTests(APITestCase):
         from user.lookups import find_user
 
         self.assertEqual(find_user('squatter'), self.squatter)
+
+
+class EmailLookupTests(APITestCase):
+    """Addressing somebody by their email, the third form `find_user` takes.
+
+    Symmetrical with the phone rule above, and for the same reason: `email` is
+    not unique and any account can PATCH its address to one it does not own -
+    that clears `email_verified` but leaves `is_active` True and its tokens
+    working. Only a VERIFIED address resolves, or typing somebody's address
+    into a group would add whoever squatted it.
+
+    Inactive accounts stay invisible too - a banned account must answer the
+    same way a nonexistent one does, or the lookup enumerates them.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='mara', email='Mara@Example.com', password='x'
+        )
+        self.user.profile.email_verified = True
+        self.user.profile.save(update_fields=['email_verified'])
+
+    def test_an_email_resolves_to_its_owner(self):
+        from user.lookups import find_user
+
+        self.assertEqual(find_user('mara@example.com'), self.user)
+
+    def test_matching_ignores_case(self):
+        from user.lookups import find_user
+
+        self.assertEqual(find_user('MARA@EXAMPLE.COM'), self.user)
+
+    def test_an_unknown_email_resolves_to_nobody(self):
+        from user.lookups import find_user
+
+        self.assertIsNone(find_user('nobody@example.com'))
+
+    def test_an_inactive_account_is_invisible(self):
+        from user.lookups import find_user
+
+        self.user.is_active = False
+        self.user.save(update_fields=['is_active'])
+        self.assertIsNone(find_user('mara@example.com'))
+
+    def test_a_username_containing_an_at_still_resolves(self):
+        """The email branch is a try, not a claim on the character.
+
+        Django permits '@' in a username, so an account called `a@b` has to
+        stay addressable after email lookup exists.
+        """
+        from user.lookups import find_user
+
+        odd = User.objects.create_user(username='a@b', password='x')
+        self.assertEqual(find_user('a@b'), odd)
+
+    def test_exclude_still_applies(self):
+        from user.lookups import find_user
+
+        self.assertIsNone(find_user('mara@example.com', exclude=self.user))
+
+    def test_a_group_can_be_created_with_an_email_member(self):
+        from chat.models import Conversation
+        from chat.serializers import resolve_members
+
+        creator = User.objects.create_user(username='owner', password='x')
+        Conversation.start_group(creator, name='Family')
+
+        self.assertEqual(
+            resolve_members(['mara@example.com'], exclude=creator), [self.user]
+        )
+
+    def test_an_unverified_address_resolves_to_nobody(self):
+        """The squat. Registering and never opening the email is enough."""
+        from user.lookups import find_user
+
+        self.user.profile.email_verified = False
+        self.user.profile.save(update_fields=['email_verified'])
+        self.assertIsNone(find_user('mara@example.com'))
+
+    def test_a_squatter_cannot_be_added_to_a_group_by_the_real_address(self):
+        from chat.models import Conversation
+        from chat.serializers import resolve_members
+
+        squatter = User.objects.create_user(
+            username='mallory', email='finance@acme.com', password='x'
+        )
+        squatter.profile.email_verified = False
+        squatter.profile.save(update_fields=['email_verified'])
+
+        owner = User.objects.create_user(username='ana', password='x')
+        Conversation.start_group(owner, name='Private')
+
+        with self.assertRaises(Exception) as caught:
+            resolve_members(['finance@acme.com'], exclude=owner)
+        self.assertIn('finance@acme.com', str(caught.exception))
+
+    def test_an_unknown_email_names_itself_in_the_error(self):
+        from chat.serializers import resolve_members
+
+        with self.assertRaises(Exception) as caught:
+            resolve_members(['ghost@example.com'])
+        self.assertIn('ghost@example.com', str(caught.exception))
