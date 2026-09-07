@@ -5,6 +5,7 @@ from unittest import mock
 
 from channels.db import database_sync_to_async
 from django.db import connection
+from django.test import SimpleTestCase
 from django.test.utils import CaptureQueriesContext
 from channels.testing import WebsocketCommunicator
 from django.contrib.auth.models import User
@@ -1854,6 +1855,58 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
         # Nor inside the settings object, which is where the rest of them live.
         self.assertNotIn('join_code', data['settings'])
         self.assertIn('join_mode', data['settings'])
+
+
+class ChannelLayerCheckTests(SimpleTestCase):
+    """The deploy gate for realtime.
+
+    An in-memory channel layer across two tasks drops messages silently -
+    `send_to_group` guards only against the layer being None, and
+    InMemoryChannelLayer is not None, so every broadcast reports success. It
+    presents as "realtime works, then stops, and refreshing fixes it".
+    """
+
+    IN_MEMORY = {'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}
+    REDIS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {'hosts': ['redis://localhost:6379/0']},
+        }
+    }
+    POSTGRES = {'default': {'ENGINE': 'django.db.backends.postgresql', 'NAME': 'x'}}
+    SQLITE = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}}
+
+    def run_check(self):
+        from chat.checks import check_channel_layer
+
+        return [problem.id for problem in check_channel_layer(None)]
+
+    def test_a_deployment_without_redis_is_refused(self):
+        with override_settings(
+            DEBUG=False, CHANNEL_LAYERS=self.IN_MEMORY, DATABASES=self.POSTGRES
+        ):
+            self.assertIn('chat.E001', self.run_check())
+
+    def test_a_deployment_with_redis_is_fine(self):
+        with override_settings(
+            DEBUG=False, CHANNEL_LAYERS=self.REDIS, DATABASES=self.POSTGRES
+        ):
+            self.assertEqual(self.run_check(), [])
+
+    def test_ci_is_not_a_deployment(self):
+        # CI runs `check --deploy` with DEBUG off and neither POSTGRES_DB nor
+        # REDIS_URL, on purpose. Failing there would break every build for a
+        # condition that is only ever true of a real deployment.
+        with override_settings(
+            DEBUG=False, CHANNEL_LAYERS=self.IN_MEMORY, DATABASES=self.SQLITE
+        ):
+            self.assertEqual(self.run_check(), [])
+
+    def test_a_laptop_is_not_a_deployment(self):
+        with override_settings(
+            DEBUG=True, CHANNEL_LAYERS=self.IN_MEMORY, DATABASES=self.POSTGRES
+        ):
+            self.assertEqual(self.run_check(), [])
 
 
 class ConversationAdminFieldsTests(EnvelopeAssertions, APITestCase):
