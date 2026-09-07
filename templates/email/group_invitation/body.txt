@@ -1,0 +1,15 @@
+{{ inviter_name }} added you to "{{ group_name }}" on {{ product_name }}.
+
+{{ product_name }} is where the group talks. To see it, create an account with
+this email address:
+
+{{ join_url }}
+
+You will be in the group as soon as you confirm this address - it is that
+confirmation, not this email, that lets you in. Nothing here is a password or
+a key, so forwarding it gives nobody access.
+
+If you were not expecting this, you can ignore it. You have not been added to
+anything you can see until you sign up.
+
+Questions? Reach us at {{ support_address }}.

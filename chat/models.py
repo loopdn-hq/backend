@@ -71,6 +71,17 @@ class BlockedFromConversation(Exception):
     """
 
 
+def local_part(email):
+    """The name-ish half of an address, for showing in a group: ana.
+
+    An email invitee has no account and no name yet, and the same reasoning as
+    `mask_number` applies to the label: it goes out to everybody in the group.
+    The local part identifies them to the person who invited them without
+    handing the full address to every other member.
+    """
+    return (email or '').strip().split('@')[0][:80]
+
+
 def mask_number(number):
     """A phone number safe to show other people: +63…1111.
 
@@ -582,6 +593,15 @@ class Participant(models.Model):
     )
     # What the group sees. Required for a phone-only row; ignored for a member
     # who has an account, because their own profile is more current.
+    # Somebody invited by email who has no account yet. Nullable and unique
+    # per conversation for the same reason `phone_number` is: it identifies a
+    # person we cannot point at any other way, and two rows for one address
+    # would double every count and every send.
+    #
+    # It is CLEARED when the row is claimed by a verified account, so a row
+    # never carries both an owner and the address that proved them - see
+    # `_claim_email_participant`.
+    email = models.EmailField(max_length=254, null=True, blank=True)
     display_name = models.CharField(
         max_length=80, blank=True, default='', db_default=''
     )
@@ -660,8 +680,20 @@ class Participant(models.Model):
                 condition=Q(phone_number__isnull=False),
                 name='unique_conversation_phone_participant',
             ),
+            # An address must not sit in one group twice, for the same reason
+            # a number must not: the claim on verification would resolve
+            # ambiguously and the invitation would be sent twice.
+            models.UniqueConstraint(
+                fields=['conversation', 'email'],
+                condition=Q(email__isnull=False),
+                name='unique_conversation_email_participant',
+            ),
             models.CheckConstraint(
-                condition=Q(user__isnull=False) | Q(phone_number__isnull=False),
+                condition=(
+                    Q(user__isnull=False)
+                    | Q(phone_number__isnull=False)
+                    | Q(email__isnull=False)
+                ),
                 name='participant_identifies_someone',
             ),
             # Enforced here rather than only in the serializer: a nameless
@@ -683,7 +715,18 @@ class Participant(models.Model):
 
     @property
     def is_phone_only(self):
-        return self.user_id is None
+        """No account, reachable only at a number.
+
+        Narrowed when email invitations arrived: `user_id is None` alone would
+        now call an email invitee phone-only, and the label for one of those
+        would fall through to masking a number that is not there.
+        """
+        return self.user_id is None and self.phone_number is not None
+
+    @property
+    def is_email_only(self):
+        """No account yet, invited at an address and waiting to claim it."""
+        return self.user_id is None and self.email is not None
 
     @property
     def display_label(self):
@@ -697,6 +740,8 @@ class Participant(models.Model):
             return self.user.profile.display_label
         if self.display_name:
             return self.display_name
+        if self.email:
+            return local_part(self.email) or 'Unknown'
         return mask_number(self.phone_number) or 'Unknown'
 
 

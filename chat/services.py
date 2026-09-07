@@ -198,6 +198,31 @@ def broadcast_added_to_conversation(conversation, users):
         )
 
 
+def broadcast_conversation_updated(conversation):
+    """Tell everyone in a conversation that its settings changed.
+
+    Sent to the CONVERSATION's group, not to each member individually: everyone
+    who can see it is already subscribed, and they all need the same payload.
+
+    This matters more than a cosmetic refresh. `mode` decides which list a
+    client files the group under and whether it offers a compose box at all, and
+    `join_mode` decides how people get in. Without this event only the admin who
+    made the change sees it; every other member keeps a stale group - filed in
+    the wrong place, with a compose box that will be refused - until they happen
+    to reload.
+    """
+    from chat.serializers import ConversationSerializer
+
+    send_to_group(
+        conversation_group(conversation.pk),
+        {
+            'type': 'conversation.updated',
+            'conversation_id': conversation.pk,
+            'conversation': ConversationSerializer(conversation).data,
+        },
+    )
+
+
 def broadcast_removed_from_conversation(conversation, users):
     """Tell people they are no longer in a conversation, so their socket lets go.
 
