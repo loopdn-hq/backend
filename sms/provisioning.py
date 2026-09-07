@@ -11,6 +11,17 @@ THE RULES, which are product decisions and not implementation details:
      settings switched off. Guessing would buy a permanent foreign number
      (rule 2) that bills every member international rates forever, and the
      first anyone would know is the phone bill.
+  1b. NO NUMBER IS A VALID ANSWER. If the country the group should have cannot
+     be bought in, the group gets NO number - `conversation.sms_number` is null
+     - rather than a number somewhere else. `SMS_FALLBACK_COUNTRIES` is empty
+     by default for exactly this reason, and rule 2 is why: a consolation
+     number in another country is permanent, and every member pays
+     international rates to text it.
+     The single exception is `SMS_FORCE_COUNTRY`, which names one country to buy
+     every number in regardless of the creator. It is an operator's override,
+     not a guess - set to 'US' on staging because Telnyx sells no SMS-capable
+     number in most of the countries this product serves, and the feature would
+     otherwise be untestable. Empty in production.
   2. THE NUMBER NEVER CHANGES. Not by a member, not by an admin, not through the
      API. It is printed in people's phones as "Family" the moment anyone saves
      it, and a number that can be reassigned is a number that delivers a
@@ -21,8 +32,11 @@ THE RULES, which are product decisions and not implementation details:
 WHERE THE PROVIDER LIVES
 ------------------------
 Behind `order_number` and `release_number`, the only two functions here that
-talk to anybody. Unconfigured they mint and discard a local placeholder, so
-group creation works end to end on a laptop and in CI with no account.
+talk to anybody. Unconfigured, they buy nothing and the group simply has no
+number - `conversation.sms_number` is null. Nothing fabricates a number to
+stand in for one, because a well-formed number that belongs to nobody is
+indistinguishable from a real one everywhere it is later read: the API hands
+it to a client, the client prints it, and somebody texts a dead line.
 
 One group, one number, bought when the group is created. Nothing is bought in
 advance and nothing is reused between groups - `GroupNumber.number` is unique,
@@ -33,7 +47,6 @@ order (it is refused otherwise), and an accepted order is not an owned number
 until its status says success.
 """
 import logging
-import secrets
 import time
 
 from django.conf import settings
@@ -70,7 +83,16 @@ def country_for(user):
     changed (rule 2) in a country the group has nothing to do with, and every
     member would pay international rates to text it - discovered, at the
     earliest, on a phone bill.
+
+    `SMS_FORCE_COUNTRY` overrides all of that, including rule 1a, and is the one
+    sanctioned way to do so - see rule 1b in the module docstring. It exists
+    because the countries this product serves cannot be bought in: it is set to
+    'US' on staging so the feature can be exercised at all, and is empty in
+    production, where rule 1 decides.
     """
+    if settings.SMS_FORCE_COUNTRY:
+        return settings.SMS_FORCE_COUNTRY
+
     profile = getattr(user, 'profile', None)
     number = getattr(profile, 'phone_number', None) if profile else None
     verified = getattr(profile, 'phone_no_verified', False) if profile else False
@@ -175,16 +197,27 @@ def _disable_sms(conversation):
 
 
 def _order_with_fallback(country):
-    """Buy in the creator's country if possible, otherwise anywhere we can.
+    """Buy in `country`, then in `SMS_FALLBACK_COUNTRIES` if that fails.
 
-    The creator's country is a preference, not a requirement. Some countries -
-    the Philippines among them - need regulatory paperwork that no API call can
-    complete, so insisting would leave those groups with no number at all. A
-    group whose members text a foreign number works; a group with no number does
-    not.
+    THE LADDER IS EMPTY BY DEFAULT, so normally this orders in exactly one
+    country and returns (None, country) if that does not work - rule 1b. The
+    setting is kept because a fallback is occasionally the right call for a
+    deliberate, temporary situation; it is not a default, because a consolation
+    number in another country is permanent (rule 2) and bills every member
+    international rates to text it.
 
     Returns (order, country_actually_bought_in).
     """
+    if not messaging_is_configured():
+        # Whether a provider exists is global, not per country, so no rung of
+        # the ladder can succeed either. Checked once here rather than once per
+        # rung, which logged the same line four times for a single group.
+        logger.warning(
+            'No messaging provider configured, so conversation numbers cannot '
+            'be bought; the group has none',
+        )
+        return None, country
+
     tried = []
     for candidate in [country] + list(settings.SMS_FALLBACK_COUNTRIES):
         if candidate in tried:
@@ -251,12 +284,14 @@ def order_number(country):
                when it says success.
     """
     if not messaging_is_configured():
-        placeholder = _placeholder_number(country)
-        logger.info(
-            'No messaging provider configured; using placeholder number %s (%s)',
-            placeholder, country,
+        # No account, so there is nothing to buy and nothing to pretend with.
+        # The group is created and works in the app; it just has no number, the
+        # same state as a provider that had none available.
+        logger.warning(
+            'No messaging provider configured, so no number was bought for %s; '
+            'the group has none', country,
         )
-        return {'number': placeholder, 'provider': '', 'provider_number_id': ''}
+        return None
 
     try:
         candidates = search_numbers(country, limit=settings.SMS_NUMBER_SEARCH_CANDIDATES)
@@ -265,9 +300,12 @@ def order_number(country):
         return None
 
     if not candidates:
-        # Also what an unsupported country looks like: `filter[country_code]`
-        # has no enum, so a country Telnyx does not sell in returns an empty
-        # list rather than an error.
+        # NOT how an unsupported country looks. A country Telnyx has no SMS
+        # coverage in answers HTTP 400 with error 10015 'No coverage found',
+        # which `_request` raises as SmsError and the branch above catches -
+        # true today of PH, GB, AU and SG, whose numbers are voice/fax only.
+        # Reaching here means the country is sold in and is momentarily sold
+        # out, which is why it is worth an error rather than a shrug.
         logger.error('No SMS-capable numbers available in %s', country)
         return None
 
@@ -366,17 +404,3 @@ def release_number(group_number):
             'keeps being billed', group_number.number, group_number.provider_number_id,
         )
         return False
-
-
-def _placeholder_number(country):
-    """A syntactically valid, obviously fake number for local development.
-
-    Random rather than sequential so that two groups created in one test run
-    cannot collide on the unique column.
-    """
-    prefix = next(
-        (p for p, c in settings.SMS_COUNTRY_BY_PREFIX.items() if c == country),
-        '+1',
-    )
-    digits = ''.join(secrets.choice('0123456789') for _ in range(9))
-    return f'{prefix}{digits}'

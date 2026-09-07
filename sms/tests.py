@@ -18,6 +18,7 @@ from chat.models import (
 )
 import base64
 import time
+import urllib.parse
 from unittest import mock
 
 from django.urls import reverse
@@ -864,13 +865,58 @@ class SmsChecksTests(TestCase):
         self.assertIn('sms.E002', self.ids(SMS_MAX_SEGMENTS_PER_DAY=0))
 
 
+@override_settings(TELNYX_API_KEY='k', TELNYX_MESSAGING_PROFILE_ID='p')
 class NumberProvisioningTests(TestCase):
     """The three rules a group's number obeys.
 
     1. Its country follows whoever created the group.
     2. It never changes.
     3. Deleting the group deletes it.
+
+    A provider that always sells is faked at `sms.client._request`, the single
+    seam every provider call goes through, so these stay tests of the rules
+    rather than of the network. It has to be faked because nothing mints a
+    stand-in number any more - with no provider configured a group simply has
+    no number, which `NoProviderMeansNoNumberTests` pins separately.
     """
+
+    def setUp(self):
+        self._minted = 0
+        patcher = mock.patch('sms.client._request', side_effect=self.fake_provider)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fake_provider(self, method, url, payload=None, **kwargs):
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+
+        # Checked before `phone_numbers`, which is a substring of it.
+        if 'available_phone_numbers' in url:
+            country = (query.get('filter[country_code]') or [''])[0]
+            prefix = next(
+                (p for p, c in settings.SMS_COUNTRY_BY_PREFIX.items() if c == country),
+                None,
+            )
+            if prefix is None:
+                # A country the provider does not sell in answers with an empty
+                # list rather than an error, exactly as Telnyx does.
+                return {'data': []}
+            self._minted += 1
+            return {'data': [{
+                'phone_number': f'{prefix}9{self._minted:08d}',
+                'features': [{'name': 'sms'}],
+            }]}
+
+        if method == 'POST' and 'number_orders' in url:
+            return {'data': {'id': f'order-{self._minted}', 'status': 'success'}}
+
+        if method == 'DELETE':
+            return {}
+
+        if 'phone_numbers' in url:
+            wanted = (query.get('filter[phone_number]') or [''])[0]
+            return {'data': [{'id': f'num-{wanted.lstrip("+")}', 'phone_number': wanted}]}
+
+        raise AssertionError(f'unexpected provider call: {method} {url}')
 
     def make_user(self, name, phone=None, verified=True):
         user = User.objects.create_user(username=name, password='x')
@@ -1005,10 +1051,9 @@ class NumberProvisioningTests(TestCase):
                 'number': number.number,
                 'country': number.country,
                 'status': GroupNumber.Status.ACTIVE,
-                # Empty because no provider is configured under test - which is
-                # the whole point of exposing it: this number is a placeholder
-                # and a client can tell.
-                'provider': '',
+                # Names who the lease is with, which is where a support
+                # conversation about this number has to start.
+                'provider': 'telnyx',
             },
         )
 
@@ -1058,6 +1103,58 @@ class NumberProvisioningTests(TestCase):
         direct.delete()
 
         self.assertEqual(GroupNumber.objects.filter(conversation=group).count(), 1)
+
+
+@override_settings(TELNYX_API_KEY='', TELNYX_MESSAGING_PROFILE_ID='')
+class NoProviderMeansNoNumberTests(TestCase):
+    """With no provider account, a group gets NO number - not a made-up one.
+
+    There used to be a placeholder here: a well-formed, randomly generated
+    number minted locally so that group creation worked end to end on a laptop.
+    It was indistinguishable from a real number everywhere it was later read.
+    The API served it, a client rendered it, and somebody was told to text a
+    line that belongs to nobody. Null is the honest answer, and the only one a
+    client can act on.
+    """
+
+    def make_group(self):
+        user = User.objects.create_user(username='yul', password='x')
+        user.profile.phone_number = '+639171111111'
+        user.profile.phone_no_verified = True
+        user.profile.save()
+        conversation = Conversation.start_group(user, name='Family')
+        provisioning.provision_for(conversation, user)
+        return user, conversation
+
+    def test_no_number_row_is_created(self):
+        _, group = self.make_group()
+        self.assertFalse(GroupNumber.objects.filter(conversation=group).exists())
+        # And nothing was invented under any other status either.
+        self.assertEqual(GroupNumber.objects.count(), 0)
+
+    def test_the_group_itself_still_works(self):
+        # The whole point of provisioning sitting outside the creating
+        # transaction: no number is not a failed group.
+        _, group = self.make_group()
+        self.assertTrue(Conversation.objects.filter(pk=group.pk).exists())
+
+    def test_the_api_says_null_rather_than_an_empty_string(self):
+        user, group = self.make_group()
+        client = APIClient()
+        client.force_authenticate(user)
+        detail = client.get(reverse('chat:conversation-detail', args=[group.id]))
+        self.assertIsNone(detail.json()['data']['sms_number'])
+
+    def test_delivery_stays_on_so_the_backfill_retries(self):
+        # Distinct from rule 1a, which switches SMS off because the group can
+        # NEVER have a number. A missing provider is temporary, and delivery
+        # being left on is what `provision_missing_numbers` keys on.
+        _, group = self.make_group()
+        group.refresh_from_db()
+        self.assertTrue(group.sms_delivery_enabled)
+
+    def test_ordering_returns_none_instead_of_minting_one(self):
+        self.assertIsNone(provisioning.order_number('PH'))
 
 
 class CountryLookupTests(TestCase):
@@ -1349,11 +1446,40 @@ class BuyingANumberTests(TestCase):
 
 
 class CountryFallbackTests(TestCase):
-    """The creator's country is a preference, not a requirement.
+    """What the fallback ladder does when it is deliberately switched on.
 
-    Some countries need regulatory paperwork no API call can complete. A group
-    whose members text a foreign number works; a group with no number does not.
+    It is EMPTY by default (rule 1b): a group that cannot get a number in its
+    own country gets none, because a consolation number abroad is permanent
+    (rule 2) and bills every member international rates. Every test here sets
+    the ladder explicitly, so none of them describes the default.
     """
+
+    def setUp(self):
+        # The ladder checks for a provider once, before trying any country. No
+        # account is configured under test, so without this it returns before
+        # attempting anything and every assertion here reads as "no countries
+        # tried" rather than as the ordering behaviour being tested.
+        patcher = mock.patch(
+            'sms.provisioning.messaging_is_configured', return_value=True
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @override_settings(SMS_FALLBACK_COUNTRIES=[])
+    def test_by_default_there_is_no_second_choice(self):
+        """Rule 1b: no number is a valid answer, a foreign number is not."""
+        attempted = []
+
+        def fake(country):
+            attempted.append(country)
+            return None
+
+        with mock.patch('sms.provisioning.order_number', side_effect=fake):
+            order, country = provisioning._order_with_fallback('PH')
+
+        self.assertEqual(attempted, ['PH'])
+        self.assertIsNone(order)
+        self.assertEqual(country, 'PH')
 
     @override_settings(SMS_FALLBACK_COUNTRIES=['US'])
     def test_it_falls_back_when_the_creators_country_has_nothing(self):
@@ -1418,6 +1544,81 @@ class CountryFallbackTests(TestCase):
                 self.assertIsNone(provisioning.provision_for(group, alice))
 
         self.assertTrue(Conversation.objects.filter(pk=group.pk).exists())
+
+
+class ForcedCountryTests(TestCase):
+    """`SMS_FORCE_COUNTRY`: buy everything in one country, whoever asks.
+
+    The reason it exists is measurable rather than theoretical. Telnyx sells no
+    SMS-capable number in PH, GB, AU or SG - a search for one answers HTTP 400
+    'No coverage found', because the numbers on offer there are voice/fax only.
+    US and CA are the only two that can be bought and texted from, so without
+    this the feature cannot be exercised from a +63 account at all.
+
+    It is set on staging and empty in production, where rule 1 decides.
+    """
+
+    def a_creator(self, name='yul', phone='+639171111111', verified=True):
+        user = User.objects.create_user(username=name, password='x')
+        if phone:
+            user.profile.phone_number = phone
+            user.profile.phone_no_verified = verified
+            user.profile.save()
+        return user
+
+    @override_settings(SMS_FORCE_COUNTRY='US')
+    def test_it_overrides_the_creators_own_country(self):
+        self.assertEqual(provisioning.country_for(self.a_creator()), 'US')
+
+    @override_settings(SMS_FORCE_COUNTRY='US')
+    def test_it_overrides_rule_1a_as_well(self):
+        # No verified number normally means no country and no SMS. An explicit
+        # operator override is not the guess rule 1a exists to prevent, and a
+        # test account without a verified number is the common case on staging.
+        nobody = self.a_creator(phone=None)
+        self.assertEqual(provisioning.country_for(nobody), 'US')
+
+    @override_settings(SMS_FORCE_COUNTRY='')
+    def test_empty_leaves_rules_1_and_1a_alone(self):
+        self.assertEqual(provisioning.country_for(self.a_creator()), 'PH')
+        self.assertIsNone(
+            provisioning.country_for(self.a_creator(name='nobody', phone=None))
+        )
+
+    @override_settings(SMS_FORCE_COUNTRY='US', SMS_FALLBACK_COUNTRIES=[])
+    def test_a_philippine_creator_gets_a_us_number_end_to_end(self):
+        creator = self.a_creator()
+        group = Conversation.start_group(creator, name='Family')
+
+        bought = {'number': '+14155550123', 'provider': 'telnyx',
+                  'provider_number_id': 'num-1'}
+        with mock.patch('sms.provisioning.messaging_is_configured',
+                        return_value=True):
+            with mock.patch('sms.provisioning.order_number',
+                            return_value=bought) as order:
+                row = provisioning.provision_for(group, creator)
+
+        order.assert_called_once_with('US')
+        self.assertEqual(row.country, 'US')
+        self.assertEqual(row.number, '+14155550123')
+
+    @override_settings(SMS_FORCE_COUNTRY='US', SMS_FALLBACK_COUNTRIES=[])
+    def test_no_number_available_leaves_the_group_with_null(self):
+        """Rule 1b. Not a number somewhere else, and not a fabricated one."""
+        creator = self.a_creator()
+        group = Conversation.start_group(creator, name='Family')
+
+        with mock.patch('sms.provisioning.messaging_is_configured',
+                        return_value=True):
+            with mock.patch('sms.provisioning.order_number', return_value=None):
+                with self.assertLogs('sms.provisioning', level='ERROR'):
+                    self.assertIsNone(provisioning.provision_for(group, creator))
+
+        self.assertEqual(GroupNumber.objects.count(), 0)
+        group.refresh_from_db()
+        # Left ON deliberately: nothing here says the group can NEVER have a
+        # number, and delivery being on is what the backfill keys on.
+        self.assertTrue(group.sms_delivery_enabled)
 
 
 class SpendCapsTests(TestCase):
@@ -1857,7 +2058,16 @@ class MaintenanceTests(TransactionTestCase):
         orphan = Conversation.start_group(self.alice, name='Orphan')
         self.assertFalse(GroupNumber.objects.filter(conversation=orphan).exists())
 
-        self.assertEqual(maintenance.provision_missing_numbers(), 1)
+        # A provider that has something to sell. Without one there is nothing
+        # to buy and the backfill correctly does nothing, which would test the
+        # opposite of what this is about.
+        bought = {'number': '+14155559999', 'provider': 'telnyx',
+                  'provider_number_id': 'num-1'}
+        with mock.patch('sms.provisioning.messaging_is_configured',
+                        return_value=True):
+            with mock.patch('sms.provisioning.order_number', return_value=bought):
+                self.assertEqual(maintenance.provision_missing_numbers(), 1)
+
         self.assertTrue(GroupNumber.objects.filter(conversation=orphan).exists())
 
     def test_a_group_that_already_has_one_is_left_alone(self):

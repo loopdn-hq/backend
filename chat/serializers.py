@@ -207,10 +207,14 @@ class GroupNumberSerializer(serializers.Serializer):
     """The group's own phone number, as a client needs to see it.
 
     A bare string was enough while the only question was "what do I dial". It
-    cannot answer "can I dial it yet": with no provider configured, ordering
-    mints a well-formed placeholder that belongs to nobody, and a client that
-    renders it tells the user to text a dead line. An empty `provider` is
-    exactly that case, so it is the one field here that is not decoration.
+    cannot answer "can I dial it yet": a group whose provisioning has not
+    succeeded has no number at all, so the whole object is null and a client
+    has to handle that rather than render an empty string. `provider` names who
+    the lease is with, which is what tells a support conversation where to go
+    looking; it is the one field here that is not decoration.
+
+    Nothing ever fabricates a stand-in number, so a number present in this
+    payload is always a real one somebody can text.
 
     A plain Serializer, not a ModelSerializer, so this module stays free of any
     import of `sms` - `sms.models` imports `chat.models`, and chat's side of
