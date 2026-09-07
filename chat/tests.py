@@ -4,6 +4,8 @@ import tempfile
 from unittest import mock
 
 from channels.db import database_sync_to_async
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from channels.testing import WebsocketCommunicator
 from django.contrib.auth.models import User
 from django.core.cache import cache
@@ -767,6 +769,34 @@ class ChatWebsocketTests(TransactionTestCase):
         communicator = self.connect_as(self.alice)
         connected, _ = await communicator.connect()
         self.assertTrue(connected)
+
+    async def test_a_refused_send_does_not_drop_the_socket(self):
+        # A member posting into a broadcast group used to raise
+        # PostingNotAllowed out of the consumer, past Channels (which catches
+        # only StopConsumer), and Daphne tore the connection down. The user saw
+        # a dropped socket instead of "only admins can post", reconnected, and
+        # lost everything broadcast in the gap. Any handler bug did the same.
+        group = await database_sync_to_async(Conversation.start_group)(
+            self.alice, name='Announcements'
+        )
+        await database_sync_to_async(group.add_participant)(self.bob)
+        group.mode = Conversation.Mode.BROADCAST
+        await database_sync_to_async(group.save)(update_fields=['mode'])
+
+        communicator = self.connect_as(self.bob)
+        await communicator.connect()
+
+        await communicator.send_json_to(
+            {'type': 'message.send', 'conversation_id': group.pk, 'text': 'hi'}
+        )
+
+        reply = await communicator.receive_json_from()
+        self.assertEqual(reply['type'], 'error')
+        # Still up, and still usable - not merely "not crashed".
+        await communicator.send_json_to({'type': 'nonsense'})
+        follow_up = await communicator.receive_json_from()
+        self.assertEqual(follow_up['type'], 'error')
+        await communicator.disconnect()
 
     async def test_a_socket_from_an_unlisted_origin_is_refused(self):
         # The whole point of the origin validator, and nothing else asserts it:
@@ -1824,6 +1854,199 @@ class RolesAndJoinSettingsTests(EnvelopeAssertions, APITestCase):
         # Nor inside the settings object, which is where the rest of them live.
         self.assertNotIn('join_code', data['settings'])
         self.assertIn('join_mode', data['settings'])
+
+
+class ConversationAdminFieldsTests(EnvelopeAssertions, APITestCase):
+    """Who started this group, who runs it, and whether you do."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+
+    def detail(self, user):
+        self.client.force_authenticate(user)
+        return self.assertSuccess(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
+        )
+
+    def test_created_by_is_a_person_not_an_id(self):
+        data = self.detail(self.alice)
+
+        self.assertEqual(
+            data['created_by'], {'username': 'alice', 'avatar': None}
+        )
+
+    def test_the_creator_is_an_admin(self):
+        self.assertTrue(self.detail(self.alice)['is_admin'])
+
+    def test_an_ordinary_member_is_not(self):
+        self.assertFalse(self.detail(self.bob)['is_admin'])
+
+    def test_a_promoted_member_is(self):
+        # The other half of the rule: not the creator, so it has to come from
+        # the membership row.
+        membership.set_role(
+            Participant.objects.get(conversation=self.group, user=self.bob),
+            Participant.Role.ADMIN,
+            by=self.alice,
+        )
+
+        self.assertTrue(self.detail(self.bob)['is_admin'])
+
+    def test_admin_details_names_the_admin_to_a_member(self):
+        # Bob does not administer the group, so this tells him who does.
+        self.assertEqual(
+            self.detail(self.bob)['admin_details'],
+            {'username': 'alice', 'avatar': None},
+        )
+
+    def test_admin_details_prefers_the_creator_over_a_later_admin(self):
+        # Two admins, one object to return: the answer must be stable rather
+        # than whichever row the database hands back first.
+        membership.set_role(
+            Participant.objects.get(conversation=self.group, user=self.bob),
+            Participant.Role.ADMIN,
+            by=self.alice,
+        )
+        carol = make_user('carol')
+        self.group.add_participant(carol)
+
+        self.assertEqual(
+            self.detail(carol)['admin_details']['username'], 'alice'
+        )
+
+    def test_a_direct_conversation_has_no_admin(self):
+        # Nobody administers a one-to-one, so claiming somebody does would put
+        # admin controls on a screen that has none.
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        self.client.force_authenticate(self.alice)
+
+        data = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-detail', args=[conversation.id])
+            )
+        )
+
+        self.assertFalse(data['is_admin'])
+        self.assertIsNone(data['admin_details'])
+        self.assertEqual(data['created_by']['username'], 'alice')
+
+    def test_the_new_fields_do_not_cost_a_query_per_conversation(self):
+        # created_by and its avatar are on every row of the list. Without the
+        # select_related this is two extra queries per conversation, which only
+        # shows up once somebody has a lot of them.
+        for i in range(6):
+            Conversation.start_group(self.alice, name=f'Group {i}')
+        self.client.force_authenticate(self.alice)
+        url = reverse('chat:conversation-list')
+
+        with CaptureQueriesContext(connection) as first:
+            self.client.get(url)
+
+        for i in range(6, 12):
+            Conversation.start_group(self.alice, name=f'Group {i}')
+        with CaptureQueriesContext(connection) as second:
+            self.client.get(url)
+
+        self.assertEqual(len(second), len(first))
+
+
+class SeamlessReconnectTests(EnvelopeAssertions, APITestCase):
+    """What a client needs for a dropped socket to be invisible.
+
+    A socket always drops eventually - a sleeping laptop, a mobile handoff, a
+    deploy cycling tasks. These are the three things that decide whether that
+    costs the user anything.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.alice)
+
+    def messages_url(self):
+        return reverse('chat:conversation-messages', args=[self.group.id])
+
+    # --- resuming -----------------------------------------------------------
+
+    def test_a_client_can_fetch_exactly_what_it_missed(self):
+        seen = create_message(self.group, self.bob, text='before you left')
+        missed = [
+            create_message(self.group, self.bob, text=f'missed {i}')
+            for i in range(3)
+        ]
+
+        data = self.assertSuccess(
+            self.client.get(self.messages_url(), {'after_id': seen.pk})
+        )
+
+        self.assertEqual(
+            [row['id'] for row in data['results']], [m.pk for m in missed]
+        )
+
+    def test_resuming_from_the_newest_message_returns_nothing(self):
+        newest = create_message(self.group, self.bob, text='up to date')
+
+        data = self.assertSuccess(
+            self.client.get(self.messages_url(), {'after_id': newest.pk})
+        )
+
+        self.assertEqual(data['results'], [])
+
+    def test_a_junk_cursor_is_refused_rather_than_ignored(self):
+        # Silently ignoring it would hand back the whole history as though the
+        # client were resuming from nothing, and it would never know.
+        self.assertFailure(
+            self.client.get(self.messages_url(), {'after_id': 'yesterday'})
+        )
+
+    # --- retrying -----------------------------------------------------------
+
+    def test_a_retried_send_does_not_post_twice(self):
+        first = create_message(
+            self.group, self.alice, text='did that land?', client_id='abc-123'
+        )
+        again = create_message(
+            self.group, self.alice, text='did that land?', client_id='abc-123'
+        )
+
+        self.assertEqual(first.pk, again.pk)
+        self.assertEqual(Message.objects.filter(conversation=self.group).count(), 1)
+
+    def test_two_different_keys_are_two_messages(self):
+        create_message(self.group, self.alice, text='one', client_id='a')
+        create_message(self.group, self.alice, text='two', client_id='b')
+
+        self.assertEqual(Message.objects.filter(conversation=self.group).count(), 2)
+
+    def test_an_unkeyed_send_is_never_deduplicated(self):
+        # Inbound SMS and older clients send no key. Two identical texts are two
+        # messages, and collapsing them would silently drop somebody's message.
+        create_message(self.group, self.alice, text='same')
+        create_message(self.group, self.alice, text='same')
+
+        self.assertEqual(Message.objects.filter(conversation=self.group).count(), 2)
+
+    def test_the_same_key_in_another_group_is_a_different_message(self):
+        # The key is the SENDER's, scoped to a conversation. A client numbering
+        # its sends per-thread must not have one group swallow another's.
+        other = Conversation.start_group(self.alice, name='Work')
+
+        here = create_message(self.group, self.alice, text='hi', client_id='1')
+        there = create_message(other, self.alice, text='hi', client_id='1')
+
+        self.assertNotEqual(here.pk, there.pk)
+
+    def test_the_key_comes_back_so_a_client_can_match_its_own_message(self):
+        create_message(self.group, self.alice, text='hello', client_id='xyz')
+
+        data = self.assertSuccess(self.client.get(self.messages_url()))
+
+        self.assertEqual(data['results'][0]['client_id'], 'xyz')
 
 
 class BroadcastModeTests(EnvelopeAssertions, APITestCase):

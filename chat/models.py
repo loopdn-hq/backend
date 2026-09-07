@@ -763,6 +763,19 @@ class Message(models.Model):
     # rejects a message that has neither.
     text = models.TextField(blank=True)
 
+    # The sender's own id for this message, so a retry cannot post it twice.
+    #
+    # A websocket send is not acknowledged, so a client whose socket drops mid
+    # send cannot know whether the message landed. Retrying used to create a
+    # SECOND row with a different id - which client-side dedupe cannot collapse,
+    # and which schedules a second billed SMS fan-out to every member's phone.
+    #
+    # Empty for anything the client did not key: inbound SMS, and older
+    # clients. The constraint below is partial for exactly that reason.
+    client_id = models.CharField(
+        max_length=64, blank=True, default='', db_default=''
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -772,6 +785,17 @@ class Message(models.Model):
             # The one query that matters: a page of a conversation's history,
             # newest first.
             models.Index(fields=['conversation', '-created_at']),
+        ]
+        constraints = [
+            # The database is what actually makes a retry safe. Two sends
+            # racing on the same key would both pass a SELECT-then-INSERT
+            # check; only a unique index refuses the second, and
+            # `create_message` turns that refusal back into the first message.
+            models.UniqueConstraint(
+                fields=['conversation', 'client_id'],
+                condition=~models.Q(client_id=''),
+                name='unique_conversation_client_message',
+            ),
         ]
 
     def __str__(self):

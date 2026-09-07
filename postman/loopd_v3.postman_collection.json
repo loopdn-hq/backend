@@ -849,7 +849,7 @@
                 ""
               ]
             },
-            "description": "One conversation: its settings, its latest message and its `sms_number`.\n\n**No `participants`.** The member list is unbounded and every row nests a user and a profile, so a group of two hundred would put two hundred profiles in every fetch - and once per conversation on the list endpoint. Use *List members* instead.\n\n`sms_number` is read-only everywhere and for everybody. It is saved in members' phones as the group's name, so a number that could be reassigned would deliver a stranger's messages.\n\nFields: `number`, `country`, `status`, `provider`. An empty `provider` marks a placeholder that cannot actually receive text."
+            "description": "One conversation: its settings, its latest message, its `sms_number`, and who runs it.\n\n| Field | |\n| --- | --- |\n| `created_by` | who started it, as `{username, avatar}` |\n| `is_admin` | whether **you** administer it - the creator counts automatically, anyone else needs the admin role |\n| `admin_details` | who administers it, as `{username, avatar}`. A group can have several admins and this is one object, so it prefers the creator, then the earliest to join |\n\n`is_admin` and `admin_details` are group concepts: a one-to-one gets `false` and `null`.\n\n**No `participants`.** The member list is unbounded and every row nests a user and a profile, so a group of two hundred would put two hundred profiles in every fetch - and once per conversation on the list endpoint. Use *List members* instead.\n\n`sms_number` is read-only everywhere and for everybody. It is saved in members' phones as the group's name, so a number that could be reassigned would deliver a stranger's messages.\n\nFields: `number`, `country`, `status`, `provider`. An empty `provider` marks a placeholder that cannot actually receive text."
           }
         },
         {
@@ -1475,7 +1475,7 @@
                 ""
               ]
             },
-            "description": "Newest first, paginated.\n\nEach message carries a `source`: `app`, `sms` or `system`. There is **one message per message** however it arrived - a text sent from a handset and one typed in the app are the same row.\n\nA message sent by somebody with no account has `sender.id` and `sender.username` null, and their name in `sender.profile.display_label`. Render that field and both kinds work without branching."
+            "description": "Newest first, paginated.\n\n**`?after_id=<id>` resumes.** Returns only messages newer than that id, **oldest first**, so a client that reconnects can fetch exactly what it missed and append it in order. Without it a client can only re-page the newest-first history and diff, which is unbounded and gets worse the longer it was disconnected.\n\nKeyed on `id` rather than `created_at` deliberately: created_at is app-server wall clock, so two tasks can stamp messages out of order, and it has no tiebreak. Ids come from one sequence.\n\nEach message carries a `source`: `app`, `sms` or `system`. There is **one message per message** however it arrived - a text sent from a handset and one typed in the app are the same row.\n\nA message sent by somebody with no account has `sender.id` and `sender.username` null, and their name in `sender.profile.display_label`. Render that field and both kinds work without branching."
           }
         },
         {
@@ -1503,10 +1503,10 @@
                 ""
               ]
             },
-            "description": "Post to the conversation. Text, attachments, or both - but not neither.\n\nThe message goes to app members over the websocket immediately, and is **fanned out by SMS** to every member who should receive it - excluding you. Who that is depends on their delivery settings, their consent, and whether their number is verified; every decision not to send is recorded with a reason.\n\nIn a `broadcast` group a non-admin gets `403`.",
+            "description": "**`client_id` makes a retry safe.** It is your own id for this message. A send that times out - or a websocket that drops mid-send - leaves you unable to tell whether it landed; retrying with the SAME `client_id` returns the message already stored instead of posting a second one. Without it, a retry creates a second row with a different id that no client-side dedupe can collapse, and schedules a **second billed SMS fan-out to every member's phone**.\n\nOptional, scoped per conversation, and echoed back on the message so you can match it to the entry you rendered optimistically. `{{$guid}}` is a Postman variable that generates a fresh one per send.\n\nPost to the conversation. Text, attachments, or both - but not neither.\n\nThe message goes to app members over the websocket immediately, and is **fanned out by SMS** to every member who should receive it - excluding you. Who that is depends on their delivery settings, their consent, and whether their number is verified; every decision not to send is recorded with a reason.\n\nIn a `broadcast` group a non-admin gets `403`.",
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"text\": \"Dinner at 7\"\n}",
+              "raw": "{\n  \"text\": \"Dinner at 7\",\n  \"client_id\": \"{{$guid}}\"\n}",
               "options": {
                 "raw": {
                   "language": "json"

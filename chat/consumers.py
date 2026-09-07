@@ -14,10 +14,17 @@ events that are about the user rather than a conversation.
 Attachments are not sent over the socket - binary uploads belong on the REST
 endpoint, which broadcasts the finished message here anyway.
 """
+import logging
+
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
 
-from chat.models import Conversation, Participant
+from chat.models import (
+    BlockedFromConversation,
+    Conversation,
+    Participant,
+    PostingNotAllowed,
+)
 from chat.services import (
     conversation_group,
     create_message,
@@ -26,6 +33,8 @@ from chat.services import (
 )
 
 # Close codes. 4401/4403 mirror HTTP 401/403 in the private 4000+ range.
+logger = logging.getLogger(__name__)
+
 CLOSE_UNAUTHENTICATED = 4401
 
 
@@ -41,11 +50,17 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         self.user = user
         self.subscribed = set()
 
-        await self.accept()
-
+        # Subscribe BEFORE accepting. `accept()` is what fires `open` on the
+        # client, and a client that hears `open` starts sending and expects to
+        # receive - so accepting first left a window where a message broadcast
+        # to this conversation reached nobody on this socket. Nothing can be
+        # delivered during the window either: Channels dispatches one event at
+        # a time, so no group message is handled until connect() returns.
         await self.subscribe(user_group(user.pk))
         for conversation_id in await self.conversation_ids():
             await self.subscribe(conversation_group(conversation_id))
+
+        await self.accept()
 
     async def disconnect(self, code):
         for group in list(getattr(self, 'subscribed', ())):
@@ -66,7 +81,29 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         if handler is None:
             await self.send_json({'type': 'error', 'detail': 'Unknown message type.'})
             return
-        await handler(content)
+
+        # An exception raised in here escapes the ASGI application and Daphne
+        # tears the socket down - Channels' consumer catches only StopConsumer.
+        # So a member posting into a broadcast group did not get told "only
+        # admins can post": their connection dropped, they reconnected, and
+        # everything broadcast in the gap was lost. Any handler bug had the
+        # same effect.
+        try:
+            await handler(content)
+        except (PostingNotAllowed, BlockedFromConversation) as refusal:
+            # An ordinary, expected refusal. The client is told, and the socket
+            # stays up.
+            await self.send_json({'type': 'error', 'detail': str(refusal)})
+        except Exception:
+            # A bug. Logged with its traceback because nothing else will report
+            # it - but still not a reason to disconnect somebody mid-conversation.
+            logger.exception(
+                'Websocket handler %r failed for user %s',
+                content.get('type'), getattr(self.user, 'pk', None),
+            )
+            await self.send_json(
+                {'type': 'error', 'detail': 'Something went wrong. Try again.'}
+            )
 
     async def handle_message_send(self, content):
         conversation = await self.get_conversation(content.get('conversation_id'))
@@ -81,9 +118,16 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
             await self.send_json({'type': 'error', 'detail': 'Message text is required.'})
             return
 
+        # `client_id` is the sender's own id for this message. A websocket send
+        # is not acknowledged, so a client whose socket drops mid-send cannot
+        # know whether it landed; keying the send is what makes its retry safe
+        # rather than a second row and a second billed SMS fan-out. Optional,
+        # so a client that does not send one behaves exactly as before.
+        client_id = str(content.get('client_id') or '')[:64]
+
         # create_message broadcasts to the conversation group, which this
         # socket is part of - so the sender's own echo arrives that way too.
-        await self.store_message(conversation, text)
+        await self.store_message(conversation, text, client_id=client_id)
 
     async def handle_typing(self, content):
         conversation = await self.get_conversation(content.get('conversation_id'))
@@ -172,5 +216,9 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         ).first()
 
     @database_sync_to_async
-    def store_message(self, conversation, text):
-        return serialize_message(create_message(conversation, self.user, text=text))
+    def store_message(self, conversation, text, client_id=''):
+        return serialize_message(
+            create_message(
+                conversation, self.user, text=text, client_id=client_id
+            )
+        )

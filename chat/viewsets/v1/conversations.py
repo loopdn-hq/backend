@@ -144,7 +144,10 @@ class ConversationViewSet(
             # A reverse one-to-one, so it joins rather than costing a query per
             # conversation - which it did, every time the list serialised the
             # group's number.
-            .select_related('sms_number')
+            # `created_by` is serialized on every row, and its avatar lives on
+            # the profile - without both joins that is two queries per
+            # conversation on the list.
+            .select_related('sms_number', 'created_by__profile')
             .prefetch_related(
                 Prefetch(
                     'participants',
@@ -589,6 +592,15 @@ class ConversationViewSet(
         if request.method == 'POST':
             return self._send_message(request, conversation)
 
+        # A resume cursor. Without one, a client that reconnects cannot ask
+        # "what did I miss" - it can only re-page the newest-first history and
+        # diff, which is unbounded and gets worse the longer it was away.
+        #
+        # Keyed on `id`, not `created_at`: created_at is app-server wall clock,
+        # so two tasks can stamp messages out of order, and it has no tiebreak.
+        # Ids come from one sequence and are a sound total order.
+        after_id = request.query_params.get('after_id')
+
         history = (
             conversation.messages.select_related(
                 'sender__profile',
@@ -599,6 +611,17 @@ class ConversationViewSet(
             )
             .prefetch_related('attachments')
         )
+
+        if after_id is not None:
+            try:
+                cursor = int(after_id)
+            except (TypeError, ValueError):
+                raise ValidationError('after_id must be a whole number.')
+            # ASCENDING here, unlike the default history. A client catching up
+            # appends in the order things happened; handing it newest-first
+            # would make it reverse every page before rendering.
+            history = history.filter(pk__gt=cursor).order_by('pk')
+
         page = self.paginate_queryset(history)
         serializer = MessageSerializer(
             page if page is not None else history,
