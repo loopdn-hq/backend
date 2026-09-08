@@ -25,10 +25,12 @@ from django.utils import timezone
 from chat.models import (
     BlockedFromConversation,
     Conversation,
+    Notification,
     Participant,
     local_part,
     mask_number,
 )
+from chat.notifications import notify
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +99,18 @@ def request_to_join(conversation, *, user=None, phone_number=None,
         """Tell the admins, once the row is really committed."""
         if row.status != Participant.Status.PENDING:
             return
+        from chat.notifications import notify_many
         from chat.services import broadcast_join_request
 
+        # The socket frame tells admins who are looking right now; the
+        # notification is what an admin who was not finds waiting for them.
+        notify_many(
+            admin_users(conversation),
+            Notification.Type.JOIN_REQUESTED,
+            from_user=row.user,
+            conversation=conversation,
+            data={'display_name': row.display_name} if row.user_id is None else None,
+        )
         transaction.on_commit(lambda: broadcast_join_request(conversation, row))
 
     if existing is not None:
@@ -185,6 +197,12 @@ def approve(participant, by):
     participant.status = Participant.Status.ACTIVE
     participant.save(update_fields=['status'])
     _announce_membership(participant)
+    notify(
+        participant.user,
+        Notification.Type.JOIN_APPROVED,
+        from_user=by,
+        conversation=participant.conversation,
+    )
     _tell_them(
         participant,
         f'You are in {participant.conversation.name}. '
@@ -207,6 +225,12 @@ def decline(participant, by):
     participant.status = Participant.Status.REMOVED
     participant.save(update_fields=['status'])
     _revoke_socket(participant)
+    notify(
+        participant.user,
+        Notification.Type.JOIN_DECLINED,
+        from_user=by,
+        conversation=participant.conversation,
+    )
     _tell_them(
         participant,
         f'Your request to join {participant.conversation.name} was not accepted.',
@@ -279,6 +303,13 @@ def remove(participant, by, *, block=False):
     )
     participant.save(update_fields=['status'])
     _revoke_socket(participant)
+    notify(
+        participant.user,
+        Notification.Type.MEMBER_REMOVED,
+        from_user=by,
+        conversation=participant.conversation,
+        data={'blocked': True} if block else None,
+    )
     return participant
 
 
@@ -322,6 +353,14 @@ def set_role(participant, role, by):
 
     participant.role = role
     participant.save(update_fields=['role'])
+    notify(
+        participant.user,
+        Notification.Type.ROLE_GRANTED
+        if role == Participant.Role.ADMIN
+        else Notification.Type.ROLE_REVOKED,
+        from_user=by,
+        conversation=conversation,
+    )
     return participant
 
 
@@ -345,6 +384,81 @@ def set_delivery(participant, *, muted=None, sms_enabled=None):
     if fields:
         participant.save(update_fields=fields)
     return participant
+
+
+def clear_history(participant):
+    """Empty one member's view of a conversation, without them leaving it.
+
+    They stay a member and everyone else's copy is untouched: this moves their
+    own start-of-history to the newest message, so the thread reads as empty
+    for them and the conversation drops out of their list.
+
+    It comes back on its own when somebody posts, showing only what arrived
+    after - which is why this is a pointer and not a delete. Nothing is
+    destroyed, and the member has not been quietly removed from a group whose
+    other members still think they are in it.
+
+    The read pointer moves with it. Otherwise the cleared messages would still
+    be counted as unread, and the conversation would come back carrying a badge
+    for messages the member can no longer see.
+    """
+    if participant.status != Participant.Status.ACTIVE:
+        raise NotAMember('You are not a member of that conversation.')
+
+    newest = participant.conversation.messages.order_by('-pk').first()
+    if newest is None:
+        return participant
+
+    fields = []
+    if participant.cleared_before_message_id != newest.pk:
+        participant.cleared_before_message = newest
+        fields.append('cleared_before_message')
+    if (participant.last_read_message_id or 0) < newest.pk:
+        participant.last_read_message = newest
+        fields.append('last_read_message')
+
+    if fields:
+        participant.save(update_fields=fields)
+    return participant
+
+
+def set_archived(participant, archived):
+    """Tidy this conversation out of one member's list, or put it back.
+
+    Not a departure and not a mute: they stay a member, the texts keep coming,
+    and everyone else's list is untouched. It decides which of the member's own
+    lists the conversation appears in and nothing else.
+    """
+    if participant.status != Participant.Status.ACTIVE:
+        raise NotAMember('You are not a member of that conversation.')
+
+    stamp = timezone.now() if archived else None
+    if (participant.archived_at is None) == (stamp is None):
+        return participant
+
+    participant.archived_at = stamp
+    participant.save(update_fields=['archived_at'])
+    return participant
+
+
+def unarchive_for_new_message(conversation):
+    """Bring a conversation back into the lists it was tidied out of.
+
+    Archive means "not now", not "never again" - so something happening puts it
+    back, the same way an email thread returns to the inbox on a reply. A
+    muted member is the exception and is left alone: they have said they do not
+    want to hear about this group, and pulling it back to the top of their list
+    every time somebody posts is precisely hearing about it.
+
+    Returns the number of members it surfaced for, which is zero in the common
+    case where nobody had archived it.
+    """
+    return Participant.objects.filter(
+        conversation=conversation,
+        status=Participant.Status.ACTIVE,
+        archived_at__isnull=False,
+        muted=False,
+    ).update(archived_at=None)
 
 
 def set_last_read(participant, message):
@@ -489,6 +603,21 @@ def resolve(conversation, *, user=None, phone_number=None):
         if status in by_status:
             return by_status[status]
     return rows[0]
+
+
+def admin_users(conversation):
+    """The accounts that administer a group.
+
+    Phone-only rows cannot be admins and have no account to notify, so the
+    join on `user` is what filters them out rather than a separate check.
+    """
+    from django.contrib.auth import get_user_model
+
+    return get_user_model().objects.filter(
+        conversation_memberships__conversation=conversation,
+        conversation_memberships__role=Participant.Role.ADMIN,
+        conversation_memberships__status=Participant.Status.ACTIVE,
+    ).distinct()
 
 
 def _find_row(conversation, *, user=None, phone_number=None):

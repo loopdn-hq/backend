@@ -24,6 +24,8 @@
     GET  /api/v1/chat/conversations/<id>/messages/ history, newest first
     POST /api/v1/chat/conversations/<id>/messages/ send text and/or files
     POST /api/v1/chat/conversations/<id>/read/     mark it read up to a message
+    POST /api/v1/chat/conversations/<id>/archive/  tidy it out of my list
+    POST /api/v1/chat/conversations/<id>/clear/    empty MY view of it
 
 Access control is the queryset, not a check bolted on afterwards: every
 lookup starts from the conversations the caller participates in, so a
@@ -31,7 +33,7 @@ non-member gets a 404 from every route here and cannot even learn that a
 conversation exists.
 """
 from django.db.models import Count, IntegerField, OuterRef, Prefetch, Subquery, Value
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, Greatest
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
@@ -46,6 +48,7 @@ from chat.models import Conversation, Message, Participant
 from chat.serializers import (
     ADMIN_ONLY_SETTINGS,
     AddMembersSerializer,
+    ArchiveSerializer,
     ConversationSerializer,
     ConversationSearchSerializer,
     DirectConversationSerializer,
@@ -101,6 +104,7 @@ class ConversationViewSet(
         'remove': RemoveMemberSerializer,
         'delivery': DeliveryPreferenceSerializer,
         'read': MarkReadSerializer,
+        'archive': ArchiveSerializer,
         'role': ParticipantRoleSerializer,
         'rename': RenameMemberSerializer,
         'invite': InviteByPhoneSerializer,
@@ -125,6 +129,8 @@ class ConversationViewSet(
         'remove': 'Member removed.',
         'delivery': 'Delivery settings saved.',
         'read': 'Marked as read.',
+        'archive': 'Conversation updated.',
+        'clear': 'Conversation cleared.',
         'role': 'Role updated.',
         'rename': 'Member renamed.',
         'invite': 'Invitation sent.',
@@ -151,9 +157,17 @@ class ConversationViewSet(
         """
         user = self.request.user
 
+        # clear_history moves the read pointer with the cutoff, so the read
+        # pointer alone is enough here - but taking the greater of the two is
+        # what keeps that true if either is ever moved on its own.
         read_pointer = Participant.objects.filter(
             conversation=OuterRef(OuterRef('pk')), user=user
-        ).values('last_read_message_id')[:1]
+        ).annotate(
+            floor=Greatest(
+                Coalesce('last_read_message_id', Value(0)),
+                Coalesce('cleared_before_message_id', Value(0)),
+            )
+        ).values('floor')[:1]
 
         return (
             Message.objects.filter(conversation=OuterRef('pk'))
@@ -501,6 +515,46 @@ class ConversationViewSet(
         return Response(ParticipantSerializer(participant).data)
 
     @action(detail=True, methods=['post'])
+    def clear(self, request, pk=None):
+        """Empty my view of this conversation, without leaving it.
+
+        Mine alone. The member stays in the group, everybody else's copy is
+        untouched, and nothing is destroyed - their own history simply starts
+        after the newest message. The conversation leaves their list because
+        there is nothing left to show, and returns by itself when somebody
+        posts, carrying only what arrived after.
+        """
+        conversation = self.get_object()
+        participant = Participant.objects.get(
+            conversation=conversation, user=request.user
+        )
+        membership.clear_history(participant)
+
+        conversation = self.get_queryset().get(pk=conversation.pk)
+        return Response(self._as_conversation(conversation))
+
+    @action(detail=True, methods=['post'])
+    def archive(self, request, pk=None):
+        """Move this conversation out of my list, or back into it.
+
+        Mine alone, like `delivery` and `read`, so it takes no participant id.
+        It is not leaving and it is not muting: the member stays in the group
+        and every channel keeps delivering, including SMS. Only which of their
+        own lists it appears in changes.
+        """
+        conversation = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        participant = Participant.objects.get(
+            conversation=conversation, user=request.user
+        )
+        membership.set_archived(participant, serializer.validated_data['archived'])
+
+        conversation = self.get_queryset().get(pk=conversation.pk)
+        return Response(self._as_conversation(conversation))
+
+    @action(detail=True, methods=['post'])
     def read(self, request, pk=None):
         """Mark this conversation read, up to a message.
 
@@ -681,6 +735,13 @@ class ConversationViewSet(
         # Ids come from one sequence and are a sound total order.
         after_id = request.query_params.get('after_id')
 
+        # Everything before this member cleared their view is gone for them,
+        # and must not come back through paging or the resume cursor.
+        own = Participant.objects.filter(
+            conversation=conversation, user=request.user
+        ).first()
+        cleared_before = own.cleared_before_message_id if own else None
+
         history = (
             conversation.messages.select_related(
                 'sender__profile',
@@ -691,6 +752,9 @@ class ConversationViewSet(
             )
             .prefetch_related('attachments')
         )
+
+        if cleared_before is not None:
+            history = history.filter(pk__gt=cleared_before)
 
         if after_id is not None:
             try:

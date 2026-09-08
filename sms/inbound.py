@@ -259,6 +259,21 @@ def _opt_out(participant, phone_number):
             profile.sms_opt_out_at = timezone.now()
             profile.save(update_fields=['sms_enabled', 'sms_opt_out_at', 'updated_at'])
 
+        # The admins would otherwise never learn this. From their side the
+        # member simply goes quiet, and every message they send from now on
+        # silently misses one person.
+        from chat.membership import admin_users
+        from chat.models import Notification
+        from chat.notifications import notify_many
+
+        notify_many(
+            admin_users(participant.conversation),
+            Notification.Type.SMS_OPTED_OUT,
+            from_user=participant.user,
+            conversation=participant.conversation,
+            data={'display_name': participant.display_name},
+        )
+
     # No reply: the carrier and the messaging profile send the mandated
     # confirmation themselves, and a second one is a double-ack and a charge.
     return InboundResult(action='opted_out', participant=participant)
