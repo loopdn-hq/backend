@@ -23,13 +23,15 @@
     POST /api/v1/chat/conversations/<id>/join-code/ admin issues a new one
     GET  /api/v1/chat/conversations/<id>/messages/ history, newest first
     POST /api/v1/chat/conversations/<id>/messages/ send text and/or files
+    POST /api/v1/chat/conversations/<id>/read/     mark it read up to a message
 
 Access control is the queryset, not a check bolted on afterwards: every
 lookup starts from the conversations the caller participates in, so a
 non-member gets a 404 from every route here and cannot even learn that a
 conversation exists.
 """
-from django.db.models import Prefetch
+from django.db.models import Count, IntegerField, OuterRef, Prefetch, Subquery, Value
+from django.db.models.functions import Coalesce
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
@@ -52,6 +54,7 @@ from chat.serializers import (
     InviteByPhoneSerializer,
     JoinGroupSerializer,
     JoinRequestDecisionSerializer,
+    MarkReadSerializer,
     MessageCreateSerializer,
     MessageSerializer,
     DeliveryPreferenceSerializer,
@@ -97,6 +100,7 @@ class ConversationViewSet(
         'requests': JoinRequestDecisionSerializer,
         'remove': RemoveMemberSerializer,
         'delivery': DeliveryPreferenceSerializer,
+        'read': MarkReadSerializer,
         'role': ParticipantRoleSerializer,
         'rename': RenameMemberSerializer,
         'invite': InviteByPhoneSerializer,
@@ -120,6 +124,7 @@ class ConversationViewSet(
         'requests:POST': 'Request handled.',
         'remove': 'Member removed.',
         'delivery': 'Delivery settings saved.',
+        'read': 'Marked as read.',
         'role': 'Role updated.',
         'rename': 'Member renamed.',
         'invite': 'Invitation sent.',
@@ -130,6 +135,35 @@ class ConversationViewSet(
 
     def get_serializer_class(self):
         return self.serializer_classes.get(self.action, self.serializer_class)
+
+    def unread_count_subquery(self):
+        """How many messages the caller has not read, per conversation.
+
+        Correlated so it costs one subquery in the SELECT rather than a query
+        per row. Two levels of OuterRef because it is a subquery inside a
+        subquery: the inner one reaches past the Message query it sits in, back
+        out to the Conversation being counted.
+
+        `exclude(sender=...)` is what stops your own messages counting against
+        you. Coalesce covers a member who has read nothing - a NULL pointer
+        would make every comparison NULL and report zero unread, which is the
+        exact opposite of the truth.
+        """
+        user = self.request.user
+
+        read_pointer = Participant.objects.filter(
+            conversation=OuterRef(OuterRef('pk')), user=user
+        ).values('last_read_message_id')[:1]
+
+        return (
+            Message.objects.filter(conversation=OuterRef('pk'))
+            .exclude(sender=user)
+            .filter(pk__gt=Coalesce(Subquery(read_pointer), Value(0)))
+            .order_by()
+            .values('conversation')
+            .annotate(total=Count('pk'))
+            .values('total')
+        )
 
     def get_queryset(self):
         return (
@@ -168,6 +202,15 @@ class ConversationViewSet(
                     .order_by('-created_at')[:1],
                     to_attr='latest_messages',
                 ),
+            )
+            .annotate(
+                unread_count=Coalesce(
+                    Subquery(
+                        self.unread_count_subquery(),
+                        output_field=IntegerField(),
+                    ),
+                    Value(0),
+                )
             )
         )
 
@@ -456,6 +499,43 @@ class ConversationViewSet(
         )
         membership.set_delivery(participant, **serializer.validated_data)
         return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['post'])
+    def read(self, request, pk=None):
+        """Mark this conversation read, up to a message.
+
+        Mine alone, like `delivery`, so it takes no participant id: reading is
+        the caller's own state and no admin sets it for anybody else.
+
+        Omitting `message_id` means "everything", which is what a client that
+        has just opened the thread means. Naming a message is for the client
+        that is looking at a specific point in the history.
+
+        Answers with the conversation so the caller gets the recalculated
+        unread_count back rather than having to assume it is now zero - it may
+        not be, if something arrived between the read and this request.
+        """
+        conversation = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        message_id = serializer.validated_data.get('message_id')
+        if message_id is None:
+            message = conversation.messages.order_by('-pk').first()
+        else:
+            message = conversation.messages.filter(pk=message_id).first()
+            if message is None:
+                raise NotFound('No such message in this conversation.')
+
+        if message is not None:
+            participant = Participant.objects.get(
+                conversation=conversation, user=request.user
+            )
+            membership.set_last_read(participant, message)
+
+        # Re-read through get_queryset so the response carries the annotation.
+        conversation = self.get_queryset().get(pk=conversation.pk)
+        return Response(self._as_conversation(conversation))
 
     @action(detail=True, methods=['post'])
     def role(self, request, pk=None):

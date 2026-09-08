@@ -661,6 +661,29 @@ class Participant(models.Model):
     # and the template will have changed by the time anybody asks.
     consent_text = models.TextField(blank=True, default='', db_default='')
 
+    # How far this member has read, as the last message they have seen.
+    #
+    # A message id rather than a timestamp, for the reason the history cursor
+    # gives: created_at is app-server wall clock, so two tasks can stamp
+    # messages out of order and it has no tiebreak. Ids come from one sequence
+    # and are a sound total order, so "newer than this" is exact.
+    #
+    # NULL means nothing has been read - every message in the group counts as
+    # unread. That is also the permanent state of a phone-only member: SMS can
+    # tell you a handset accepted a text and never that a person read it, so
+    # there is nothing here to move and no client asking for their badge.
+    #
+    # related_name='+' on purpose. The reverse of this - "everybody who has
+    # read up to this message" - is the expensive query behind read receipts,
+    # and it should not be reachable by accident.
+    last_read_message = models.ForeignKey(
+        'chat.Message',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='+',
+    )
+
     joined_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

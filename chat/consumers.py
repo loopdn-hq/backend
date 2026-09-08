@@ -7,6 +7,8 @@ events that are about the user rather than a conversation.
     <- {"type": "message.new", "message": {...}}
     <- {"type": "conversation.added", "conversation": {...}}
     <- {"type": "typing", "conversation_id": 1, "user_id": 2}
+    <- {"type": "conversation.read", "conversation_id": 1,
+        "last_read_message_id": 42}   (this account, on another device)
 
     -> {"type": "message.send", "conversation_id": 1, "text": "hi"}
     -> {"type": "typing", "conversation_id": 1}
@@ -192,6 +194,21 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
                 'type': 'conversation.updated',
                 'conversation_id': event['conversation_id'],
                 'conversation': event['conversation'],
+            }
+        )
+
+    async def conversation_read(self, event):
+        """This account read a conversation somewhere else.
+
+        Arrives on the user's own group, so every device this person has open
+        hears it and can clear the badge together. Nobody else's socket is in
+        that group, so nothing here is visible to the rest of the conversation.
+        """
+        await self.send_json(
+            {
+                'type': 'conversation.read',
+                'conversation_id': event['conversation_id'],
+                'last_read_message_id': event['last_read_message_id'],
             }
         )
 
