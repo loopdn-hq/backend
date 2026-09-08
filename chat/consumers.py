@@ -6,6 +6,7 @@ events that are about the user rather than a conversation.
 
     <- {"type": "message.new", "message": {...}}
     <- {"type": "conversation.added", "conversation": {...}}
+    <- {"type": "notification.new", "notification": {...}}
     <- {"type": "typing", "conversation_id": 1, "user_id": 2}
     <- {"type": "conversation.read", "conversation_id": 1,
         "last_read_message_id": 42}   (this account, on another device)
@@ -194,6 +195,22 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
                 'type': 'conversation.updated',
                 'conversation_id': event['conversation_id'],
                 'conversation': event['conversation'],
+            }
+        )
+
+    async def notification_new(self, event):
+        """A new activity notification for this account.
+
+        Arrives on the user's own group. Without this method the frame was
+        being dropped: Channels routes a group event by turning its `type` into
+        a method name, so `notification.new` needs `notification_new` to exist
+        or there is nothing to deliver it to. The row was still written, which
+        is why the feed filled in on a refresh and never live.
+        """
+        await self.send_json(
+            {
+                'type': 'notification.new',
+                'notification': event['notification'],
             }
         )
 
