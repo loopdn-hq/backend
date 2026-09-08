@@ -731,6 +731,10 @@ class ChatWebsocketTests(TransactionTestCase):
         self.bob = make_user('bob', '+639170000002')
         self.carol = make_user('carol', '+639170000003')
         self.conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        # Roles only exist on a group, and a notification needs somebody with
+        # the standing to cause one.
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
 
         # Minted here, in synchronous setUp: RefreshToken.for_user() writes
         # to the database (last_login, outstanding token), which an async
@@ -748,6 +752,33 @@ class ChatWebsocketTests(TransactionTestCase):
             f'/ws/chat/?token={self.tokens[user.username]}',
             headers=self.HEADERS,
         )
+
+    async def test_a_notification_reaches_the_socket(self):
+        """The half that is easy to leave out and hard to notice.
+
+        Channels routes a group event by turning its `type` into a method
+        name, so a frame with no matching method on the consumer is simply
+        dropped. The notification row is written either way - which is exactly
+        why this looked like it worked until somebody watched for it live
+        rather than reloading the page.
+        """
+        communicator = self.connect_as(self.bob)
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        await database_sync_to_async(membership.set_role)(
+            await database_sync_to_async(Participant.objects.get)(
+                conversation=self.group, user=self.bob
+            ),
+            Participant.Role.ADMIN,
+            self.alice,
+        )
+
+        frame = await communicator.receive_json_from(timeout=3)
+        self.assertEqual(frame['type'], 'notification.new')
+        self.assertEqual(frame['notification']['type'], 'role.granted')
+
+        await communicator.disconnect()
 
     async def test_a_socket_without_a_token_is_refused(self):
         from loopd.asgi import application
