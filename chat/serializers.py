@@ -552,6 +552,8 @@ class NotificationSerializer(serializers.ModelSerializer):
     from_user = PublicUserSerializer(read_only=True)
     category = serializers.CharField(read_only=True)
     conversation_name = serializers.SerializerMethodField()
+    conversation_join_mode = serializers.SerializerMethodField()
+    viewer_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Notification
@@ -562,6 +564,8 @@ class NotificationSerializer(serializers.ModelSerializer):
             'from_user',
             'conversation',
             'conversation_name',
+            'conversation_join_mode',
+            'viewer_status',
             'message',
             'data',
             'read_at',
@@ -574,6 +578,55 @@ class NotificationSerializer(serializers.ModelSerializer):
         if conversation is None:
             return None
         return conversation.name or ''
+
+    def get_conversation_join_mode(self, obj):
+        """How somebody gets into this group.
+
+        Context for a client deciding what to offer: an open group can be
+        joined outright, a code group needs the code, an approval group is a
+        request, and an invite-only group cannot be asked at all.
+        """
+        conversation = obj.conversation
+        return conversation.join_mode if conversation else None
+
+    def get_viewer_status(self, obj):
+        """Where the RECIPIENT stands in that conversation right now.
+
+        Computed live rather than recorded with the event, because the
+        notification is a record of the past and the action has to be about the
+        present. Somebody added and then removed must not still be offered a
+        way in, and somebody who has since joined must not be offered the join
+        form again.
+
+        None means no membership row at all.
+        """
+        if obj.conversation_id is None:
+            return None
+        return self._status_map().get(obj.conversation_id)
+
+    def _status_map(self):
+        """Every membership this viewer has, in one query for the whole page.
+
+        Cached on the serializer context, which is shared across the page, so
+        a feed of twenty notifications about twenty groups still costs one
+        query rather than twenty.
+        """
+        cached = self.context.get('_viewer_participation')
+        if cached is not None:
+            return cached
+
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is None or not user.is_authenticated:
+            self.context['_viewer_participation'] = {}
+            return {}
+
+        rows = Participant.objects.filter(user=user).values_list(
+            'conversation_id', 'status'
+        )
+        mapping = dict(rows)
+        self.context['_viewer_participation'] = mapping
+        return mapping
 
 
 class MarkNotificationsReadSerializer(serializers.Serializer):
@@ -590,10 +643,47 @@ class MarkNotificationsReadSerializer(serializers.Serializer):
 
 
 class ConversationSearchSerializer(serializers.ModelSerializer):
+    """A group as somebody outside it sees it, before deciding to join.
+
+    Deliberately thinner than ConversationSerializer: this is the one place a
+    NON-MEMBER reads a group, so it carries what is needed to choose - the
+    name, what it is for, how big it is and how to get in - and nothing that
+    belongs to the people already inside. No messages, no participants, no
+    sms_number, no join_code.
+    """
+
+    image_url = serializers.SerializerMethodField()
+    member_count = serializers.SerializerMethodField()
+
     class Meta:
         model = Conversation
-        fields = ['id', 'name', 'join_mode', 'mode']
+        fields = [
+            'id',
+            'name',
+            'description',
+            'image_url',
+            'member_count',
+            'join_mode',
+            'mode',
+        ]
         read_only_fields = fields
+
+    def get_image_url(self, obj):
+        request = self.context.get('request')
+        if not obj.image:
+            return None
+        return request.build_absolute_uri(obj.image.url) if request else obj.image.url
+
+    def get_member_count(self, obj):
+        """Active members only, and annotated by the view so this is free.
+
+        Falls back to a query rather than raising when the annotation is
+        missing, so the serializer stays usable from a shell or a test.
+        """
+        annotated = getattr(obj, 'active_member_count', None)
+        if annotated is not None:
+            return annotated
+        return obj.active_participants.count()
 
 
 class DirectConversationSerializer(serializers.Serializer):

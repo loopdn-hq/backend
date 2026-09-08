@@ -97,18 +97,30 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
         }
         self.assertEqual(usernames, {'alice', 'bob'})
 
-    def test_search_conversations_returns_joinable_groups_only(self):
-        open_group = Conversation.start_group(self.alice, 'Weekend Plans')
-        open_group.join_mode = Conversation.JoinMode.OPEN
-        open_group.mode = Conversation.Mode.BROADCAST
-        open_group.save(update_fields=['join_mode', 'mode'])
-        Conversation.start_group(self.alice, 'Weekend Private')
+    def a_discoverable_group(self, name, join_mode, **kwargs):
+        group = Conversation.start_group(self.alice, name, **kwargs)
+        group.join_mode = join_mode
+        group.save(update_fields=['join_mode'])
+        return group
 
-        data = self.assertSuccess(
-            self.client.get(
-                reverse('chat:conversation-search'), {'q': 'weekend'}
-            )
+    def search(self, term, as_user=None):
+        self.client.force_authenticate(as_user or self.bob)
+        return self.assertSuccess(
+            self.client.get(reverse('chat:conversation-search'), {'q': term})
         )
+
+    def test_search_conversations_returns_joinable_groups_only(self):
+        open_group = self.a_discoverable_group(
+            'Weekend Plans', Conversation.JoinMode.OPEN,
+            description='Pickleball in CDO',
+        )
+        open_group.mode = Conversation.Mode.BROADCAST
+        open_group.save(update_fields=['mode'])
+        # Invite-only is not discoverable: listing it would announce a group to
+        # somebody who can never join it.
+        self.a_discoverable_group('Weekend Private', Conversation.JoinMode.INVITE)
+
+        data = self.search('weekend')
 
         self.assertEqual(len(data['results']), 1)
         self.assertEqual(
@@ -116,10 +128,56 @@ class ChatAPITests(EnvelopeAssertions, APITestCase):
             {
                 'id': open_group.id,
                 'name': 'Weekend Plans',
+                'description': 'Pickleball in CDO',
+                'image_url': None,
+                'member_count': 1,
                 'join_mode': 'open',
                 'mode': 'broadcast',
             },
         )
+
+    def test_code_and_approval_groups_are_discoverable(self):
+        self.a_discoverable_group('Weekend Code', Conversation.JoinMode.CODE)
+        self.a_discoverable_group('Weekend Approval', Conversation.JoinMode.APPROVAL)
+
+        data = self.search('weekend')
+
+        self.assertEqual(
+            {row['join_mode'] for row in data['results']}, {'code', 'approval'}
+        )
+
+    def test_a_group_you_are_already_in_is_not_a_result(self):
+        """It is in the sidebar. Offering "Join" for it can only confuse."""
+        group = self.a_discoverable_group('Weekend Plans', Conversation.JoinMode.OPEN)
+
+        self.assertEqual(len(self.search('weekend')['results']), 1)
+
+        group.add_participant(self.bob)
+        self.assertEqual(self.search('weekend')['results'], [])
+
+    def test_the_creator_never_sees_their_own_group(self):
+        self.a_discoverable_group('Weekend Plans', Conversation.JoinMode.OPEN)
+        self.assertEqual(self.search('weekend', as_user=self.alice)['results'], [])
+
+    def test_leaving_makes_it_discoverable_again(self):
+        # LEFT is not ACTIVE, so the door reopens - which is what makes the
+        # exclusion a statement about membership rather than about history.
+        group = self.a_discoverable_group('Weekend Plans', Conversation.JoinMode.OPEN)
+        row = group.add_participant(self.bob)
+        self.assertEqual(self.search('weekend')['results'], [])
+
+        row.status = Participant.Status.LEFT
+        row.save(update_fields=['status'])
+        self.assertEqual(len(self.search('weekend')['results']), 1)
+
+    def test_member_count_counts_only_active_members(self):
+        group = self.a_discoverable_group('Weekend Plans', Conversation.JoinMode.OPEN)
+        row = group.add_participant(self.carol)
+        self.assertEqual(self.search('weekend')['results'][0]['member_count'], 2)
+
+        row.status = Participant.Status.REMOVED
+        row.save(update_fields=['status'])
+        self.assertEqual(self.search('weekend')['results'][0]['member_count'], 1)
 
     def test_the_same_pair_never_gets_two_conversations(self):
         first = self.assertSuccess(
@@ -3559,3 +3617,79 @@ class ReadReceiptTests(EnvelopeAssertions, APITestCase):
         ]
         self.assertEqual(len(rows), 1)
         self.assertIsNone(rows[0]['last_read_message'])
+
+
+class NotificationActionContextTests(EnvelopeAssertions, APITestCase):
+    """What a client needs to decide what to OFFER on a notification.
+
+    The row records what happened; the action has to be about what is true
+    now. Somebody added and then removed must not still be handed a way in,
+    and how a stranger gets into the group decides what "a way in" even is.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.join_mode = Conversation.JoinMode.CODE
+        self.group.save(update_fields=['join_mode'])
+        # Through the endpoint an admin uses. The model's add_participant is
+        # deliberately not the hook - it also runs for both sides of a direct
+        # chat and for a group's own creator.
+        self.add_member(self.group, 'bob')
+
+    def add_member(self, group, username):
+        self.client.force_authenticate(self.alice)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-members', args=[group.id]),
+                {'members': [username]},
+                format='json',
+            )
+        )
+
+    def feed(self, user):
+        self.client.force_authenticate(user)
+        return self.assertSuccess(
+            self.client.get(reverse('chat:notification-list'))
+        )['results']
+
+    def test_the_join_mode_rides_along(self):
+        self.assertEqual(
+            self.feed(self.bob)[0]['conversation_join_mode'], 'code'
+        )
+
+    def test_a_member_reports_as_active(self):
+        self.assertEqual(self.feed(self.bob)[0]['viewer_status'], 'active')
+
+    def test_being_removed_afterwards_changes_the_answer(self):
+        # The "you were added" notification stays - it did happen - but the
+        # client must stop offering a door that is now shut.
+        membership.remove(
+            Participant.objects.get(conversation=self.group, user=self.bob),
+            self.alice,
+        )
+
+        rows = self.feed(self.bob)
+        added = [r for r in rows if r['type'] == 'member.added'][0]
+        self.assertEqual(added['viewer_status'], 'removed')
+
+    def test_the_whole_page_costs_one_query_for_membership(self):
+        # Twenty notifications about twenty groups must not be twenty lookups.
+        for index in range(5):
+            group = Conversation.start_group(self.alice, name=f'G{index}')
+            self.add_member(group, 'bob')
+
+        self.client.force_authenticate(self.bob)
+        url = reverse('chat:notification-list')
+        with CaptureQueriesContext(connection) as first:
+            self.client.get(url)
+
+        for index in range(5, 10):
+            group = Conversation.start_group(self.alice, name=f'G{index}')
+            self.add_member(group, 'bob')
+
+        with CaptureQueriesContext(connection) as second:
+            self.client.get(url)
+
+        self.assertEqual(len(second), len(first))

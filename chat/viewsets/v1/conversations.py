@@ -32,7 +32,15 @@ lookup starts from the conversations the caller participates in, so a
 non-member gets a 404 from every route here and cannot even learn that a
 conversation exists.
 """
-from django.db.models import Count, IntegerField, OuterRef, Prefetch, Subquery, Value
+from django.db.models import (
+    Count,
+    IntegerField,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Value,
+)
 from django.db.models.functions import Coalesce, Greatest
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -232,14 +240,52 @@ class ConversationViewSet(
 
     @action(detail=False, methods=['get'])
     def search(self, request):
-        """Find named groups that can be discovered and joined."""
+        """Find named groups that can be discovered and joined.
+
+        Three filters, and each one is the difference between a directory and
+        a leak:
+
+        INVITE MODE IS EXCLUDED. An invite-only group is not discoverable by
+        definition - listing it would announce that it exists and who might be
+        in it to somebody who can never join.
+
+        GROUPS THE CALLER IS ALREADY IN ARE EXCLUDED. They are not results;
+        they are already in the sidebar, and offering "Join" for a group
+        somebody is reading is a button that can only confuse. Only ACTIVE
+        membership counts - a pending request is not being in.
+
+        A TERM OF UNDER TWO CHARACTERS RETURNS NOTHING, so this is a lookup
+        rather than a way to page through every public group in the product.
+        """
         term = (request.query_params.get('q') or '').strip()
-        matches = Conversation.objects.filter(
-            kind=Conversation.Kind.GROUP,
-            name__icontains=term,
-        ).exclude(
-            join_mode=Conversation.JoinMode.INVITE,
-        ).order_by('name', 'id')
+        matches = (
+            Conversation.objects.filter(
+                kind=Conversation.Kind.GROUP,
+                name__icontains=term,
+            )
+            .exclude(join_mode=Conversation.JoinMode.INVITE)
+            # An explicit subquery of "conversations I am an active member of"
+            # rather than .exclude(participants__user=..., participants__status=
+            # ...). Django's exclude() spans a multi-valued relation with its own
+            # join, and next to the annotate() below that quietly removed groups
+            # whose only ACTIVE row belonged to somebody else. This form says
+            # exactly what it means and cannot be read two ways.
+            .exclude(
+                pk__in=Participant.objects.filter(
+                    user=request.user, status=Participant.Status.ACTIVE
+                ).values('conversation_id')
+            )
+            # Annotated rather than counted per row: the card shows a member
+            # count, and without this that is a query for every result.
+            .annotate(
+                active_member_count=Count(
+                    'participants',
+                    filter=Q(participants__status=Participant.Status.ACTIVE),
+                    distinct=True,
+                )
+            )
+            .order_by('name', 'id')
+        )
 
         if len(term) < 2:
             matches = matches.none()
