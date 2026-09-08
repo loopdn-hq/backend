@@ -2903,3 +2903,170 @@ class SettingsChangeBroadcastTests(EnvelopeAssertions, APITestCase):
         self.assertFalse(self.group.allows_posting_by(member_row))
         self.assertTrue(self.group.allows_posting_by(admin_row))
 
+
+
+class UnreadCountTests(EnvelopeAssertions, APITestCase):
+    """What "unread" means, and who it means it for.
+
+    The count is one number per conversation per person, read off each
+    member's own pointer - so a group is not a special case, it is the same
+    thing more times. The cases that actually catch bugs are the asymmetric
+    ones: your own messages, a member who has read nothing, and a pointer
+    somebody tries to wind backwards.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.carol = make_user('carol')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.group.add_participant(self.carol)
+
+    def read_url(self, conversation=None):
+        return reverse(
+            'chat:conversation-read', args=[(conversation or self.group).id]
+        )
+
+    def unread_for(self, user):
+        self.client.force_authenticate(user)
+        data = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-detail', args=[self.group.id])
+            )
+        )
+        return data['unread_count']
+
+    def pointer_of(self, user):
+        return Participant.objects.get(
+            conversation=self.group, user=user
+        ).last_read_message_id
+
+    # --- counting -----------------------------------------------------------
+
+    def test_a_member_who_has_read_nothing_has_read_nothing(self):
+        create_message(self.group, self.bob, text='one')
+        create_message(self.group, self.bob, text='two')
+
+        # A null pointer must mean "all of it", not "none of it" - the bug
+        # would be a NULL comparison quietly reporting zero.
+        self.assertEqual(self.unread_for(self.alice), 2)
+
+    def test_your_own_messages_are_not_unread_to_you(self):
+        create_message(self.group, self.alice, text='mine')
+        create_message(self.group, self.bob, text='theirs')
+
+        self.assertEqual(self.unread_for(self.alice), 1)
+
+    def test_reading_clears_the_count(self):
+        create_message(self.group, self.bob, text='one')
+        create_message(self.group, self.bob, text='two')
+
+        self.client.force_authenticate(self.alice)
+        self.assertSuccess(self.client.post(self.read_url(), {}))
+
+        self.assertEqual(self.unread_for(self.alice), 0)
+
+    def test_messages_after_the_read_still_count(self):
+        create_message(self.group, self.bob, text='seen')
+        self.client.force_authenticate(self.alice)
+        self.assertSuccess(self.client.post(self.read_url(), {}))
+
+        create_message(self.group, self.bob, text='arrived after')
+
+        self.assertEqual(self.unread_for(self.alice), 1)
+
+    def test_reading_up_to_a_named_message_leaves_the_rest(self):
+        first = create_message(self.group, self.bob, text='one')
+        create_message(self.group, self.bob, text='two')
+        create_message(self.group, self.bob, text='three')
+
+        self.client.force_authenticate(self.alice)
+        self.assertSuccess(
+            self.client.post(self.read_url(), {'message_id': first.pk})
+        )
+
+        self.assertEqual(self.unread_for(self.alice), 2)
+
+    def test_the_count_comes_back_on_the_list_too(self):
+        create_message(self.group, self.bob, text='one')
+
+        self.client.force_authenticate(self.alice)
+        data = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )
+        rows = data['results'] if isinstance(data, dict) else data
+
+        self.assertEqual(rows[0]['unread_count'], 1)
+
+    # --- the pointer only goes forward -------------------------------------
+
+    def test_an_older_message_does_not_wind_the_pointer_back(self):
+        first = create_message(self.group, self.bob, text='one')
+        create_message(self.group, self.bob, text='two')
+
+        self.client.force_authenticate(self.alice)
+        self.assertSuccess(self.client.post(self.read_url(), {}))
+        ahead = self.pointer_of(self.alice)
+
+        # A tab that was asleep reports where it had got to. Honouring that
+        # would turn messages Alice has read back into unread ones, on every
+        # device she has open.
+        self.assertSuccess(
+            self.client.post(self.read_url(), {'message_id': first.pk})
+        )
+
+        self.assertEqual(self.pointer_of(self.alice), ahead)
+        self.assertEqual(self.unread_for(self.alice), 0)
+
+    # --- groups -------------------------------------------------------------
+
+    def test_each_member_of_a_group_counts_for_themselves(self):
+        create_message(self.group, self.alice, text='hello all')
+
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(self.client.post(self.read_url(), {}))
+
+        # Bob reading changes nothing for Carol.
+        self.assertEqual(self.unread_for(self.bob), 0)
+        self.assertEqual(self.unread_for(self.carol), 1)
+        self.assertEqual(self.unread_for(self.alice), 0)
+
+    def test_a_phone_only_member_does_not_disturb_anyone_else(self):
+        # SMS can tell you a handset took a text, never that a person read it,
+        # so these rows have no pointer and never will. They must not make the
+        # count wrong for the members who do have one.
+        self.group.add_phone_participant(
+            '+639171234567', display_name='Mom', added_by=self.alice
+        )
+        create_message(self.group, self.bob, text='one')
+
+        self.assertEqual(self.unread_for(self.alice), 1)
+
+    # --- refusals -----------------------------------------------------------
+
+    def test_a_message_from_another_conversation_is_refused(self):
+        other = Conversation.start_group(self.alice, name='Work')
+        stray = create_message(other, self.alice, text='elsewhere')
+
+        self.client.force_authenticate(self.alice)
+        response = self.client.post(
+            self.read_url(), {'message_id': stray.pk}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIsNone(self.pointer_of(self.alice))
+
+    def test_a_non_member_cannot_mark_anything_read(self):
+        outsider = make_user('mallory')
+        self.client.force_authenticate(outsider)
+
+        response = self.client.post(self.read_url(), {})
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_reading_an_empty_conversation_is_harmless(self):
+        empty = Conversation.start_group(self.alice, name='Quiet')
+
+        self.client.force_authenticate(self.alice)
+        self.assertSuccess(self.client.post(self.read_url(empty), {}))

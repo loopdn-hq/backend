@@ -347,6 +347,47 @@ def set_delivery(participant, *, muted=None, sms_enabled=None):
     return participant
 
 
+def set_last_read(participant, message):
+    """Move this member's read pointer up to `message`.
+
+    Forward only. A tab that was backgrounded for a minute reports the message
+    it had when it went to sleep, and honouring that would drag the pointer
+    back and turn messages the member has already read unread again - on every
+    device at once, because the pointer is the account's, not the browser's.
+    So an older id is not an error, it is simply nothing to do.
+
+    Returns True when the pointer actually moved, so the caller knows whether
+    there is anything worth telling the member's other devices about.
+    """
+    if participant.status != Participant.Status.ACTIVE:
+        raise NotAMember('You are not a member of that conversation.')
+
+    if message.conversation_id != participant.conversation_id:
+        raise NotAMember('That message is not in this conversation.')
+
+    if message.pk <= (participant.last_read_message_id or 0):
+        return False
+
+    participant.last_read_message = message
+    participant.save(update_fields=['last_read_message'])
+
+    # To the member's OWN devices, so a badge cleared on the laptop clears on
+    # the phone too. Deliberately not to the conversation: who has read what is
+    # the member's business, and putting it on the group's socket would turn a
+    # private pointer into a read receipt for everybody.
+    #
+    # After commit, so a client that reacts by refetching cannot race the write.
+    from chat.services import broadcast_conversation_read
+
+    conversation = participant.conversation
+    user = participant.user
+    if user is not None:
+        transaction.on_commit(
+            lambda: broadcast_conversation_read(conversation, user, message)
+        )
+    return True
+
+
 def set_muted(participant, muted):
     """Silence this group for one member, or unsilence it.
 

@@ -262,6 +262,7 @@ class ConversationSerializer(serializers.ModelSerializer):
     # rather than a related object - this endpoint used to leave `settings`
     # out entirely, so the client's Admin Panel Settings tab always saw null.
     settings = GroupSettingsFieldsSerializer(source='*', read_only=True)
+    unread_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
@@ -282,10 +283,25 @@ class ConversationSerializer(serializers.ModelSerializer):
             'admin_details',
             'sms_number',
             'last_message',
+            'unread_count',
             'created_at',
             'updated_at',
         ]
         read_only_fields = fields
+
+    def get_unread_count(self, obj):
+        """Messages past the caller's read pointer, not counting their own.
+
+        Read off an annotation the list and detail querysets add, because
+        computing it here would be a query per conversation on every list.
+
+        Defaults to 0 rather than assuming the annotation is there: several
+        actions re-serialize a conversation they fetched outside
+        get_queryset - a freshly created group, the payload
+        broadcast_conversation_updated puts on the socket - and those
+        instances carry no annotation. A missing count is not "unread".
+        """
+        return getattr(obj, 'unread_count', 0)
 
     def get_sms_number(self, obj):
         """The group's number as an object, or None while it has not got one.
@@ -862,6 +878,18 @@ class RemoveMemberSerializer(ParticipantActionSerializer):
         default=False,
         help_text='Also stop them ever rejoining, by any route.',
     )
+
+
+class MarkReadSerializer(serializers.Serializer):
+    """How far the caller has read.
+
+    `message_id` is optional: a client that just opened a conversation means
+    "everything", and making it say which message that was would be a round
+    trip to learn something the server already knows. Omitting it marks the
+    newest message read.
+    """
+
+    message_id = serializers.IntegerField(required=False, min_value=1)
 
 
 class DeliveryPreferenceSerializer(serializers.Serializer):

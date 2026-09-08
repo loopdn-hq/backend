@@ -223,6 +223,25 @@ def broadcast_conversation_updated(conversation):
     )
 
 
+def broadcast_conversation_read(conversation, user, message):
+    """Tell one member's OTHER devices that they have read this far.
+
+    Sent to the user's own group, never the conversation's. The pointer is
+    private state - it clears a badge on the phone when the laptop opened the
+    thread - and putting it on the group's socket would quietly turn it into a
+    read receipt visible to everyone, which is a product decision nobody has
+    made.
+    """
+    send_to_group(
+        user_group(user.pk),
+        {
+            'type': 'conversation.read',
+            'conversation_id': conversation.pk,
+            'last_read_message_id': message.pk,
+        },
+    )
+
+
 def broadcast_removed_from_conversation(conversation, users):
     """Tell people they are no longer in a conversation, so their socket lets go.
 
