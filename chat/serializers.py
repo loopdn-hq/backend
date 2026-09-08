@@ -6,6 +6,7 @@ from django.db import transaction
 from rest_framework import serializers
 
 from chat.models import (
+    Notification,
     Attachment,
     BlockedFromConversation,
     Conversation,
@@ -161,6 +162,12 @@ class ParticipantSerializer(serializers.ModelSerializer):
             'status',
             'muted',
             'sms_enabled',
+            # How far this member has read, so a client can show a sender
+            # whether their message has been seen. Null for anybody who has
+            # read nothing - and permanently null for a phone-only member,
+            # because SMS can report that a handset accepted a text and never
+            # that a person read it. A receipt must not count them.
+            'last_read_message',
             'joined_at',
         ]
         read_only_fields = fields
@@ -263,6 +270,9 @@ class ConversationSerializer(serializers.ModelSerializer):
     # out entirely, so the client's Admin Panel Settings tab always saw null.
     settings = GroupSettingsFieldsSerializer(source='*', read_only=True)
     unread_count = serializers.SerializerMethodField()
+    muted = serializers.SerializerMethodField()
+    archived = serializers.SerializerMethodField()
+    cleared = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
@@ -284,10 +294,64 @@ class ConversationSerializer(serializers.ModelSerializer):
             'sms_number',
             'last_message',
             'unread_count',
+            'muted',
+            'archived',
+            'cleared',
             'created_at',
             'updated_at',
         ]
         read_only_fields = fields
+
+    def _own_participation(self, obj):
+        """The caller's own membership row, or None.
+
+        Read off the prefetch the list queryset already carries rather than
+        querying per conversation - the same list `is_admin` walks. Falls back
+        to nothing for an anonymous or non-member caller, who cannot reach
+        these routes anyway.
+        """
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is None or not user.is_authenticated:
+            return None
+        for participant in obj.participants.all():
+            if participant.user_id == user.pk:
+                return participant
+        return None
+
+    def get_muted(self, obj):
+        """Whether this member has silenced the group, on every channel.
+
+        Their own state, never an admin's: the same flag texting MUTE sets, and
+        the one the SMS fan-out checks before sending.
+        """
+        participant = self._own_participation(obj)
+        return bool(participant and participant.muted)
+
+    def get_archived(self, obj):
+        participant = self._own_participation(obj)
+        return bool(participant and participant.archived_at)
+
+    def get_cleared(self, obj):
+        """True when this member has nothing left to see in here.
+
+        They cleared their view and nothing has arrived since, so a client
+        should leave it out of the list entirely. It becomes false again the
+        moment somebody posts, which is what brings the conversation back
+        holding only the new messages - no second flag to keep in step.
+
+        Read off the prefetched newest message rather than counting, so this
+        costs nothing on a list of any length.
+        """
+        participant = self._own_participation(obj)
+        if participant is None or participant.cleared_before_message_id is None:
+            return False
+
+        latest = getattr(obj, 'latest_messages', None)
+        newest_id = latest[0].pk if latest else None
+        if newest_id is None:
+            return True
+        return newest_id <= participant.cleared_before_message_id
 
     def get_unread_count(self, obj):
         """Messages past the caller's read pointer, not counting their own.
@@ -470,6 +534,59 @@ class ConversationSerializer(serializers.ModelSerializer):
             return None
         admins.sort(key=lambda row: (row.user_id != obj.created_by_id, row.joined_at))
         return self._person(admins[0].user)
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    """One row of somebody's activity feed.
+
+    `conversation_name` is denormalized onto the response rather than nesting
+    the whole conversation: the feed renders a group's name under every row,
+    and nesting would put a full conversation - settings, sms_number,
+    last_message - behind each of them.
+
+    The text itself is NOT stored or sent. A row says what happened and what it
+    happened to; the client renders the sentence. Store "Alice added you to
+    Family" and renaming the group leaves it wrong forever.
+    """
+
+    from_user = PublicUserSerializer(read_only=True)
+    category = serializers.CharField(read_only=True)
+    conversation_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Notification
+        fields = [
+            'id',
+            'type',
+            'category',
+            'from_user',
+            'conversation',
+            'conversation_name',
+            'message',
+            'data',
+            'read_at',
+            'created_at',
+        ]
+        read_only_fields = fields
+
+    def get_conversation_name(self, obj):
+        conversation = obj.conversation
+        if conversation is None:
+            return None
+        return conversation.name or ''
+
+
+class MarkNotificationsReadSerializer(serializers.Serializer):
+    """Which notifications to mark read.
+
+    An explicit list marks those; omitting it marks everything the caller has
+    unread, which is what the "Mark all as read" control means.
+    """
+
+    ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), required=False,
+        allow_empty=True,
+    )
 
 
 class ConversationSearchSerializer(serializers.ModelSerializer):
@@ -878,6 +995,12 @@ class RemoveMemberSerializer(ParticipantActionSerializer):
         default=False,
         help_text='Also stop them ever rejoining, by any route.',
     )
+
+
+class ArchiveSerializer(serializers.Serializer):
+    """Tidy a conversation away, or bring it back."""
+
+    archived = serializers.BooleanField()
 
 
 class MarkReadSerializer(serializers.Serializer):

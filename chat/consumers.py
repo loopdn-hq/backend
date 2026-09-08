@@ -212,6 +212,22 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
             }
         )
 
+    async def conversation_read_by(self, event):
+        """Somebody else in this conversation has read up to a message.
+
+        Arrives on the conversation's group, so everyone in it hears. The
+        reader's own client ignores it - it already knows - and the senders use
+        it to mark their messages seen.
+        """
+        await self.send_json(
+            {
+                'type': 'conversation.read.by',
+                'conversation_id': event['conversation_id'],
+                'user_id': event['user_id'],
+                'last_read_message_id': event['last_read_message_id'],
+            }
+        )
+
     async def typing(self, event):
         if event['user_id'] == self.user.pk:
             return  # nobody needs to be told they are typing

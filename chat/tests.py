@@ -26,6 +26,7 @@ from chat.models import (
     BlockedFromConversation,
     Conversation,
     Message,
+    Notification,
     Participant,
 )
 from chat.serializers import ConversationSerializer
@@ -3070,3 +3071,460 @@ class UnreadCountTests(EnvelopeAssertions, APITestCase):
 
         self.client.force_authenticate(self.alice)
         self.assertSuccess(self.client.post(self.read_url(empty), {}))
+
+
+class ActivityNotificationTests(EnvelopeAssertions, APITestCase):
+    """The events that used to exist only as a socket frame.
+
+    Each of these already happened before this table; what is new is that it
+    survives nobody being there to see it. The cases worth holding are the
+    ones where a notification would be wrong rather than merely missing: your
+    own actions, a phone-only member with no account to address, and one
+    person's feed being reachable from another person's session.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.carol = make_user('carol')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+
+    def feed(self, user, **params):
+        self.client.force_authenticate(user)
+        return self.assertSuccess(
+            self.client.get(reverse('chat:notification-list'), params)
+        )
+
+    def types_for(self, user, **params):
+        return [row['type'] for row in self.feed(user, **params)['results']]
+
+    def bob_row(self):
+        return Participant.objects.get(conversation=self.group, user=self.bob)
+
+    # --- the events ---------------------------------------------------------
+
+    def test_being_promoted_is_recorded(self):
+        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
+
+        self.assertIn('role.granted', self.types_for(self.bob))
+
+    def test_being_demoted_is_recorded(self):
+        row = self.bob_row()
+        membership.set_role(row, Participant.Role.ADMIN, self.alice)
+        membership.set_role(row, Participant.Role.MEMBER, self.alice)
+
+        self.assertIn('role.revoked', self.types_for(self.bob))
+
+    def test_being_removed_is_recorded(self):
+        membership.remove(self.bob_row(), self.alice)
+
+        self.assertIn('member.removed', self.types_for(self.bob))
+
+    def test_being_added_is_recorded(self):
+        # Through the endpoint an admin actually uses. Conversation
+        # .add_participant is deliberately NOT the hook: it also runs for both
+        # sides of a direct chat and for a group's own creator, neither of whom
+        # wants telling they were added to something.
+        self.client.force_authenticate(self.alice)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-members', args=[self.group.id]),
+                {'members': ['carol']},
+                format='json',
+            )
+        )
+
+        self.assertIn('member.added', self.types_for(self.carol))
+
+    # --- who does NOT get told ---------------------------------------------
+
+    def test_you_are_not_told_about_your_own_action(self):
+        # Alice demoting Alice would otherwise put "you are no longer an
+        # admin" in the feed of the person who just clicked it.
+        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
+        alice_row = Participant.objects.get(
+            conversation=self.group, user=self.alice
+        )
+        membership.set_role(alice_row, Participant.Role.MEMBER, self.alice)
+
+        self.assertNotIn('role.revoked', self.types_for(self.alice))
+
+    def test_a_phone_only_member_is_not_notified(self):
+        # No account, so nothing to address - and the call must not raise
+        # rather than every call site having to check for itself.
+        mom = self.group.add_phone_participant(
+            '+639171234567', display_name='Mom', added_by=self.alice
+        )
+        membership.remove(mom, self.alice)
+
+        self.assertEqual(Notification.objects.filter(to_user=None).count(), 0)
+
+    def test_a_message_never_creates_a_notification(self):
+        # unread_count answers this. Two sources of truth would disagree.
+        create_message(self.group, self.alice, text='hello')
+
+        self.assertEqual(self.types_for(self.bob), [])
+
+    # --- the feed itself ----------------------------------------------------
+
+    def test_the_feed_is_only_your_own(self):
+        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
+
+        self.assertEqual(self.types_for(self.carol), [])
+
+    def test_the_unread_count_rides_with_the_list(self):
+        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
+
+        self.assertEqual(self.feed(self.bob)['unread_count'], 1)
+
+    def test_filtering_by_category(self):
+        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
+
+        self.assertEqual(self.types_for(self.bob, category='groups'),
+                         ['role.granted'])
+        self.assertEqual(self.types_for(self.bob, category='sms'), [])
+
+    def test_marking_everything_read(self):
+        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
+
+        self.client.force_authenticate(self.bob)
+        data = self.assertSuccess(
+            self.client.post(reverse('chat:notification-read'), {})
+        )
+
+        self.assertEqual(data['marked'], 1)
+        self.assertEqual(data['unread_count'], 0)
+        self.assertEqual(self.feed(self.bob)['unread_count'], 0)
+
+    def test_marking_read_cannot_reach_somebody_elses_row(self):
+        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
+        theirs = Notification.objects.get(to_user=self.bob)
+
+        self.client.force_authenticate(self.carol)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:notification-read'), {'ids': [theirs.pk]},
+                format='json',
+            )
+        )
+
+        theirs.refresh_from_db()
+        self.assertIsNone(theirs.read_at)
+
+    def test_unread_filter(self):
+        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
+        self.client.force_authenticate(self.bob)
+        self.client.post(reverse('chat:notification-read'), {})
+
+        self.assertEqual(self.types_for(self.bob, unread='1'), [])
+
+
+class ArchiveAndMuteTests(EnvelopeAssertions, APITestCase):
+    """Two switches that look similar and are not.
+
+    Mute stops delivery on every channel, SMS included. Archive stops nothing -
+    it only decides which of the member's own lists a conversation sits in.
+    Conflating them is how somebody tidies their list and then misses the texts
+    still arriving on their phone, so the difference is what these hold.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.alice)
+
+    def archive_url(self):
+        return reverse('chat:conversation-archive', args=[self.group.id])
+
+    def detail(self, user=None):
+        self.client.force_authenticate(user or self.alice)
+        return self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-detail', args=[self.group.id])
+            )
+        )
+
+    def alice_row(self):
+        return Participant.objects.get(conversation=self.group, user=self.alice)
+
+    # --- archive ------------------------------------------------------------
+
+    def test_archiving_shows_on_my_copy(self):
+        self.assertSuccess(
+            self.client.post(self.archive_url(), {'archived': True},
+                             format='json')
+        )
+
+        self.assertTrue(self.detail()['archived'])
+
+    def test_archiving_is_mine_alone(self):
+        self.assertSuccess(
+            self.client.post(self.archive_url(), {'archived': True},
+                             format='json')
+        )
+
+        self.assertFalse(self.detail(self.bob)['archived'])
+
+    def test_unarchiving(self):
+        self.client.post(self.archive_url(), {'archived': True}, format='json')
+        self.assertSuccess(
+            self.client.post(self.archive_url(), {'archived': False},
+                             format='json')
+        )
+
+        self.assertFalse(self.detail()['archived'])
+
+    def test_a_new_message_brings_it_back(self):
+        self.client.post(self.archive_url(), {'archived': True}, format='json')
+
+        create_message(self.group, self.bob, text='still here?')
+
+        self.assertFalse(self.detail()['archived'])
+
+    def test_but_not_for_somebody_who_muted_it(self):
+        # They said they did not want to hear about this group. Pulling it back
+        # to the top of their list on every post is hearing about it.
+        membership.set_muted(self.alice_row(), True)
+        self.client.post(self.archive_url(), {'archived': True}, format='json')
+
+        create_message(self.group, self.bob, text='still here?')
+
+        self.assertTrue(self.detail()['archived'])
+
+    def test_archiving_does_not_leave_the_group(self):
+        self.client.post(self.archive_url(), {'archived': True}, format='json')
+
+        self.assertEqual(self.alice_row().status, Participant.Status.ACTIVE)
+
+    def test_a_non_member_cannot_archive(self):
+        self.client.force_authenticate(make_user('mallory'))
+
+        response = self.client.post(
+            self.archive_url(), {'archived': True}, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # --- mute ---------------------------------------------------------------
+
+    def test_muting_shows_on_my_copy(self):
+        membership.set_muted(self.alice_row(), True)
+
+        self.assertTrue(self.detail()['muted'])
+
+    def test_muting_is_mine_alone(self):
+        membership.set_muted(self.alice_row(), True)
+
+        self.assertFalse(self.detail(self.bob)['muted'])
+
+    def test_archiving_does_not_mute(self):
+        # The distinction the whole feature turns on: a tidied list must not
+        # quietly stop the texts.
+        self.client.post(self.archive_url(), {'archived': True}, format='json')
+
+        self.assertFalse(self.detail()['muted'])
+        self.assertFalse(self.alice_row().muted)
+
+
+class ClearHistoryTests(EnvelopeAssertions, APITestCase):
+    """Deleting a chat for yourself without leaving it.
+
+    Distinct from both neighbours: archive keeps the history and only moves the
+    conversation between the member's own lists; leaving takes them out of the
+    group for everybody. This empties one member's view, keeps their
+    membership, and lets the conversation return by itself carrying only what
+    arrived afterwards.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.alice)
+
+    def clear_url(self):
+        return reverse('chat:conversation-clear', args=[self.group.id])
+
+    def clear(self):
+        return self.assertSuccess(self.client.post(self.clear_url(), {}))
+
+    def history(self, user=None):
+        self.client.force_authenticate(user or self.alice)
+        data = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-messages', args=[self.group.id])
+            )
+        )
+        rows = data['results'] if isinstance(data, dict) else data
+        return [row['text'] for row in rows]
+
+    def detail(self, user=None):
+        self.client.force_authenticate(user or self.alice)
+        return self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-detail', args=[self.group.id])
+            )
+        )
+
+    # --- clearing -----------------------------------------------------------
+
+    def test_the_history_is_empty_afterwards(self):
+        create_message(self.group, self.bob, text='old one')
+        create_message(self.group, self.bob, text='old two')
+
+        self.clear()
+
+        self.assertEqual(self.history(), [])
+
+    def test_everybody_else_still_has_theirs(self):
+        create_message(self.group, self.bob, text='old one')
+
+        self.clear()
+
+        self.assertEqual(self.history(self.bob), ['old one'])
+
+    def test_the_member_has_not_left(self):
+        create_message(self.group, self.bob, text='old one')
+
+        self.clear()
+
+        row = Participant.objects.get(conversation=self.group, user=self.alice)
+        self.assertEqual(row.status, Participant.Status.ACTIVE)
+
+    def test_it_drops_out_of_the_list_while_there_is_nothing_to_show(self):
+        create_message(self.group, self.bob, text='old one')
+
+        self.clear()
+
+        self.assertTrue(self.detail()['cleared'])
+
+    # --- and comes back -----------------------------------------------------
+
+    def test_a_new_message_brings_it_back(self):
+        create_message(self.group, self.bob, text='old one')
+        self.clear()
+
+        create_message(self.group, self.bob, text='new one')
+
+        self.assertFalse(self.detail()['cleared'])
+
+    def test_and_it_carries_only_what_arrived_after(self):
+        create_message(self.group, self.bob, text='old one')
+        self.clear()
+        create_message(self.group, self.bob, text='new one')
+
+        self.assertEqual(self.history(), ['new one'])
+
+    def test_the_cleared_messages_are_not_unread(self):
+        # Otherwise the conversation returns wearing a badge for messages the
+        # member can no longer open.
+        create_message(self.group, self.bob, text='old one')
+        create_message(self.group, self.bob, text='old two')
+
+        self.clear()
+
+        self.assertEqual(self.detail()['unread_count'], 0)
+
+    def test_only_messages_after_the_clear_count_as_unread(self):
+        create_message(self.group, self.bob, text='old one')
+        self.clear()
+        create_message(self.group, self.bob, text='new one')
+
+        self.assertEqual(self.detail()['unread_count'], 1)
+
+    def test_the_resume_cursor_cannot_reach_cleared_messages(self):
+        first = create_message(self.group, self.bob, text='old one')
+        create_message(self.group, self.bob, text='old two')
+        self.clear()
+        create_message(self.group, self.bob, text='new one')
+
+        self.client.force_authenticate(self.alice)
+        data = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-messages', args=[self.group.id]),
+                {'after_id': first.pk - 1},
+            )
+        )
+        rows = data['results'] if isinstance(data, dict) else data
+
+        self.assertEqual([row['text'] for row in rows], ['new one'])
+
+    # --- refusals -----------------------------------------------------------
+
+    def test_clearing_an_empty_conversation_is_harmless(self):
+        empty = Conversation.start_group(self.alice, name='Quiet')
+
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-clear', args=[empty.id]), {}
+            )
+        )
+
+    def test_a_non_member_cannot_clear(self):
+        self.client.force_authenticate(make_user('mallory'))
+
+        response = self.client.post(self.clear_url(), {})
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class ReadReceiptTests(EnvelopeAssertions, APITestCase):
+    """Showing a sender that their message has been seen.
+
+    Read state is private until somebody asks to see it, and this is the ask:
+    the pointer that clears the reader's own badge is also what tells a sender
+    their message landed. What it must never do is imply anything about the
+    members it cannot speak for.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+
+    def members(self):
+        self.client.force_authenticate(self.alice)
+        return members_of(self.client, self.group.id)
+
+    def row_for(self, username):
+        for row in self.members():
+            user = row.get('user') or {}
+            if user.get('username') == username:
+                return row
+        return None
+
+    def test_a_member_who_has_read_nothing_reports_nothing(self):
+        create_message(self.group, self.alice, text='hello')
+
+        self.assertIsNone(self.row_for('bob')['last_read_message'])
+
+    def test_reading_is_visible_to_the_other_members(self):
+        message = create_message(self.group, self.alice, text='hello')
+
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-read', args=[self.group.id]), {}
+            )
+        )
+
+        self.assertEqual(self.row_for('bob')['last_read_message'], message.pk)
+
+    def test_a_phone_only_member_never_reports_a_read(self):
+        # SMS can tell you a handset accepted a text and never that a person
+        # read it. A receipt counting them would be inventing a fact.
+        self.group.add_phone_participant(
+            '+639171234567', display_name='Mom', added_by=self.alice
+        )
+        create_message(self.group, self.alice, text='hello')
+
+        rows = [
+            row for row in self.members() if row['display_label'] == 'Mom'
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]['last_read_message'])

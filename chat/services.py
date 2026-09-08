@@ -119,6 +119,14 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     # in the value.
     conversation.save(update_fields=['updated_at'])
 
+    # And back INTO the list, for anybody who had tidied it away. Archive
+    # means "not now" rather than "never again", so activity restores it -
+    # except for muted members, for whom being pulled back to the top of the
+    # list on every post is exactly the interruption they turned off.
+    from chat.membership import unarchive_for_new_message
+
+    unarchive_for_new_message(conversation)
+
     # Only broadcast once the row is really committed - subscribers on other
     # workers would otherwise race the transaction and fetch nothing.
     transaction.on_commit(lambda: broadcast_message(message))
@@ -166,6 +174,15 @@ def announce_added_to_conversation(conversation, users):
     pks = [user.pk for user in users if user is not None]
     if not pks:
         return
+
+    from chat.models import Notification
+    from chat.notifications import notify_many
+
+    notify_many(
+        [user for user in users if user is not None],
+        Notification.Type.MEMBER_ADDED,
+        conversation=conversation,
+    )
 
     def _publish():
         from django.contrib.auth.models import User
@@ -224,19 +241,32 @@ def broadcast_conversation_updated(conversation):
 
 
 def broadcast_conversation_read(conversation, user, message):
-    """Tell one member's OTHER devices that they have read this far.
+    """Say that this member has read up to here.
 
-    Sent to the user's own group, never the conversation's. The pointer is
-    private state - it clears a badge on the phone when the laptop opened the
-    thread - and putting it on the group's socket would quietly turn it into a
-    read receipt visible to everyone, which is a product decision nobody has
-    made.
+    Two audiences, and they are told for different reasons:
+
+    Their OWN devices, so a badge cleared on the laptop clears on the phone.
+    That frame carries no user id because it is about the recipient.
+
+    The CONVERSATION, so other members can show a sender that their message
+    has been seen. This half is a read receipt, and it is a deliberate product
+    choice rather than a side effect: read state is only private until somebody
+    asks to see it.
     """
     send_to_group(
         user_group(user.pk),
         {
             'type': 'conversation.read',
             'conversation_id': conversation.pk,
+            'last_read_message_id': message.pk,
+        },
+    )
+    send_to_group(
+        conversation_group(conversation.pk),
+        {
+            'type': 'conversation.read.by',
+            'conversation_id': conversation.pk,
+            'user_id': user.pk,
             'last_read_message_id': message.pk,
         },
     )
