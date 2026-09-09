@@ -158,6 +158,7 @@ INSTALLED_APPS = [
     'otp',
     'chat',
     'sms',
+    'billing',
 ]
 
 MIDDLEWARE = [
@@ -356,6 +357,16 @@ EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMA
 # Where the frontend lives, for building links that go out in email (password
 # reset today). No trailing slash - callers append their own path.
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://loopdn.com').rstrip('/')
+
+# Origins Stripe Checkout/portal is allowed to redirect back to.
+#
+# success_url/cancel_url/return_url are caller-supplied, and Stripe will
+# redirect a real, just-paid customer to whatever they contain - handing that
+# straight to Stripe unvalidated is an open redirect (and a phishing setup:
+# "you just paid, now here is a look-alike login page"). CORS_ALLOWED_ORIGINS
+# is already the list of frontends this API trusts, so it doubles as the
+# redirect allowlist rather than inventing a second one to keep in sync.
+BILLING_ALLOWED_REDIRECT_ORIGINS = set(CORS_ALLOWED_ORIGINS) | {FRONTEND_URL}
 
 # How long a password-reset link stays valid. This is a real Django setting -
 # django.contrib.auth.tokens.default_token_generator reads it directly, so
@@ -629,6 +640,16 @@ REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'loopd.exceptions.api_exception_handler',
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
+    # Scoped throttles opt in per-view (billing checkout/portal today) rather
+    # than through DEFAULT_THROTTLE_CLASSES, so this only bounds the views
+    # that actually name a scope.
+    'DEFAULT_THROTTLE_RATES': {
+        # A Checkout Session is a real call to Stripe's API, not a free local
+        # read - this is what stops a compromised token or a retry loop from
+        # running up Stripe API usage or tripping Stripe's own abuse controls.
+        'billing_checkout': '10/hour',
+        'billing_portal': '20/hour',
+    },
 }
 
 if DEBUG:
@@ -784,3 +805,23 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 86400.0,
     },
 }
+
+
+# Stripe (payments and webhooks)
+#
+# Unset in development - billing/webhooks.py then has no secret to verify
+# against, which billing/checks.py only flags once a secret key is present,
+# the same "empty means development" convention TELNYX_PUBLIC_KEYS uses above.
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY', '')
+
+# The signing secret for THIS endpoint, from `stripe listen` locally or the
+# dashboard's webhook settings in staging/production. Without it,
+# stripe.Webhook.construct_event raises on every request rather than silently
+# accepting unsigned ones - unlike the Telnyx webhook, there is no accept-all
+# fallback here.
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+
+import stripe  # noqa: E402
+
+stripe.api_key = STRIPE_SECRET_KEY

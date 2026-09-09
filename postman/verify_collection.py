@@ -65,6 +65,18 @@ EXPECTED = {
     'Approve or decline': (
         400, 'nobody is waiting for approval in a linear run: the only '
              'participant to hand is the one just invited, who is already active'),
+    'Checkout: subscribe to a plan': (
+        400, 'no Stripe price is configured for the plan until '
+             '`manage.py sync_stripe_billing` has run against a real Stripe account'),
+    'Checkout: buy communication credits': (
+        400, 'no Stripe price is configured for the credit package until '
+             '`manage.py sync_stripe_billing` has run against a real Stripe account'),
+    'Billing portal': (
+        502, 'STRIPE_SECRET_KEY is unset in this environment, so Stripe '
+             'rejects the API call'),
+    'Stripe webhook (provider callback)': (
+        400, 'Postman cannot mint a valid Stripe signature; only the Stripe '
+             'CLI or a real event can'),
 }
 
 #: Requests to skip, with the reason. Kept short on purpose - a skip is a hole
