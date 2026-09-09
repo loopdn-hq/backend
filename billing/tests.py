@@ -191,10 +191,13 @@ class PlanCheckoutSecurityTests(TestCase):
         self.assertIn('success_url', response.json()['data'])
 
     def test_a_trusted_redirect_origin_passes_validation(self):
-        # Fails downstream on the real Stripe call (no live network here),
-        # which is fine - this only proves the URL check itself let it through.
+        # Mocks the whole checkout-session call, not just the low-level Stripe
+        # request under it - get_or_create_stripe_customer would otherwise
+        # still hit the real Stripe API and fail wherever STRIPE_SECRET_KEY
+        # is unset (CI), for a reason this test has nothing to do with. This
+        # only proves the redirect-URL check itself let the request through.
         with mock.patch(
-            'billing.services.stripe.checkout.Session.create',
+            'billing.viewsets.v1.billing.services.create_plan_checkout_session',
             return_value={'url': 'https://checkout.stripe.com/test'},
         ):
             response = self.client.post(self.url, self.payload, format='json')
@@ -208,7 +211,7 @@ class PlanCheckoutSecurityTests(TestCase):
         # smaller one, and asserts one call past it is refused.
         limit = int(settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']['billing_checkout'].split('/')[0])
         with mock.patch(
-            'billing.services.stripe.checkout.Session.create',
+            'billing.viewsets.v1.billing.services.create_plan_checkout_session',
             return_value={'url': 'https://checkout.stripe.com/test'},
         ):
             for _ in range(limit):
