@@ -158,6 +158,7 @@ INSTALLED_APPS = [
     'otp',
     'chat',
     'sms',
+    'billing',
 ]
 
 MIDDLEWARE = [
@@ -784,3 +785,23 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 86400.0,
     },
 }
+
+
+# Stripe (payments and webhooks)
+#
+# Unset in development - billing/webhooks.py then has no secret to verify
+# against, which billing/checks.py only flags once a secret key is present,
+# the same "empty means development" convention TELNYX_PUBLIC_KEYS uses above.
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY', '')
+
+# The signing secret for THIS endpoint, from `stripe listen` locally or the
+# dashboard's webhook settings in staging/production. Without it,
+# stripe.Webhook.construct_event raises on every request rather than silently
+# accepting unsigned ones - unlike the Telnyx webhook, there is no accept-all
+# fallback here.
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+
+import stripe  # noqa: E402
+
+stripe.api_key = STRIPE_SECRET_KEY
