@@ -40,7 +40,26 @@ def _idempotency_key(*parts, bucket_seconds):
 
 
 def get_free_plan():
-    return Plan.objects.get(code=Plan.Code.FREE)
+    """The Free plan, creating it if the seed row is somehow missing.
+
+    Normally seeded by `0002_seed_plans_and_credit_packages`, but every
+    subscription defaults to this plan (`get_or_create_subscription`), which
+    makes it a hard dependency of something as basic as creating a group -
+    `.get()` alone would turn a missing/deleted row into a 500 on totally
+    unrelated features rather than the admin action of restoring a plan.
+    `get_or_create` also survives `TransactionTestCase`, which truncates
+    every table (including data-migration rows) after each test and does not
+    restore them.
+    """
+    plan, _ = Plan.objects.get_or_create(
+        code=Plan.Code.FREE,
+        defaults={
+            'name': 'Free', 'monthly_price_cents': 0,
+            'max_groups': 3, 'max_members_per_group': 20, 'max_admins_per_group': 1,
+            'storage_gb': 1,
+        },
+    )
+    return plan
 
 
 def get_or_create_subscription(user):
