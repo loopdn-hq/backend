@@ -849,6 +849,10 @@ class GroupCreateSerializer(serializers.Serializer):
         return conversation
 
     def _create_group(self, validated_data, creator):
+        from billing.limits import check_can_create_group
+
+        check_can_create_group(creator)
+
         conversation = Conversation.start_group(
             creator,
             validated_data['name'],
@@ -1008,6 +1012,11 @@ class AddMembersSerializer(serializers.Serializer):
         added = [
             user for user in users if not conversation.has_participant(user)
         ]
+
+        if added:
+            from billing.limits import check_can_add_members
+            check_can_add_members(conversation, len(added))
+
         for user in added:
             conversation.add_participant(user)
 

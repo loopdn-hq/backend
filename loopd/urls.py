@@ -39,6 +39,8 @@ urlpatterns = [
     # The one public route a phone network calls. Authenticated by signature
     # rather than by a token - see sms/webhooks.py.
     path('api/v1/sms/', include('sms.urls')),
+
+    path('api/v1/billing/', include('billing.urls')),
 ]
 
 if not settings.AWS_STORAGE_BUCKET_NAME:
