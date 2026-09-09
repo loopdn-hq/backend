@@ -554,6 +554,7 @@ class NotificationSerializer(serializers.ModelSerializer):
     conversation_name = serializers.SerializerMethodField()
     conversation_join_mode = serializers.SerializerMethodField()
     viewer_status = serializers.SerializerMethodField()
+    request_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Notification
@@ -566,6 +567,7 @@ class NotificationSerializer(serializers.ModelSerializer):
             'conversation_name',
             'conversation_join_mode',
             'viewer_status',
+            'request_status',
             'message',
             'data',
             'read_at',
@@ -603,6 +605,51 @@ class NotificationSerializer(serializers.ModelSerializer):
         if obj.conversation_id is None:
             return None
         return self._status_map().get(obj.conversation_id)
+
+    def get_request_status(self, obj):
+        """For a join request: where THAT request stands now.
+
+        A notification is a record, not a queue - the request it announced may
+        have been approved from the admin panel, declined by another admin, or
+        answered here a moment ago. Without this the client can only offer
+        Approve and Decline forever and find out it was too late by failing.
+
+        None when the row is not a join request, or when the membership it
+        pointed at has since been deleted.
+        """
+        if obj.type != Notification.Type.JOIN_REQUESTED:
+            return None
+        participant_id = (obj.data or {}).get('participant_id')
+        if participant_id is None:
+            return None
+        return self._request_status_map().get(participant_id)
+
+    def _request_status_map(self):
+        """The status of every membership this page's requests point at.
+
+        One query for the page, cached on the shared serializer context, so a
+        feed of twenty requests does not become twenty lookups.
+        """
+        cached = self.context.get('_request_statuses')
+        if cached is not None:
+            return cached
+
+        ids = {
+            (notification.data or {}).get('participant_id')
+            for notification in self.context.get('_page_notifications', [])
+            if notification.type == Notification.Type.JOIN_REQUESTED
+        }
+        ids.discard(None)
+
+        mapping = (
+            dict(
+                Participant.objects.filter(pk__in=ids).values_list('pk', 'status')
+            )
+            if ids
+            else {}
+        )
+        self.context['_request_statuses'] = mapping
+        return mapping
 
     def _status_map(self):
         """Every membership this viewer has, in one query for the whole page.
