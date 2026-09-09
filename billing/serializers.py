@@ -1,6 +1,25 @@
+from urllib.parse import urlsplit
+
+from django.conf import settings
 from rest_framework import serializers
 
 from billing.models import CreditPackage, Plan, Subscription, Wallet
+
+
+def _validate_redirect_url(value):
+    """Refuse a redirect target this API does not already trust.
+
+    success_url/cancel_url/return_url are handed straight to Stripe, which
+    later redirects a real, just-completed customer there - an unvalidated
+    URL here is an open redirect Stripe would carry out on our behalf. Checked
+    against the same origins CORS already trusts, not a separate allowlist.
+    """
+    origin = f'{urlsplit(value).scheme}://{urlsplit(value).netloc}'
+    if origin not in settings.BILLING_ALLOWED_REDIRECT_ORIGINS:
+        raise serializers.ValidationError(
+            'This redirect URL is not on an allowed origin for this app.'
+        )
+    return value
 
 
 class PlanSerializer(serializers.ModelSerializer):
@@ -45,17 +64,17 @@ class WalletSerializer(serializers.ModelSerializer):
 
 class PlanCheckoutRequestSerializer(serializers.Serializer):
     plan_code = serializers.ChoiceField(choices=Plan.Code.choices)
-    success_url = serializers.URLField()
-    cancel_url = serializers.URLField()
+    success_url = serializers.URLField(validators=[_validate_redirect_url])
+    cancel_url = serializers.URLField(validators=[_validate_redirect_url])
 
 
 class CreditCheckoutRequestSerializer(serializers.Serializer):
     package_id = serializers.PrimaryKeyRelatedField(
         queryset=CreditPackage.objects.filter(active=True)
     )
-    success_url = serializers.URLField()
-    cancel_url = serializers.URLField()
+    success_url = serializers.URLField(validators=[_validate_redirect_url])
+    cancel_url = serializers.URLField(validators=[_validate_redirect_url])
 
 
 class BillingPortalRequestSerializer(serializers.Serializer):
-    return_url = serializers.URLField()
+    return_url = serializers.URLField(validators=[_validate_redirect_url])

@@ -358,6 +358,16 @@ EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMA
 # reset today). No trailing slash - callers append their own path.
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://loopdn.com').rstrip('/')
 
+# Origins Stripe Checkout/portal is allowed to redirect back to.
+#
+# success_url/cancel_url/return_url are caller-supplied, and Stripe will
+# redirect a real, just-paid customer to whatever they contain - handing that
+# straight to Stripe unvalidated is an open redirect (and a phishing setup:
+# "you just paid, now here is a look-alike login page"). CORS_ALLOWED_ORIGINS
+# is already the list of frontends this API trusts, so it doubles as the
+# redirect allowlist rather than inventing a second one to keep in sync.
+BILLING_ALLOWED_REDIRECT_ORIGINS = set(CORS_ALLOWED_ORIGINS) | {FRONTEND_URL}
+
 # How long a password-reset link stays valid. This is a real Django setting -
 # django.contrib.auth.tokens.default_token_generator reads it directly, so
 # nothing else has to check the expiry by hand. Also governs any other use of
@@ -630,6 +640,16 @@ REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'loopd.exceptions.api_exception_handler',
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
+    # Scoped throttles opt in per-view (billing checkout/portal today) rather
+    # than through DEFAULT_THROTTLE_CLASSES, so this only bounds the views
+    # that actually name a scope.
+    'DEFAULT_THROTTLE_RATES': {
+        # A Checkout Session is a real call to Stripe's API, not a free local
+        # read - this is what stops a compromised token or a retry loop from
+        # running up Stripe API usage or tripping Stripe's own abuse controls.
+        'billing_checkout': '10/hour',
+        'billing_portal': '20/hour',
+    },
 }
 
 if DEBUG:

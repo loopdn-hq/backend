@@ -76,12 +76,18 @@ class StripeWebhook(APIView):
 
         try:
             # `event['data']['object']` is a Stripe SDK object (Session,
-            # Subscription, ...), not a dict - newer stripe-python versions
-            # raise AttributeError on `.get(...)` against one rather than
-            # falling through to dict behaviour. `_handle` and its helpers
-            # are all written against a plain dict, so convert once here
-            # rather than bracket-accessing everything downstream.
-            self._handle(event_type, event['data']['object'].to_dict())
+            # Subscription, ...) coming from the real `construct_event`, not a
+            # dict - newer stripe-python versions raise AttributeError on
+            # `.get(...)` against one rather than falling through to dict
+            # behaviour. `_handle` and its helpers are all written against a
+            # plain dict, so convert once here rather than bracket-accessing
+            # everything downstream. Tests that stub `construct_event` hand
+            # back an already-plain dict, which has no `.to_dict()` - kept as
+            # is in that case.
+            data_object = event['data']['object']
+            if hasattr(data_object, 'to_dict'):
+                data_object = data_object.to_dict()
+            self._handle(event_type, data_object)
         except Exception:
             # Delete the dedupe row so Stripe's retry can actually reprocess
             # this event rather than being waved through as a duplicate.

@@ -5,7 +5,9 @@ Stripe-event-shaped) so both call the same functions and cannot drift apart -
 a checkout completing and a subscription being restored by support hit the
 same `activate_subscription`, for instance.
 """
+import hashlib
 import logging
+import time
 
 import stripe
 from django.conf import settings
@@ -19,6 +21,22 @@ logger = logging.getLogger(__name__)
 
 class InsufficientCredit(Exception):
     """The wallet does not have enough balance to cover this debit."""
+
+
+def _idempotency_key(*parts, bucket_seconds):
+    """A Stripe idempotency key, stable for `bucket_seconds` then rotating.
+
+    Stripe replays the FIRST response for a given key rather than repeating
+    the side effect, so a double-click, a client retry after a timeout, or a
+    dropped connection right after Stripe received the request all land on
+    the same Checkout Session / customer / portal session instead of a second
+    one. Bucketed by time rather than fixed forever, so a genuine later
+    attempt (the user actually changed their mind and tried again) is not
+    silently handed back a stale, possibly-expired session.
+    """
+    bucket = int(time.time() // bucket_seconds)
+    raw = ':'.join(str(part) for part in (*parts, bucket))
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def get_free_plan():
@@ -70,6 +88,10 @@ def get_or_create_stripe_customer(user):
         email=user.email or None,
         name=user.get_username(),
         metadata={'user_id': str(user.pk)},
+        # A narrow window - just wide enough to survive a genuine retry of
+        # THIS request, not to block a customer legitimately created again
+        # after this one was deleted (see the retrieve() check above it).
+        idempotency_key=_idempotency_key('customer', user.pk, bucket_seconds=60),
     )
     subscription.stripe_customer_id = customer['id']
     subscription.save(update_fields=['stripe_customer_id', 'updated_at'])
@@ -94,6 +116,13 @@ def create_plan_checkout_session(user, plan, success_url, cancel_url):
         cancel_url=cancel_url,
         client_reference_id=str(user.pk),
         metadata={'user_id': str(user.pk), 'plan_code': plan.code},
+        # 5 minutes: long enough that a double-click or a client retrying a
+        # timed-out request reuses this session rather than opening a second
+        # one somebody could also pay, short enough that abandoning this one
+        # and deliberately starting over shortly after still gets a fresh session.
+        idempotency_key=_idempotency_key(
+            'checkout-plan', user.pk, plan.code, bucket_seconds=300
+        ),
     )
 
 
@@ -115,13 +144,21 @@ def create_credit_checkout_session(user, package, success_url, cancel_url):
         cancel_url=cancel_url,
         client_reference_id=str(user.pk),
         metadata={'user_id': str(user.pk), 'credit_package_id': str(package.pk)},
+        # Same reasoning as the plan checkout above.
+        idempotency_key=_idempotency_key(
+            'checkout-credits', user.pk, package.pk, bucket_seconds=300
+        ),
     )
 
 
 def create_billing_portal_session(user, return_url):
     """Stripe's hosted page for managing payment methods and cancelling."""
     customer_id = get_or_create_stripe_customer(user)
-    return stripe.billing_portal.Session.create(customer=customer_id, return_url=return_url)
+    return stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url=return_url,
+        idempotency_key=_idempotency_key('portal', user.pk, bucket_seconds=60),
+    )
 
 
 @transaction.atomic

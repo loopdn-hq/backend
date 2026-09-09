@@ -2,8 +2,10 @@
 import json
 from unittest import mock
 
+from django.conf import settings
 from django.contrib.auth.models import User
-from django.test import TestCase
+from django.core.cache import cache
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -161,3 +163,56 @@ class StripeWebhookTests(TestCase):
                 HTTP_STRIPE_SIGNATURE='bad',
             )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+@override_settings(BILLING_ALLOWED_REDIRECT_ORIGINS={'https://loopdn.com'})
+class PlanCheckoutSecurityTests(TestCase):
+    """success_url/cancel_url validation and the checkout rate limit."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='erin', password='pw')
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.url = reverse('billing:checkout-plan')
+        Plan.objects.filter(code=Plan.Code.PREMIUM).update(
+            stripe_price_id='price_premium_test'
+        )
+        self.payload = {
+            'plan_code': 'premium',
+            'success_url': 'https://loopdn.com/billing/success',
+            'cancel_url': 'https://loopdn.com/billing/cancel',
+        }
+
+    def test_an_untrusted_redirect_origin_is_rejected(self):
+        payload = {**self.payload, 'success_url': 'https://evil.example/steal'}
+        response = self.client.post(self.url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('success_url', response.json()['data'])
+
+    def test_a_trusted_redirect_origin_passes_validation(self):
+        # Fails downstream on the real Stripe call (no live network here),
+        # which is fine - this only proves the URL check itself let it through.
+        with mock.patch(
+            'billing.services.stripe.checkout.Session.create',
+            return_value={'url': 'https://checkout.stripe.com/test'},
+        ):
+            response = self.client.post(self.url, self.payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_checkout_is_rate_limited(self):
+        # DRF's throttle classes bind THROTTLE_RATES from settings once at
+        # import time, so override_settings can't reach them here - this
+        # exercises the real configured rate (settings.REST_FRAMEWORK
+        # ['DEFAULT_THROTTLE_RATES']['billing_checkout']) rather than a
+        # smaller one, and asserts one call past it is refused.
+        limit = int(settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']['billing_checkout'].split('/')[0])
+        with mock.patch(
+            'billing.services.stripe.checkout.Session.create',
+            return_value={'url': 'https://checkout.stripe.com/test'},
+        ):
+            for _ in range(limit):
+                response = self.client.post(self.url, self.payload, format='json')
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+            response = self.client.post(self.url, self.payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)

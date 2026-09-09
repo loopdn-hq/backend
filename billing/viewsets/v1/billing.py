@@ -19,6 +19,7 @@ from billing.serializers import (
     SubscriptionSerializer,
     WalletSerializer,
 )
+from billing.throttles import BillingPortalRateThrottle, CheckoutRateThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ class PlanCheckoutSessionView(APIView):
     """Start a Checkout Session that subscribes the caller to a paid plan."""
 
     permission_classes = [IsAuthenticated]
+    throttle_classes = [CheckoutRateThrottle]
 
     def post(self, request):
         serializer = PlanCheckoutRequestSerializer(data=request.data)
@@ -97,6 +99,7 @@ class CreditCheckoutSessionView(APIView):
     """Start a Checkout Session that tops up the caller's wallet."""
 
     permission_classes = [IsAuthenticated]
+    throttle_classes = [CheckoutRateThrottle]
 
     def post(self, request):
         serializer = CreditCheckoutRequestSerializer(data=request.data)
@@ -121,6 +124,7 @@ class BillingPortalSessionView(APIView):
     """A link to Stripe's hosted page for managing the subscription/cards."""
 
     permission_classes = [IsAuthenticated]
+    throttle_classes = [BillingPortalRateThrottle]
 
     def post(self, request):
         serializer = BillingPortalRequestSerializer(data=request.data)
