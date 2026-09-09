@@ -50,6 +50,27 @@ class NotificationViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
     def get_serializer_class(self):
         return self.serializer_classes.get(self.action, self.serializer_class)
 
+    def get_serializer(self, *args, **kwargs):
+        """Hand the serializer the whole page, not just one row at a time.
+
+        A join request's current status lives on the membership its `data`
+        points at, and resolving that per row would be a query per
+        notification. Materialising the page here lets the serializer look
+        them all up once.
+
+        Set before delegating, because get_serializer_context runs inside the
+        call below.
+        """
+        if kwargs.get('many') and args:
+            self._page_rows = list(args[0])
+            args = (self._page_rows,) + args[1:]
+        return super().get_serializer(*args, **kwargs)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['_page_notifications'] = getattr(self, '_page_rows', [])
+        return context
+
     def get_queryset(self):
         queryset = (
             Notification.objects.filter(to_user=self.request.user)

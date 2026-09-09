@@ -3693,3 +3693,76 @@ class NotificationActionContextTests(EnvelopeAssertions, APITestCase):
             self.client.get(url)
 
         self.assertEqual(len(second), len(first))
+
+
+class JoinRequestNotificationTests(EnvelopeAssertions, APITestCase):
+    """An admin should be able to act on a request from the notification.
+
+    Which means the row has to say WHICH membership is asking. Every review
+    endpoint is keyed on Participant.pk, and that is not the user's id - they
+    differ as soon as somebody is in more than one group, and a phone-only
+    requester has no user id at all.
+    """
+
+    def setUp(self):
+        self.admin = make_user('alice')
+        self.stranger = make_user('bob')
+        self.group = Conversation.start_group(self.admin, name='Pickle')
+        self.group.join_mode = Conversation.JoinMode.APPROVAL
+        self.group.save(update_fields=['join_mode'])
+
+    def test_the_admin_is_told_which_membership_is_asking(self):
+        membership.request_to_join(self.group, user=self.stranger)
+
+        self.client.force_authenticate(self.admin)
+        rows = self.assertSuccess(
+            self.client.get(reverse('chat:notification-list'))
+        )['results']
+        asking = [r for r in rows if r['type'] == 'join.requested'][0]
+
+        pending = Participant.objects.get(
+            conversation=self.group, user=self.stranger
+        )
+        self.assertEqual(asking['data']['participant_id'], pending.pk)
+
+    def test_that_id_is_what_the_review_endpoint_takes(self):
+        membership.request_to_join(self.group, user=self.stranger)
+        pending = Participant.objects.get(
+            conversation=self.group, user=self.stranger
+        )
+
+        self.client.force_authenticate(self.admin)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-requests', args=[self.group.id]),
+                {'participant': pending.pk, 'decision': 'approve'},
+                format='json',
+            )
+        )
+
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, Participant.Status.ACTIVE)
+
+    def test_the_feed_says_whether_a_request_is_still_open(self):
+        # A notification is a record, not a queue. Once the request behind it
+        # has been answered - here, or from the admin panel, or by another
+        # admin - the client has to stop offering to answer it again.
+        membership.request_to_join(self.group, user=self.stranger)
+        pending = Participant.objects.get(
+            conversation=self.group, user=self.stranger
+        )
+
+        self.client.force_authenticate(self.admin)
+        rows = self.assertSuccess(
+            self.client.get(reverse('chat:notification-list'))
+        )['results']
+        asking = [r for r in rows if r['type'] == 'join.requested'][0]
+        self.assertEqual(asking['request_status'], 'pending')
+
+        membership.approve(pending, self.admin)
+
+        rows = self.assertSuccess(
+            self.client.get(reverse('chat:notification-list'))
+        )['results']
+        asking = [r for r in rows if r['type'] == 'join.requested'][0]
+        self.assertEqual(asking['request_status'], 'active')

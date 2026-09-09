@@ -109,7 +109,19 @@ def request_to_join(conversation, *, user=None, phone_number=None,
             Notification.Type.JOIN_REQUESTED,
             from_user=row.user,
             conversation=conversation,
-            data={'display_name': row.display_name} if row.user_id is None else None,
+            # The membership row, so an admin can approve or decline straight
+            # from the notification. Every review endpoint is keyed on
+            # Participant.pk rather than the user's id - the two differ as soon
+            # as somebody belongs to more than one group, and a phone-only
+            # requester has no user id at all.
+            data={
+                'participant_id': row.pk,
+                **(
+                    {'display_name': row.display_name}
+                    if row.user_id is None
+                    else {}
+                ),
+            },
         )
         transaction.on_commit(lambda: broadcast_join_request(conversation, row))
 
