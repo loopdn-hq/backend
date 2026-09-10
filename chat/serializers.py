@@ -5,6 +5,7 @@ from django.conf import settings
 from django.db import transaction
 from rest_framework import serializers
 
+from chat import membership
 from chat.models import (
     Notification,
     Attachment,
@@ -1018,7 +1019,25 @@ class AddMembersSerializer(serializers.Serializer):
     members = serializers.ListField(child=serializers.CharField(), allow_empty=False)
 
     def validate_members(self, values):
-        return resolve_members(values, exclude=None)
+        # `exclude=None`, so `find_user` does NOT drop a blocked pair here.
+        # That is on purpose and it is not the same shortcut the sibling
+        # serializer takes: an admin adding several people needs each name to
+        # resolve or fail on its own merits, and a lookup that silently found
+        # nobody would be reported as "no such user" rather than as a refusal.
+        # The block is enforced below instead, where it can actually refuse.
+        resolved = resolve_members(values, exclude=None)
+
+        # §11 of the blocking spec, on the route people actually use. This was
+        # enforced on invite-by-email and invite-by-number while the ordinary
+        # "add members" endpoint - the one the app calls - went straight to
+        # `add_participant`, which knows only about the admin-imposed block and
+        # nothing about one person blocking another.
+        request = self.context.get('request')
+        adder = getattr(request, 'user', None)
+        for user in resolved:
+            membership._refuse_blocked_invite(adder, user)
+
+        return resolved
 
     @transaction.atomic
     def save(self, **kwargs):

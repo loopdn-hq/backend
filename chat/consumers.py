@@ -136,6 +136,17 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         conversation = await self.get_conversation(content.get('conversation_id'))
         if conversation is None:
             return
+        if await self.direct_contact_is_blocked(conversation):
+            # A blocked direct thread is read-only, and a typing indicator is
+            # the one signal that would still cross it - the other person would
+            # watch them start and stop typing in a conversation neither can
+            # send into. It is person-to-person contact by any reading, so it
+            # stops with the rest.
+            #
+            # Silently, and only here: groups are untouched, and returning an
+            # error would tell the sender something the refusals are careful
+            # not to.
+            return
         await self.channel_layer.group_send(
             conversation_group(conversation.pk),
             {
@@ -144,6 +155,31 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
                 'user_id': self.user.pk,
             },
         )
+
+    @database_sync_to_async
+    def direct_contact_is_blocked(self, conversation):
+        """Whether this is a direct thread between two people who cannot talk.
+
+        False for every group, always: a block is about direct contact and
+        changes nothing about a conversation other people are also in.
+        """
+        from chat.models import Conversation, Participant
+        from user.blocks import blocks_between
+
+        if conversation.kind != Conversation.Kind.DIRECT:
+            return False
+
+        other = (
+            Participant.objects.filter(
+                conversation=conversation, user__isnull=False
+            )
+            .exclude(user=self.user)
+            .select_related('user')
+            .first()
+        )
+        if other is None:
+            return False
+        return blocks_between(self.user, other.user)
 
     # -- outbound (channel layer event -> socket) -------------------------
 

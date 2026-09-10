@@ -899,6 +899,27 @@ def _refuse_blocked_invite(inviter, invitee=None, *, phone_number=None):
     if phone_number is not None:
         if blocks_number(inviter, phone_number):
             raise JoinRefused('Unable to add this person.')
+
+        # And the same number may BE an account. A block is recorded against
+        # whichever identity the blocker named, but the person is one person -
+        # so blocking the account and then being invited by number would have
+        # been a way straight back in, on the identity that was not named.
+        #
+        # Only a VERIFIED number resolves, for the reason it never resolves
+        # anywhere else: an unverified one is a string somebody typed into
+        # their own profile, and honouring it would let a squatter make
+        # themselves unaddressable by claiming a stranger's number.
+        from user.models import Profile
+
+        owner = (
+            Profile.objects.filter(
+                phone_number=phone_number, phone_no_verified=True
+            )
+            .select_related('user')
+            .first()
+        )
+        if owner is not None and blocks_between(inviter, owner.user):
+            raise JoinRefused('Unable to add this person.')
         return
 
     if blocks_between(inviter, invitee):

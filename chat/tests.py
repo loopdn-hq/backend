@@ -4225,6 +4225,110 @@ class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
 
         self.assertEqual(membership.claim_email_invitations(carol), 1)
 
+    def test_adding_me_to_a_group_by_username_is_refused_too(self):
+        # The route the app actually uses, and the one that was open: the
+        # email and bare-number invites checked the block while
+        # POST /conversations/<id>/members/ went straight to add_participant,
+        # which knows only about the admin-imposed block.
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.bob, name='Bobs Group')
+        self.client.force_authenticate(self.bob)
+
+        response = self.client.post(
+            reverse('chat:conversation-members', args=[group.id]),
+            {'members': ['alice']},
+            format='json',
+        )
+
+        self.assertFailure(response)
+        self.assertFalse(
+            Participant.objects.filter(
+                conversation=group, user=self.alice,
+                status=Participant.Status.ACTIVE,
+            ).exists()
+        )
+
+    def test_and_adding_somebody_unrelated_still_works(self):
+        make_user('carol')
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.bob, name='Bobs Group')
+        self.client.force_authenticate(self.bob)
+
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-members', args=[group.id]),
+                {'members': ['carol']},
+                format='json',
+            )
+        )
+
+    def test_inviting_a_blocked_accounts_own_number_is_refused(self):
+        # One person, two identities. A block recorded against the account had
+        # to also stop an invitation addressed to that account's verified
+        # number, or naming the other identity was a way straight back in.
+        self.alice.profile.phone_number = '+639171230001'
+        self.alice.profile.phone_no_verified = True
+        self.alice.profile.save()
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.bob, name='Bobs Group')
+
+        with self.assertRaises(membership.JoinRefused):
+            membership.invite_by_phone(
+                group, '+639171230001', 'A', self.bob
+            )
+
+    def test_but_an_unverified_number_is_not_taken_as_proof(self):
+        # The mirror of the rule everywhere else: an unverified number is a
+        # string somebody typed into their own profile, so honouring it would
+        # let a squatter make themselves unaddressable with a stranger's.
+        carol = make_user('carol')
+        carol.profile.phone_number = '+639171230002'
+        carol.profile.save()
+        from user import blocks
+
+        blocks.block(self.alice, user=carol)
+        group = Conversation.start_group(self.alice, name='Family')
+
+        row = membership.invite_by_phone(
+            group, '+639171230002', 'C', self.alice
+        )
+        self.assertIsNotNone(row.pk)
+
+    def test_a_blocked_direct_thread_does_not_leak_typing(self):
+        # The one signal that would still have crossed a read-only thread:
+        # each would watch the other start and stop typing in a conversation
+        # neither can send into.
+        from asgiref.sync import async_to_sync
+        from chat.consumers import ChatConsumer
+
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        consumer = ChatConsumer()
+        consumer.user = self.alice
+
+        self.assertFalse(
+            async_to_sync(consumer.direct_contact_is_blocked)(conversation)
+        )
+
+        self.block(self.alice, 'bob')
+
+        self.assertTrue(
+            async_to_sync(consumer.direct_contact_is_blocked)(conversation)
+        )
+
+    def test_and_a_group_never_suppresses_typing(self):
+        from asgiref.sync import async_to_sync
+        from chat.consumers import ChatConsumer
+
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+
+        consumer = ChatConsumer()
+        consumer.user = self.alice
+        self.assertFalse(
+            async_to_sync(consumer.direct_contact_is_blocked)(group)
+        )
+
     # --- and the group is untouched -----------------------------------------
 
     def test_a_shared_group_is_not_changed_at_all(self):
