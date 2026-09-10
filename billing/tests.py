@@ -164,6 +164,218 @@ class StripeWebhookTests(TestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_price_created_with_plan_metadata_upserts_plan(self):
+        event = {
+            'id': 'evt_plan_price_1',
+            'type': 'price.created',
+            'data': {'object': {
+                'id': 'price_plan_1',
+                'product': 'prod_plan_1',
+                'unit_amount': 1999,
+                'currency': 'usd',
+                'recurring': {'interval': 'month'},
+                'metadata': {
+                    'data': json.dumps({
+                        'type': 'plan',
+                        'code': 'premium',
+                        'max_groups': 25,
+                        'max_members_per_group': 250,
+                        'max_admins_per_group': 5,
+                        'storage_gb': 10,
+                        'has_whatsapp': True,
+                        'has_telegram': True,
+                        'features': ['Search'],
+                        'is_custom_pricing': False,
+                    })
+                },
+            }},
+        }
+        with mock.patch('stripe.Product.retrieve', return_value={
+            'id': 'prod_plan_1',
+            'name': 'Premium Plus',
+            'active': True,
+            'metadata': {},
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan = Plan.objects.get(code='premium')
+        self.assertEqual(plan.name, 'Premium Plus')
+        self.assertEqual(plan.monthly_price_cents, 1999)
+        self.assertEqual(plan.stripe_price_id, 'price_plan_1')
+        self.assertEqual(plan.max_groups, 25)
+        self.assertEqual(plan.features, ['Search'])
+
+    def test_product_updated_with_credit_metadata_upserts_credit_package(self):
+        event = {
+            'id': 'evt_credit_product_1',
+            'type': 'product.updated',
+            'data': {'object': {
+                'id': 'prod_credit_1',
+                'name': 'Promo Credits',
+                'active': True,
+                'metadata': {
+                    'data': json.dumps({'type': 'credit', 'id': 901})
+                },
+            }},
+        }
+        mocked_prices = mock.Mock()
+        mocked_prices.auto_paging_iter.return_value = iter([{
+            'id': 'price_credit_1',
+            'product': 'prod_credit_1',
+            'unit_amount': 2500,
+            'currency': 'usd',
+            'metadata': {},
+        }])
+        with mock.patch('stripe.Price.list', return_value=mocked_prices):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        package = CreditPackage.objects.get(pk=901)
+        self.assertEqual(package.name, 'Promo Credits')
+        self.assertEqual(package.price_cents, 2500)
+        self.assertEqual(package.credit_cents, 2500)
+        self.assertEqual(package.stripe_product_id, 'prod_credit_1')
+        self.assertEqual(package.stripe_price_id, 'price_credit_1')
+
+    def test_credit_payload_without_id_matches_by_stripe_product_id(self):
+        before_count = CreditPackage.objects.count()
+        package = CreditPackage.objects.create(
+            name='Starter Package',
+            price_cents=500,
+            credit_cents=500,
+            stripe_product_id='prod_credit_optional',
+            stripe_price_id='price_old',
+            active=True,
+        )
+        original_pk = package.pk
+
+        event = {
+            'id': 'evt_credit_optional_id_1',
+            'type': 'price.updated',
+            'data': {'object': {
+                'id': 'price_credit_optional_new',
+                'product': 'prod_credit_optional',
+                'unit_amount': 1500,
+                'currency': 'usd',
+                'metadata': {
+                    'data': json.dumps({'type': 'credit'})
+                },
+            }},
+        }
+        with mock.patch('stripe.Product.retrieve', return_value={
+            'id': 'prod_credit_optional',
+            'name': 'Starter Package Updated',
+            'active': True,
+            'metadata': {},
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(CreditPackage.objects.count(), before_count + 1)
+        package.refresh_from_db()
+        self.assertEqual(package.pk, original_pk)
+        self.assertEqual(package.name, 'Starter Package Updated')
+        self.assertEqual(package.price_cents, 1500)
+        self.assertEqual(package.credit_cents, 1500)
+        self.assertEqual(package.stripe_product_id, 'prod_credit_optional')
+        self.assertEqual(package.stripe_price_id, 'price_credit_optional_new')
+
+    def test_product_deleted_deactivates_matching_plan_and_credit_package(self):
+        plan = Plan.objects.get(code=Plan.Code.PREMIUM)
+        plan.active = True
+        plan.stripe_price_id = 'price_plan_dead'
+        plan.save(update_fields=['active', 'stripe_price_id', 'updated_at'])
+
+        package = CreditPackage.objects.create(
+            name='Delete Me',
+            price_cents=1000,
+            credit_cents=1000,
+            active=True,
+            stripe_price_id='price_credit_dead',
+        )
+
+        event = {
+            'id': 'evt_product_deleted_1',
+            'type': 'product.deleted',
+            'data': {'object': {'id': 'prod_deleted_1', 'deleted': True}},
+        }
+
+        def retrieve_price(price_id):
+            mapping = {
+                'price_plan_dead': {'id': 'price_plan_dead', 'product': 'prod_deleted_1'},
+                'price_credit_dead': {'id': 'price_credit_dead', 'product': 'prod_deleted_1'},
+            }
+            return mapping.get(price_id, {'id': price_id, 'product': 'prod_other'})
+
+        with mock.patch('stripe.Price.retrieve', side_effect=retrieve_price):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan.refresh_from_db()
+        package.refresh_from_db()
+        self.assertFalse(plan.active)
+        self.assertFalse(package.active)
+
+    def test_product_deleted_with_no_corresponding_rows_is_noop(self):
+        plan = Plan.objects.get(code=Plan.Code.BUSINESS)
+        plan.active = True
+        plan.stripe_price_id = 'price_plan_keep'
+        plan.save(update_fields=['active', 'stripe_price_id', 'updated_at'])
+
+        event = {
+            'id': 'evt_product_deleted_2',
+            'type': 'product.deleted',
+            'data': {'object': {'id': 'prod_missing', 'deleted': True}},
+        }
+
+        with mock.patch('stripe.Price.retrieve', return_value={
+            'id': 'price_plan_keep',
+            'product': 'prod_other',
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan.refresh_from_db()
+        self.assertTrue(plan.active)
+
+    def test_product_archived_deactivates_matching_rows(self):
+        plan = Plan.objects.get(code=Plan.Code.PREMIUM)
+        plan.active = True
+        plan.stripe_price_id = 'price_plan_archived'
+        plan.save(update_fields=['active', 'stripe_price_id', 'updated_at'])
+
+        package = CreditPackage.objects.create(
+            name='Archive Me',
+            price_cents=1200,
+            credit_cents=1200,
+            active=True,
+            stripe_product_id='prod_archived_1',
+            stripe_price_id='price_credit_archived',
+        )
+
+        event = {
+            'id': 'evt_product_archived_1',
+            'type': 'product.updated',
+            'data': {'object': {'id': 'prod_archived_1', 'active': False}},
+        }
+
+        def retrieve_price(price_id):
+            mapping = {
+                'price_plan_archived': {'id': 'price_plan_archived', 'product': 'prod_archived_1'},
+                'price_credit_archived': {'id': 'price_credit_archived', 'product': 'prod_archived_1'},
+            }
+            return mapping.get(price_id, {'id': price_id, 'product': 'prod_other'})
+
+        with mock.patch('stripe.Price.retrieve', side_effect=retrieve_price):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan.refresh_from_db()
+        package.refresh_from_db()
+        self.assertFalse(plan.active)
+        self.assertFalse(package.active)
+
 
 @override_settings(BILLING_ALLOWED_REDIRECT_ORIGINS={'https://loopdn.com'})
 class PlanCheckoutSecurityTests(TestCase):

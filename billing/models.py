@@ -70,6 +70,7 @@ class CreditPackage(models.Model):
 
     # Stripe's one-time Price for this package. Blank until synced - see
     # Plan.stripe_price_id above for why.
+    stripe_product_id = models.CharField(max_length=255, blank=True, default='', db_default='')
     stripe_price_id = models.CharField(max_length=255, blank=True, default='', db_default='')
 
     active = models.BooleanField(default=True, db_default=True)
