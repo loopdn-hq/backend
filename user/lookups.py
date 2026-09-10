@@ -18,6 +18,13 @@ The `exclude=None` case is untouched, and one caller relies on that -
 round: a block must never make `find_user` return None THERE, because the
 caller reads None as "nobody has this address" and emails them an invitation.
 Refusing an invitation is the invite path's own job, not this function's.
+
+`apply_blocks=False` is the second exception, and there is exactly one caller.
+Starting a direct conversation has to tell the two sides of a block APART - the
+blocker is told plainly, the blocked person is told nothing - and it cannot do
+that if the person has already been filtered out of existence. It re-resolves
+with the filter off only after the ordinary lookup has already missed, so the
+default stays safe and the slow path costs one extra query on a miss.
 """
 from django.contrib.auth.models import User
 
@@ -31,7 +38,7 @@ def active_users():
     return User.objects.select_related('profile').filter(is_active=True)
 
 
-def find_user(identifier, exclude=None):
+def find_user(identifier, exclude=None, *, apply_blocks=True):
     """Resolve a username, an email address or a phone number to one user.
 
     Returns None if nothing matches.
@@ -66,7 +73,8 @@ def find_user(identifier, exclude=None):
     queryset = active_users()
     if exclude is not None:
         queryset = queryset.exclude(pk=exclude.pk)
-        queryset = queryset.exclude(pk__in=blocked_user_ids(exclude))
+        if apply_blocks:
+            queryset = queryset.exclude(pk__in=blocked_user_ids(exclude))
 
     if identifier.startswith('+'):
         return queryset.filter(

@@ -4098,15 +4098,66 @@ class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
 
         self.assertFailure(self.start_direct('alice'))
 
-    def test_the_refusal_says_the_same_thing_as_a_wrong_username(self):
-        # Nothing may reveal that a block exists - so this is compared
-        # character for character against the answer a name that was never
-        # taken gives.
+    def test_the_blocker_is_told_plainly(self):
+        # The one place the two sides of a block are deliberately treated
+        # differently. A already knows they blocked B, so hiding it buys no
+        # privacy and leaves them at a dead end that looks like a bug.
         self.block(self.alice, 'bob')
-        blocked = self.assertFailure(self.start_direct('bob'))
+
+        refusal = self.assertFailure(self.start_direct('bob'))
+
+        self.assertIn('You blocked this user', refusal['message'])
+
+    def test_but_the_blocked_person_is_told_nothing(self):
+        # For B the answer must be the one a stranger's typo gets, or the
+        # refusal itself announces the block. Compared character for character
+        # against a name that was never taken.
+        self.block(self.alice, 'bob')
+        self.client.force_authenticate(self.bob)
+
+        blocked = self.assertFailure(self.start_direct('alice'))
         missing = self.assertFailure(self.start_direct('nobody-by-that-name'))
 
         self.assertEqual(blocked['message'], missing['message'])
+        self.assertNotIn('block', blocked['message'].lower())
+
+    def test_the_blocker_sees_the_flag_on_a_shared_member_list(self):
+        # What lets a client render "Blocked" beside the name, and the Unblock
+        # action on the profile behind it.
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+
+        listed = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-participants', args=[group.id])
+            )
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        by_name = {
+            (r['user'] or {}).get('username'): r['user'] for r in rows if r['user']
+        }
+        self.assertTrue(by_name['bob']['blocked_by_me'])
+        self.assertFalse(by_name['alice']['blocked_by_me'])
+
+    def test_and_the_blocked_person_sees_no_such_flag(self):
+        # It is never true because somebody blocked YOU - that would announce
+        # the block to the person it was made against.
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+        self.client.force_authenticate(self.bob)
+
+        listed = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-participants', args=[group.id])
+            )
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        by_name = {
+            (r['user'] or {}).get('username'): r['user'] for r in rows if r['user']
+        }
+        self.assertFalse(by_name['alice']['blocked_by_me'])
 
     def test_an_unrelated_person_is_unaffected(self):
         make_user('carol')

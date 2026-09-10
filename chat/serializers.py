@@ -20,6 +20,7 @@ from chat.services import (
     broadcast_conversation_updated,
     create_message,
 )
+from user.blocks import has_blocked
 from user.lookups import find_user
 from user.models import phone_number_validator
 from user.serializers import PublicUserSerializer
@@ -760,22 +761,38 @@ class DirectConversationSerializer(serializers.Serializer):
         help_text='A username, or a phone number in +E.164 form.'
     )
 
+    #: What the blocker is told. Only ever shown to the person who made the
+    #: block - see `validate_identifier`.
+    BLOCKED_BY_ME = 'You blocked this user. Unblock to message them.'
+
+    #: What everybody else is told, blocked or simply mistyped.
+    NOT_FOUND = 'No user found with that username or number.'
+
     def validate_identifier(self, value):
         viewer = self.context['request'].user
         other = find_user(value, exclude=viewer)
-        if other is None:
-            # Deliberately vague: confirming "no such user" for arbitrary
-            # input turns this into a directory oracle.
-            #
-            # A blocked person lands here too, and lands here IDENTICALLY -
-            # `find_user` already drops both sides of a block when it is given
-            # a viewer, so this raise is reached by the same path and says the
-            # same words. That is the §2 rule: nothing may reveal that a block
-            # exists, and a second error message written for blocks would be
-            # exactly such a reveal.
-            raise serializers.ValidationError('No user found with that username or number.')
-        self.other = other
-        return value
+        if other is not None:
+            self.other = other
+            return value
+
+        # Nobody resolved. Either the name is wrong, or `find_user` filtered
+        # out somebody in a block relationship with the viewer - and those two
+        # people must be told different things.
+        #
+        # THE BLOCKER IS TOLD PLAINLY. They already know they blocked somebody,
+        # so hiding it buys no privacy and only leaves them at a dead end that
+        # looks like a bug. THE BLOCKED PERSON IS TOLD NOTHING: for them the
+        # answer must be the one a stranger's typo gets, or the refusal itself
+        # announces the block.
+        #
+        # Which is why this asks `has_blocked` - one direction - rather than
+        # `blocks_between`. It is the only place in the product where the two
+        # sides of a block are deliberately treated differently.
+        candidate = find_user(value, exclude=viewer, apply_blocks=False)
+        if candidate is not None and has_blocked(viewer, candidate):
+            raise serializers.ValidationError(self.BLOCKED_BY_ME)
+
+        raise serializers.ValidationError(self.NOT_FOUND)
 
     def create(self, validated_data):
         conversation, created = Conversation.start_direct(

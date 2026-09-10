@@ -73,6 +73,26 @@ def unblock(blocker, *, user=None, phone_number=None):
     return bool(deleted)
 
 
+def has_blocked(blocker, other):
+    """One direction: did THIS person block that one.
+
+    `blocks_between` is the right question almost everywhere, because a block
+    must behave the same from both sides or it is detectable. This one exists
+    for the one place where the two sides SHOULD differ - what each is told.
+
+    The blocker already knows they blocked somebody, so telling them costs no
+    privacy and saves them a confusing dead end. The blocked person must learn
+    nothing, so they get the answer a stranger would get. Asking this rather
+    than `blocks_between` is how a caller tells those two people apart.
+    """
+    if blocker is None or other is None:
+        return False
+
+    return UserBlock.objects.filter(
+        blocker=blocker, blocked_user=other
+    ).exists()
+
+
 def blocks_between(one, other):
     """Whether EITHER of these two accounts has blocked the other.
 

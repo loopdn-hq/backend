@@ -173,12 +173,12 @@ def _refuse_if_blocked(conversation, sender):
     if other is None:
         return
 
-    from user.blocks import UserBlock, blocks_between
+    from user.blocks import blocks_between, has_blocked
 
     if not blocks_between(sender, other.user):
         return
 
-    if UserBlock.objects.filter(blocker=sender, blocked_user=other.user).exists():
+    if has_blocked(sender, other.user):
         raise PostingNotAllowed(
             'You blocked this person. Unblock them to send a message.'
         )

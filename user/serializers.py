@@ -162,11 +162,39 @@ class PublicUserSerializer(serializers.ModelSerializer):
     """Another user, as seen from a conversation."""
 
     profile = PublicProfileSerializer(read_only=True)
+    blocked_by_me = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'username', 'profile']
+        fields = ['id', 'username', 'profile', 'blocked_by_me']
         read_only_fields = fields
+
+    def get_blocked_by_me(self, obj):
+        """Whether the CALLER has blocked this person.
+
+        One direction, and only ever the caller's own decision. It is never
+        true because somebody blocked the caller - that would announce a block
+        to the person it was made against, which every refusal in this product
+        is written to avoid. So it discloses nothing that `GET /users/me/blocks/`
+        does not already tell the same caller.
+
+        This is what lets a client render §12's two affordances: the `Blocked`
+        marker beside a name in a shared member list, and the `Unblock` action
+        on a profile opened from one. Without it a client would have to fetch
+        the whole block list and join it by hand.
+
+        False whenever there is no request to ask on behalf of - a broadcast
+        payload built inside a consumer has no viewer, and a field that guessed
+        would be guessing about somebody's privacy.
+        """
+        request = self.context.get('request')
+        viewer = getattr(request, 'user', None)
+        if viewer is None or not viewer.is_authenticated:
+            return False
+
+        from user.blocks import has_blocked
+
+        return has_blocked(viewer, obj)
 
 
 class RegisterSerializer(serializers.ModelSerializer):
