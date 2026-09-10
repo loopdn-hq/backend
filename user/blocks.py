@@ -14,6 +14,10 @@ Direct contact only.
     inviting them to a group         refused
     finding them in user search      they do not appear
 
+A block may name an account OR a bare phone number, and the two are the same
+person as soon as that number is verified against that account - see
+`link_number_to_account`, which is what stops signing up being a way round one.
+
 Nothing about a group the two people already share changes: both stay members,
 both keep seeing each other's messages, and both stay in the member list. The
 spec asks for external notifications caused by a blocked member to be
@@ -34,9 +38,13 @@ there. The refusal copy lives at the call sites, not here, because each one has
 a different "nothing to see" to imitate - a search that found nobody, a
 username that resolves to nothing, a conversation that will not take a message.
 """
+import logging
+
 from django.db.models import Q
 
 from user.models import UserBlock
+
+logger = logging.getLogger(__name__)
 
 
 def block(blocker, *, user=None, phone_number=None):
@@ -124,6 +132,67 @@ def blocks_number(blocker, phone_number):
     return UserBlock.objects.filter(
         blocker=blocker, blocked_phone_number=number
     ).exists()
+
+
+def link_number_to_account(user):
+    """Move any block on this account's number onto the account itself.
+
+    Called the first time a number is VERIFIED against an account, which is the
+    moment a bare number stops being an anonymous handset and becomes a person.
+
+    THE ROW MOVES, IT IS NOT COPIED, and that is the whole rule. Somebody who
+    blocked a number blocked whoever was answering it. Once that person has an
+    account, the block is about them:
+
+        before   blocker -> +639171234567
+        after    blocker -> that account, and nothing against the number
+
+    So a carrier reassigning the number later hands a stranger a clean line -
+    which is right. They are not the person anybody blocked, and leaving the
+    number blocked would punish them for inheriting a handset.
+
+    Without this, registering an account would have been a way straight back in
+    - block the number, they sign up, and the block names an identity nobody is
+    using any more. It is the same hole `chat/models.py:_claim_phone_participant`
+    already refuses to leave open for the conversation-level block.
+
+    Returns how many blocks moved. Safe to call twice: the second run finds
+    nothing, because the first left no row against the number.
+    """
+    profile = getattr(user, 'profile', None)
+    number = _normalised(getattr(profile, 'phone_number', None))
+    if number is None or not getattr(profile, 'phone_no_verified', False):
+        return 0
+
+    moved = 0
+    for row in UserBlock.objects.filter(blocked_phone_number=number):
+        if row.blocker_id == user.pk:
+            # They blocked their own number - which people do, by typo or by
+            # blocking a number they later claim. A self-block is refused by a
+            # constraint and means nothing, so it goes rather than converts.
+            row.delete()
+            continue
+
+        if UserBlock.objects.filter(
+            blocker_id=row.blocker_id, blocked_user=user
+        ).exists():
+            # This blocker already blocked the account by name. Two rows for
+            # one person is the ambiguity the model exists to prevent - and it
+            # would make unblocking a guess about which one to delete.
+            row.delete()
+            continue
+
+        row.blocked_user = user
+        row.blocked_phone_number = None
+        row.save(update_fields=['blocked_user', 'blocked_phone_number'])
+        moved += 1
+
+    if moved:
+        logger.info(
+            'Moved %s phone block(s) onto account %s after verification',
+            moved, user.pk,
+        )
+    return moved
 
 
 def blocked_user_ids(viewer):

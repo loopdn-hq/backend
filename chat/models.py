@@ -373,7 +373,9 @@ class Conversation(models.Model):
         that number.
 
         A blocked phone row is never claimed either. Registering an account
-        against a number that was blocked must not be a way back in.
+        against a number that was blocked must not be a way back in. Nor is one
+        that somebody in a block relationship with this account invited - see
+        the guard below.
         """
         profile = getattr(user, 'profile', None)
         if profile is None or not (profile.phone_no_verified and profile.phone_number):
@@ -393,6 +395,24 @@ class Conversation(models.Model):
             raise BlockedFromConversation(
                 'That number is blocked from this conversation.'
             )
+
+        # And the same refusal the EMAIL claim path makes, for the same reason
+        # - see chat/membership.py:claim_email_invitations.
+        #
+        # An invitation addressed to an UNVERIFIED number cannot be checked
+        # against a user-level block when it is sent, because an unverified
+        # number resolves to nobody on purpose. So somebody who has been
+        # blocked could invite the blocker's number, and the row would sit
+        # dormant until this moment - which is the first moment the number has
+        # an owner at all, and therefore the first moment the block can be
+        # read.
+        #
+        # The row is left behind rather than claimed: dormant, granting
+        # nothing, and not re-creatable by a second invitation.
+        from user.blocks import blocks_between
+
+        if phone_row.added_by_id and blocks_between(user, phone_row.added_by):
+            return None
 
         existing = Participant.objects.filter(conversation=self, user=user).first()
         if existing is None:

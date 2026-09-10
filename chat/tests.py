@@ -4380,6 +4380,49 @@ class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
             async_to_sync(consumer.direct_contact_is_blocked)(group)
         )
 
+    def test_an_unverified_number_is_not_a_way_round_the_invite_refusal(self):
+        # The phone twin of the email hole. An invitation addressed to an
+        # UNVERIFIED number cannot be checked against a block when it is sent,
+        # because an unverified number resolves to nobody on purpose. So the
+        # refusal has to happen when the row would become real.
+        carol = make_user('carol')
+        self.block(self.alice, 'carol')
+        group = Conversation.start_group(self.alice, name='Family')
+
+        # Alice invites a number Carol has not verified yet.
+        membership.invite_by_phone(group, '+639171230009', 'C', self.alice)
+        self.assertTrue(
+            Participant.objects.filter(
+                conversation=group, phone_number='+639171230009'
+            ).exists()
+        )
+
+        # Carol verifies it and the row would fold into her account.
+        carol.profile.phone_number = '+639171230009'
+        carol.profile.phone_no_verified = True
+        carol.profile.save()
+
+        self.assertIsNone(group._claim_phone_participant(carol))
+        self.assertFalse(
+            Participant.objects.filter(
+                conversation=group, user=carol,
+                status=Participant.Status.ACTIVE,
+            ).exists()
+        )
+
+    def test_but_an_ordinary_phone_invitation_still_claims(self):
+        carol = make_user('carol')
+        group = Conversation.start_group(self.alice, name='Family')
+        membership.invite_by_phone(group, '+639171230010', 'C', self.alice)
+
+        carol.profile.phone_number = '+639171230010'
+        carol.profile.phone_no_verified = True
+        carol.profile.save()
+
+        claimed = group._claim_phone_participant(carol)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.user_id, carol.pk)
+
     # --- and the group is untouched -----------------------------------------
 
     def test_a_shared_group_is_not_changed_at_all(self):

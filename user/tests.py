@@ -1289,6 +1289,11 @@ class UserBlockTests(EnvelopeAssertions, APITestCase):
     def block(self, **payload):
         return self.client.post(reverse('user:user-me-block'), payload, format='json')
 
+    def blocked_rows(self):
+        from user.models import UserBlock
+
+        return UserBlock.objects.filter(blocker=self.alice)
+
     def unblock(self, **payload):
         return self.client.post(
             reverse('user:user-me-unblock'), payload, format='json'
@@ -1353,6 +1358,105 @@ class UserBlockTests(EnvelopeAssertions, APITestCase):
         self.client.force_authenticate(self.bob)
 
         self.assertEqual(self.blocked_list(), [])
+
+    # --- a number becomes a person -------------------------------------------
+
+    def verify(self, user, number):
+        """Verify a number against an account, the way otp/services does."""
+        from user import blocks
+
+        profile = user.profile
+        profile.phone_number = number
+        profile.phone_no_verified = True
+        profile.save(update_fields=['phone_number', 'phone_no_verified'])
+        return blocks.link_number_to_account(user)
+
+    def test_a_number_block_follows_the_number_onto_its_account(self):
+        # Otherwise signing up is a clean way back in: block the number, they
+        # register, and the block names an identity nobody uses any more.
+        from user import blocks
+
+        self.block(phone_number='+639171234567')
+
+        self.assertEqual(self.verify(self.bob, '+639171234567'), 1)
+
+        self.assertTrue(blocks.blocks_between(self.alice, self.bob))
+
+    def test_and_the_row_MOVES_rather_than_being_copied(self):
+        # "The block follows the account, not future owners of the number."
+        # So nothing is left against the number for the next person to inherit.
+        from user.models import UserBlock
+
+        self.block(phone_number='+639171234567')
+        self.verify(self.bob, '+639171234567')
+
+        rows = UserBlock.objects.filter(blocker=self.alice)
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(rows.first().blocked_user_id, self.bob.pk)
+        self.assertIsNone(rows.first().blocked_phone_number)
+
+    def test_so_the_next_owner_of_that_number_is_not_blocked(self):
+        from user import blocks
+
+        self.block(phone_number='+639171234567')
+        self.verify(self.bob, '+639171234567')
+
+        # The carrier reassigns it. A stranger is not the person anybody
+        # blocked, and inheriting a handset must not inherit a block.
+        self.bob.profile.phone_number = None
+        self.bob.profile.save(update_fields=['phone_number'])
+        carol = User.objects.create_user(username='carol', password='x')
+        self.verify(carol, '+639171234567')
+
+        self.assertFalse(blocks.blocks_between(self.alice, carol))
+        self.assertTrue(blocks.blocks_between(self.alice, self.bob))
+
+    def test_blocking_my_own_number_just_goes_away(self):
+        # People do this by typo, or by blocking a number they later claim.
+        # A self-block is refused by a constraint and means nothing.
+        from user.models import UserBlock
+
+        self.block(phone_number='+639171234567')
+
+        self.verify(self.alice, '+639171234567')
+
+        self.assertFalse(UserBlock.objects.filter(blocker=self.alice).exists())
+
+    def test_a_duplicate_is_collapsed_rather_than_doubled(self):
+        # Blocking both the account and its number leaves ONE row - two would
+        # make unblocking a guess about which to delete.
+        from user.models import UserBlock
+
+        self.block(username='bob')
+        self.block(phone_number='+639171234567')
+
+        self.verify(self.bob, '+639171234567')
+
+        self.assertEqual(UserBlock.objects.filter(blocker=self.alice).count(), 1)
+
+    def test_running_it_twice_changes_nothing(self):
+        from user import blocks
+        from user.models import UserBlock
+
+        self.block(phone_number='+639171234567')
+        self.verify(self.bob, '+639171234567')
+
+        self.assertEqual(blocks.link_number_to_account(self.bob), 0)
+        self.assertEqual(UserBlock.objects.filter(blocker=self.alice).count(), 1)
+
+    def test_an_unverified_number_moves_nothing(self):
+        from user import blocks
+        from user.models import UserBlock
+
+        self.block(phone_number='+639171234567')
+        profile = self.bob.profile
+        profile.phone_number = '+639171234567'
+        profile.save(update_fields=['phone_number'])
+
+        self.assertEqual(blocks.link_number_to_account(self.bob), 0)
+        self.assertIsNotNone(
+            UserBlock.objects.get(blocker=self.alice).blocked_phone_number
+        )
 
     # --- search -------------------------------------------------------------
 
