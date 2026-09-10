@@ -9,3 +9,4 @@ class ChatConfig(AppConfig):
         # Registers the signal handlers and the system checks. Imported here
         # rather than at module level so the app registry is populated first.
         from chat import checks  # noqa: F401
+        from chat import signals  # noqa: F401

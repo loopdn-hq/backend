@@ -28,7 +28,8 @@ from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 
-from chat.models import Participant
+from chat import delivery, membership
+from chat.models import ChannelConsent, Participant
 from sms import segments
 from sms.client import SmsError, is_allowed_destination, send_text
 from sms.models import GroupNumber, SmsDelivery, SmsSettings
@@ -70,37 +71,30 @@ def recipients_for(message):
     Returns (send_to, skipped) where `skipped` carries a reason per person, so
     the delivery log can answer for its own omissions.
     """
-    conversation = message.conversation
-    rows = (
-        Participant.objects.filter(
-            conversation=conversation, status=Participant.Status.ACTIVE
-        )
-        .exclude(pk=message.sender_participant_id)
-        .select_related('user__profile')
+    send_to, skipped = delivery.eligible_for(
+        message, ChannelConsent.Channel.SMS
     )
 
-    send_to, skipped = [], []
-    for row in rows:
-        reason = _refusal_reason(row)
+    # The shared ladder answers the membership question. Whether there is a
+    # number we may text is SMS's own, and is asked here.
+    textable, no_address = [], []
+    for row in send_to:
+        reason = _address_reason(row)
         if reason is None:
-            send_to.append(row)
+            textable.append(row)
         else:
-            skipped.append((row, reason))
-    return send_to, skipped
+            no_address.append((row, reason))
+
+    return textable, skipped + no_address
 
 
-def _refusal_reason(participant):
-    """Why this member must not be texted, or None if they may be."""
-    if not participant.sms_enabled:
-        return 'sms disabled for this group'
-    if participant.muted:
-        return 'muted'
-    if participant.sms_consent == Participant.Consent.STOPPED:
-        return 'opted out'
+def _address_reason(participant):
+    """Why there is no number we may text, or None if there is one.
 
+    Only the address question - membership, muting and consent were settled by
+    chat.delivery before this is reached.
+    """
     if participant.user_id is None:
-        if participant.sms_consent != Participant.Consent.GRANTED:
-            return 'consent not granted'
         number = participant.phone_number
     else:
         # An account member is texted on the number they verified when they
@@ -542,13 +536,39 @@ def send_notice(conversation, participant, text, *, kind='notice'):
     if not number:
         return None
 
-    if participant.sms_consent == Participant.Consent.STOPPED:
+    consent = membership.consent_status(
+        participant, ChannelConsent.Channel.SMS
+    )
+
+    if consent in (
+        ChannelConsent.Status.OPTED_OUT,
+        ChannelConsent.Status.DECLINED,
+    ):
         return _record_notice(
             conversation, participant, SmsDelivery.Status.SKIPPED,
             reason='opted out',
         )
 
-    if kind != 'invitation' and participant.sms_consent == Participant.Consent.PENDING:
+    # The delivery switches, as well as the answer. This used to read consent
+    # alone, which meant the two could disagree and the notice would believe
+    # the wrong one: an admin who switched SMS off for a member, or a STOP that
+    # set the switch on every group this number belongs to, left a consent row
+    # still saying opted in - and a membership notice went out to somebody who
+    # should not have been texted at all.
+    if not participant.sms_enabled:
+        return _record_notice(
+            conversation, participant, SmsDelivery.Status.SKIPPED,
+            reason='sms disabled for this group',
+        )
+
+    profile = getattr(participant.user, 'profile', None) if participant.user_id else None
+    if profile is not None and not profile.sms_enabled:
+        return _record_notice(
+            conversation, participant, SmsDelivery.Status.SKIPPED,
+            reason='sms disabled account-wide',
+        )
+
+    if kind != 'invitation' and consent == ChannelConsent.Status.PENDING:
         # They have not answered the invitation yet, so no group traffic and no
         # chatter - only the invitation itself.
         return _record_notice(

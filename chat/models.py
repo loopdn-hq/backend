@@ -433,7 +433,6 @@ class Conversation(models.Model):
                 'added_by': added_by,
                 'role': Participant.Role.MEMBER,
                 'sms_enabled': True,
-                'sms_consent': Participant.Consent.PENDING,
             },
         )
         return participant
@@ -556,18 +555,6 @@ class Participant(models.Model):
         # not by texting JOIN, not by an admin adding them again by mistake.
         BLOCKED = 'blocked', 'Blocked'
 
-    class Consent(models.TextChoices):
-        # An account holder agreed to SMS in their own settings, so there is
-        # nothing to collect here.
-        NOT_REQUIRED = 'not_required', 'Not required'
-        # A phone-only member has been texted an invitation and has not
-        # answered. No group traffic reaches them in this state.
-        PENDING = 'pending', 'Pending'
-        GRANTED = 'granted', 'Granted'
-        # They replied STOP. Never text this row again, whatever the settings
-        # elsewhere say.
-        STOPPED = 'stopped', 'Stopped'
-
     conversation = models.ForeignKey(
         Conversation,
         on_delete=models.CASCADE,
@@ -648,12 +635,6 @@ class Participant(models.Model):
     # to text anybody it cannot address, so this flag is about intent and the
     # verified number is what makes it happen.
     sms_enabled = models.BooleanField(default=True, db_default=True)
-    sms_consent = models.CharField(
-        max_length=12,
-        choices=Consent.choices,
-        default=Consent.NOT_REQUIRED,
-        db_default=Consent.NOT_REQUIRED,
-    )
     consent_sent_at = models.DateTimeField(null=True, blank=True)
     consent_at = models.DateTimeField(null=True, blank=True)
     # Verbatim text of the invitation we sent. Kept because "what exactly were
@@ -1058,3 +1039,84 @@ class Notification(models.Model):
 
     def __str__(self):
         return f'{self.get_type_display()} -> {self.to_user_id}'
+
+
+class ChannelConsent(models.Model):
+    """One member's answer about one channel, for one group.
+
+    Consent is per person, per group, per channel, because all three vary
+    independently: somebody can want texts from Family and not from Work, and
+    email from both. A column per channel on the membership row would mean a
+    migration every time a channel is added, and the columns would have to
+    agree with each other by convention rather than by shape.
+
+    NOT the same question as `Participant.sms_enabled`. That is whether the
+    channel is available for this membership at all - a delivery setting an
+    admin screen also touches. This is the member's own answer, which only they
+    can give. Both have to be true to send, and conflating them is how somebody
+    an admin switched off gets counted as having declined.
+
+    DECLINED and OPTED_OUT are deliberately different states. Declining is a
+    decision about ONE group and leaves every other group alone; opting out is
+    the carrier-mandated STOP, which is about LoopD'n as a whole and must be
+    honoured everywhere, whatever any group's settings say.
+    """
+
+    class Channel(models.TextChoices):
+        SMS = 'sms', 'SMS'
+        EMAIL = 'email', 'Email'
+        VOICE = 'voice', 'Voice'
+
+    class Status(models.TextChoices):
+        # Asked and not yet answered. Nothing is delivered in this state: the
+        # invitation went out, and silence is not agreement.
+        PENDING = 'pending', 'Pending'
+        OPTED_IN = 'opted_in', 'Opted in'
+        # Said no to THIS group. Other groups are unaffected.
+        DECLINED = 'declined', 'Declined'
+        # Provider-level STOP. Never deliver on this channel again, whatever
+        # this group or any other has been told.
+        OPTED_OUT = 'opted_out', 'Opted out'
+
+    participant = models.ForeignKey(
+        Participant,
+        related_name='channel_consents',
+        on_delete=models.CASCADE,
+    )
+    channel = models.CharField(max_length=8, choices=Channel.choices)
+    status = models.CharField(
+        max_length=10,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_default=Status.PENDING,
+    )
+
+    # When, not whether. "They agreed on the 3rd" is the question a consent
+    # complaint actually turns on, and a boolean cannot answer it.
+    consented_at = models.DateTimeField(null=True, blank=True)
+    opted_out_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            # One answer per member per channel. Two rows would let the
+            # delivery check pick either one and be right about neither.
+            models.UniqueConstraint(
+                fields=['participant', 'channel'],
+                name='unique_participant_channel_consent',
+            ),
+        ]
+        indexes = [
+            # The fan-out's question: this member's answer for this channel.
+            models.Index(fields=['participant', 'channel']),
+        ]
+
+    def __str__(self):
+        return f'{self.get_channel_display()}: {self.get_status_display()}'
+
+    @property
+    def allows_delivery(self):
+        """Whether this answer permits sending. The only state that does."""
+        return self.status == self.Status.OPTED_IN

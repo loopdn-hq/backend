@@ -24,6 +24,7 @@ from django.utils import timezone
 
 from chat.models import (
     BlockedFromConversation,
+    ChannelConsent,
     Conversation,
     Notification,
     Participant,
@@ -173,9 +174,13 @@ def request_to_join(conversation, *, user=None, phone_number=None,
         # which is the whole reason JOIN is a better front door than adding
         # somebody's number on their behalf and hoping they consent later.
         sms_enabled=True,
-        sms_consent=Participant.Consent.GRANTED,
         consent_at=timezone.now(),
         consent_text='Sent JOIN to the group number.',
+    )
+    set_channel_consent(
+        created_by_text,
+        ChannelConsent.Channel.SMS,
+        ChannelConsent.Status.OPTED_IN,
     )
     _announce_if_pending(created_by_text)
     return created_by_text
@@ -432,6 +437,38 @@ def clear_history(participant):
     if fields:
         participant.save(update_fields=fields)
     return participant
+
+
+def set_channel_consent(participant, channel, status, *, when=None):
+    """Record this member's answer about one channel. The only way to set it.
+
+    One entry point, for the reason the rest of this module has one: the REST
+    API, an inbound text and a Celery sweep all have to leave the same record,
+    and three copies of "and also stamp consented_at" is three chances to
+    forget one. A consent record that cannot say when somebody agreed is not
+    much of a record.
+    """
+    consent, _ = ChannelConsent.objects.get_or_create(
+        participant=participant, channel=channel
+    )
+
+    stamp = when or timezone.now()
+    consent.status = status
+    if status == ChannelConsent.Status.OPTED_IN:
+        consent.consented_at = stamp
+    elif status == ChannelConsent.Status.OPTED_OUT:
+        consent.opted_out_at = stamp
+
+    consent.save(update_fields=['status', 'consented_at', 'opted_out_at', 'updated_at'])
+    return consent
+
+
+def consent_status(participant, channel):
+    """This member's answer for one channel, or None if there is no record."""
+    consent = ChannelConsent.objects.filter(
+        participant=participant, channel=channel
+    ).first()
+    return consent.status if consent else None
 
 
 def set_archived(participant, archived):
@@ -923,25 +960,42 @@ def invite_by_phone(conversation, phone_number, display_name, by):
         phone_number, display_name=display_name, added_by=by
     )
 
-    if participant.sms_consent == Participant.Consent.GRANTED:
-        # Already agreed - they texted JOIN at some point, or accepted an
-        # earlier invitation. Re-inviting must not reset that.
+    answer = consent_status(participant, ChannelConsent.Channel.SMS)
+    if answer is not None and answer != ChannelConsent.Status.PENDING:
+        # They have already answered this group's question - YES, NO, or a
+        # carrier-level STOP - and re-inviting is not a new question. Only a
+        # PENDING invitation is sent again, because a pending one is the only
+        # kind that may simply never have arrived.
+        #
+        # Preserving OPTED_IN alone was not enough. Resetting anything else to
+        # PENDING made "no" mean "not yet": whoever added the member next
+        # cleared the decline and texted them again, and did the same to a
+        # number that had replied STOP - the one thing a carrier audit tests
+        # for, and not something an admin's word should be able to undo.
+        #
+        # Both are recoverable, by the member and only by the member: YES
+        # turns a declined group back on, START undoes a STOP.
+        logger.info(
+            'Not re-asking participant %s for SMS consent; already %s',
+            participant.pk, answer,
+        )
         return participant
 
     inviter = getattr(getattr(by, 'profile', None), 'display_label', None) or 'Somebody'
     text = (
         f'{inviter} added you to {conversation.name} on LoopD. '
-        'Reply YES to join, STOP to never hear from us.'
+        'Reply YES to receive this group by text, NO to decline. '
+        'STOP to never hear from us.'
     )
 
-    participant.sms_consent = Participant.Consent.PENDING
+    set_channel_consent(
+        participant, ChannelConsent.Channel.SMS, ChannelConsent.Status.PENDING
+    )
     participant.consent_sent_at = timezone.now()
     # The exact words they were shown. A consent complaint turns on what was
     # actually sent, and the template will have changed by the time anyone asks.
     participant.consent_text = text
-    participant.save(
-        update_fields=['sms_consent', 'consent_sent_at', 'consent_text']
-    )
+    participant.save(update_fields=['consent_sent_at', 'consent_text'])
 
     transaction.on_commit(
         lambda: send_notice(conversation, participant, text, kind='invitation')

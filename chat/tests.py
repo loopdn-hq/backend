@@ -19,9 +19,10 @@ from rest_framework import status
 from rest_framework.test import APITestCase, APITransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from chat import membership
+from chat import delivery, membership
 from sms import inbound
 from chat.models import (
+    ChannelConsent,
     Attachment,
     BlockedFromConversation,
     Conversation,
@@ -32,6 +33,27 @@ from chat.models import (
 from chat.serializers import ConversationSerializer
 from chat.services import create_message
 from user.tests import EnvelopeAssertions, make_image_upload
+
+def grant_sms(participant, status):
+    """Set a member's SMS consent, the way production does.
+
+    Through membership.set_channel_consent rather than by writing the row, so
+    a test sets consent by the same route the app does and cannot drift from
+    it - which is the whole reason that entry point exists.
+    """
+    from chat import membership
+
+    return membership.set_channel_consent(
+        participant, ChannelConsent.Channel.SMS, status
+    )
+
+
+def sms_consent_of(participant):
+    """A member's SMS consent status, or None if there is no record."""
+    from chat import membership
+
+    return membership.consent_status(participant, ChannelConsent.Channel.SMS)
+
 
 MEDIA_ROOT = tempfile.mkdtemp(prefix='loopd-chat-media-')
 
@@ -2591,7 +2613,7 @@ class GroupCreationWithSettingsTests(EnvelopeAssertions, APITestCase):
             conversation_id=data['id'], phone_number='+639171111111'
         )
         self.assertEqual(mom.status, Participant.Status.ACTIVE)
-        self.assertEqual(mom.sms_consent, Participant.Consent.PENDING)
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.PENDING)
 
     def test_an_unreachable_invite_does_not_lose_the_group(self):
         # The group and its real members are already committed; losing them
@@ -3766,3 +3788,113 @@ class JoinRequestNotificationTests(EnvelopeAssertions, APITestCase):
         )['results']
         asking = [r for r in rows if r['type'] == 'join.requested'][0]
         self.assertEqual(asking['request_status'], 'active')
+
+
+class DeliveryEngineTests(EnvelopeAssertions, APITestCase):
+    """The one ladder every channel asks before sending anything.
+
+    Written against the engine rather than through SMS, because the whole
+    reason it exists is that email and voice will ask it too - and a rule only
+    the SMS tests cover is a rule the next channel can quietly get wrong.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.bob_row = Participant.objects.get(
+            conversation=self.group, user=self.bob
+        )
+
+    def post(self):
+        return create_message(self.group, self.alice, text='Dinner at 7')
+
+    def refusal(self):
+        return delivery.refusal_reason(
+            self.bob_row, ChannelConsent.Channel.SMS
+        )
+
+    # --- what stops delivery ------------------------------------------------
+
+    def test_a_member_who_left_is_refused(self):
+        self.bob_row.status = Participant.Status.LEFT
+        self.bob_row.save(update_fields=['status'])
+
+        self.assertEqual(self.refusal(), 'not an active member')
+
+    def test_a_muted_member_is_refused(self):
+        membership.set_muted(self.bob_row, True)
+
+        self.assertEqual(self.refusal(), 'muted')
+
+    def test_a_member_who_declined_is_refused(self):
+        membership.set_channel_consent(
+            self.bob_row,
+            ChannelConsent.Channel.SMS,
+            ChannelConsent.Status.DECLINED,
+        )
+
+        self.assertEqual(self.refusal(), 'declined this group')
+
+    def test_a_member_who_opted_out_is_refused(self):
+        membership.set_channel_consent(
+            self.bob_row,
+            ChannelConsent.Channel.SMS,
+            ChannelConsent.Status.OPTED_OUT,
+        )
+
+        self.assertEqual(self.refusal(), 'opted out')
+
+    def test_a_channel_switched_off_for_this_group_is_refused(self):
+        self.bob_row.sms_enabled = False
+        self.bob_row.save(update_fields=['sms_enabled'])
+
+        self.assertEqual(self.refusal(), 'sms disabled for this group')
+
+    # --- what does NOT stop delivery ----------------------------------------
+
+    def test_archiving_does_not_stop_delivery(self):
+        # The rule most easily got wrong, and the reason it is stated here
+        # rather than left to each channel: archive hides a conversation from
+        # a list. Muting is how somebody asks for silence.
+        membership.set_archived(self.bob_row, True)
+
+        self.assertIsNone(self.refusal())
+
+    def test_an_ordinary_member_is_eligible(self):
+        self.assertIsNone(self.refusal())
+
+    # --- the audience -------------------------------------------------------
+
+    def test_the_sender_is_never_in_their_own_audience(self):
+        message = self.post()
+
+        send_to, _ = delivery.eligible_for(
+            message, ChannelConsent.Channel.SMS
+        )
+
+        self.assertNotIn(
+            message.sender_participant_id, [row.pk for row in send_to]
+        )
+
+    def test_every_omission_carries_its_reason(self):
+        membership.set_muted(self.bob_row, True)
+
+        send_to, skipped = delivery.eligible_for(
+            self.post(), ChannelConsent.Channel.SMS
+        )
+
+        self.assertEqual(send_to, [])
+        self.assertEqual([reason for _, reason in skipped], ['muted'])
+
+    def test_a_new_member_has_an_answer_on_record(self):
+        # A missing row reads as a refusal, so a membership created by any
+        # route without one would silently stop receiving anything.
+        carol = make_user('carol')
+        self.group.add_participant(carol)
+        row = Participant.objects.get(conversation=self.group, user=carol)
+
+        self.assertIsNotNone(
+            membership.consent_status(row, ChannelConsent.Channel.SMS)
+        )

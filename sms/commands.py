@@ -29,13 +29,22 @@ UNMUTE = 'unmute'
 LEAVE = 'leave'
 STOP = 'stop'
 START = 'start'
+# Group-level, and deliberately not the same thing as START/STOP. YES and NO
+# answer "do you want THIS group by text"; START and STOP are the carrier's
+# words and are about LoopD'n as a whole. Somebody who declines one group
+# still hears from the others.
+YES = 'yes'
+NO = 'no'
 
 # The carrier-mandated opt-out words. Every one of these has to work on every
 # route, whatever the product would otherwise like them to mean - a carrier
 # audit tests them literally.
 _STOP_WORDS = {'STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT'}
-# The matching opt-in words, same reason.
-_START_WORDS = {'START', 'UNSTOP', 'YES'}
+# The matching opt-in words, same reason. YES is NOT among them: a carrier
+# audit tests START and UNSTOP, while YES is the answer to a group's own
+# invitation - and treating it as a global opt-in would let answering one
+# group's question quietly change a setting for every other.
+_START_WORDS = {'START', 'UNSTOP'}
 _HELP_WORDS = {'HELP', 'INFO'}
 
 _SINGLE_WORD = {
@@ -46,6 +55,12 @@ _SINGLE_WORD = {
     'UNMUTE': UNMUTE,
     'LEAVE': LEAVE,
     'JOIN': JOIN,
+    # YES and NO only - not Y, N, OK, SURE or a thumbs up. The use cases are
+    # explicit that a pending member sending anything else is ignored, and the
+    # reason is that a guess here is a guess about consent: reading "Y" as
+    # agreement is how somebody who never answered starts getting texted.
+    'YES': YES,
+    'NO': NO,
 }
 
 # Trailing noise a phone adds on its own. Not stripped from the middle of a
