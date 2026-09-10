@@ -38,9 +38,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from otp.models import OtpError
 from otp.services import start_email_verification
+from user import blocks
 from user.lookups import search_users
-from user.models import Profile
+from user.models import Profile, UserBlock
 from user.serializers import (
+    BlockedEntrySerializer,
+    BlockSerializer,
     ChangePasswordSerializer,
     ForgotPasswordSerializer,
     GoogleCredentialSerializer,
@@ -110,6 +113,8 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         'change_password': ChangePasswordSerializer,
         'me': UserSerializer,
         'profile': ProfileSerializer,
+        'block': BlockSerializer,
+        'unblock': BlockSerializer,
     }
 
     success_messages = {
@@ -129,6 +134,9 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         'profile:PATCH': 'Profile updated.',
         'retrieve': 'User fetched.',
         'search': 'Search complete.',
+        'blocks:GET': 'Blocked list fetched.',
+        'block': 'Blocked.',
+        'unblock': 'Unblocked.',
     }
 
     def get_serializer_class(self):
@@ -420,6 +428,54 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         if page is not None:
             return self.get_paginated_response(serializer.data)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='me/blocks', url_name='me-blocks')
+    def blocks(self, request):
+        """Everybody I have blocked.
+
+        Mine alone, and only ever mine: nothing anywhere tells one person that
+        another has blocked them, which is why there is no route that reads
+        somebody else's list.
+        """
+        rows = (
+            UserBlock.objects.filter(blocker=request.user)
+            .select_related('blocked_user__profile')
+        )
+        return Response(BlockedEntrySerializer(rows, many=True).data)
+
+    @action(detail=False, methods=['post'], url_path='me/blocks/add', url_name='me-block')
+    def block(self, request):
+        """Stop direct contact with one person.
+
+        Stops direct messages both ways, stops either of us adding the other to
+        a group, and takes them out of my search results. It does NOT touch any
+        group we already share: we both stay members, we both still see each
+        other's messages there, and neither of us is told anything about the
+        other's membership changing.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        blocks.block(
+            request.user,
+            user=serializer.validated_data['target_user'],
+            phone_number=serializer.validated_data['target_number'],
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=['post'], url_path='me/blocks/remove',
+            url_name='me-unblock')
+    def unblock(self, request):
+        """Undo it. Answers the same whether or not there was anything to undo."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        blocks.unblock(
+            request.user,
+            user=serializer.validated_data['target_user'],
+            phone_number=serializer.validated_data['target_number'],
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def _retrieve_or_update(self, request, instance):
         """GET and PATCH against one object, shared by `me` and `profile`."""

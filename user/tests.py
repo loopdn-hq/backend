@@ -1266,3 +1266,111 @@ class EmailPreferenceTests(EnvelopeAssertions, APITestCase):
             )
 
         self.assertEqual(post.call_count, 1)
+
+
+class UserBlockTests(EnvelopeAssertions, APITestCase):
+    """Blocking a person, and what it does and does not reach.
+
+    The rule under test is narrow on purpose: this release blocks DIRECT
+    contact only. A shared group is untouched - both people stay members, both
+    still see each other's messages there - and there is a test below that pins
+    that, because the easy mistake is to make a block quietly remove somebody.
+    """
+
+    def setUp(self):
+        self.alice = User.objects.create_user(
+            username='alice', password='a-strong-passphrase-42'
+        )
+        self.bob = User.objects.create_user(
+            username='bob', password='a-strong-passphrase-42'
+        )
+        self.client.force_authenticate(self.alice)
+
+    def block(self, **payload):
+        return self.client.post(reverse('user:user-me-block'), payload, format='json')
+
+    def unblock(self, **payload):
+        return self.client.post(
+            reverse('user:user-me-unblock'), payload, format='json'
+        )
+
+    def blocked_list(self):
+        return self.assertSuccess(self.client.get(reverse('user:user-me-blocks')))
+
+    def search(self, term):
+        """Usernames the search returns. It is paginated, so unwrap it."""
+        data = self.assertSuccess(
+            self.client.get(reverse('user:user-search'), {'q': term})
+        )
+        rows = data['results'] if isinstance(data, dict) else data
+        return [row['username'] for row in rows]
+
+    # --- the record ---------------------------------------------------------
+
+    def test_blocking_records_it(self):
+        self.assertEqual(self.block(username='bob').status_code, 204)
+
+        entries = self.blocked_list()
+        self.assertEqual([e['username'] for e in entries], ['bob'])
+
+    def test_blocking_twice_is_one_row(self):
+        self.block(username='bob')
+        self.assertEqual(self.block(username='bob').status_code, 204)
+
+        self.assertEqual(len(self.blocked_list()), 1)
+
+    def test_unblocking_removes_it(self):
+        self.block(username='bob')
+
+        self.assertEqual(self.unblock(username='bob').status_code, 204)
+
+        self.assertEqual(self.blocked_list(), [])
+
+    def test_unblocking_somebody_who_was_never_blocked_is_fine(self):
+        self.assertEqual(self.unblock(username='bob').status_code, 204)
+
+    def test_a_bare_number_can_be_blocked(self):
+        # Most members of most groups have no account at all, so a block that
+        # could only name accounts could not name most people.
+        self.assertEqual(
+            self.block(phone_number='+639171234567').status_code, 204
+        )
+
+        entries = self.blocked_list()
+        self.assertEqual(entries[0]['phone_number'], '+639171234567')
+        self.assertIsNone(entries[0]['username'])
+
+    def test_you_cannot_block_yourself(self):
+        self.assertFailure(self.block(username='alice'))
+
+    def test_naming_both_or_neither_is_refused(self):
+        self.assertFailure(self.block())
+        self.assertFailure(self.block(username='bob', phone_number='+639171234567'))
+
+    def test_my_list_is_mine_alone(self):
+        # Nothing anywhere tells one person that another has blocked them.
+        self.block(username='bob')
+        self.client.force_authenticate(self.bob)
+
+        self.assertEqual(self.blocked_list(), [])
+
+    # --- search -------------------------------------------------------------
+
+    def test_a_blocked_person_is_not_in_my_search(self):
+        self.block(username='bob')
+
+        self.assertNotIn('bob', self.search('bo'))
+
+    def test_and_i_am_not_in_theirs_either(self):
+        # Symmetric. A one-way block is observable: B would notice their own
+        # blocks behaving differently.
+        self.block(username='bob')
+        self.client.force_authenticate(self.bob)
+
+        self.assertNotIn('alice', self.search('al'))
+
+    def test_somebody_unrelated_is_still_found(self):
+        self.block(username='bob')
+        User.objects.create_user(username='bobby', password='x')
+
+        self.assertEqual(self.search('bob'), ['bobby'])

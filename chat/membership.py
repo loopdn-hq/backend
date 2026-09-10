@@ -871,6 +871,40 @@ def _admin_count(conversation, lock=False):
     return queryset.count()
 
 
+def _refuse_blocked_invite(inviter, invitee=None, *, phone_number=None):
+    """Refuse an invitation between two people in a block relationship.
+
+    §11 of the blocking spec: B must not be able to put A into a group. It is
+    the last direct channel left once messages are refused, and without this
+    the block is a detour rather than a wall.
+
+    Symmetric, like every other read of the rule - if A blocked B then B cannot
+    add A, and A cannot add B either. One-way would be observable.
+
+    Raises the same JoinRefused any other unaddable person raises, with wording
+    that names nothing. A distinct message, or a distinct exception with its own
+    status code, would be exactly the reveal §11 asks us to avoid: `loopd/
+    exceptions.py` maps BlockedFromConversation to 403 and JoinRefused to 400,
+    so using the former here would announce the block by status code alone.
+
+    Group MEMBERSHIP is untouched by a block, so this refuses the invitation
+    and never the group: if the two are already in a group together they stay
+    there, and either may still join one the other is in by their own choice.
+    """
+    if inviter is None:
+        return
+
+    from user.blocks import blocks_between, blocks_number
+
+    if phone_number is not None:
+        if blocks_number(inviter, phone_number):
+            raise JoinRefused('Unable to add this person.')
+        return
+
+    if blocks_between(inviter, invitee):
+        raise JoinRefused('Unable to add this person.')
+
+
 def _require_admin(conversation, by):
     if by is None or not conversation.is_admin(by):
         raise JoinRefused('Only a group admin can do that.')
@@ -905,8 +939,13 @@ def invite_by_email(conversation, email, by):
     if not address:
         raise JoinRefused('That is not an email address.')
 
+    # No viewer passed, deliberately - see user/lookups.py. A block must not
+    # make this return None, because None means "nobody has this address" and
+    # sends them an invitation email. The refusal is `_refuse_blocked_invite`
+    # below, where it can actually refuse.
     owner = find_user(address)
     if owner is not None:
+        _refuse_blocked_invite(by, owner)
         # A real account. add_participant carries the blocked checks and the
         # phone-row folding, so there is nothing to duplicate here.
         return conversation.add_participant(owner)
@@ -991,9 +1030,36 @@ def claim_email_invitations(user):
         user__isnull=True, email__iexact=address
     ).select_related('conversation')
 
+    from user.blocks import blocks_between
+
     claimed = 0
     for row in pending:
         if row.status == Participant.Status.BLOCKED:
+            continue
+
+        # The other half of the invite refusal, and the half that catches the
+        # case `invite_by_email` structurally cannot.
+        #
+        # A block is keyed on an account or a number, never on a bare address -
+        # and an UNVERIFIED address resolves to nobody, on purpose, because
+        # anybody can type somebody else's address into their own profile. So
+        # if B invites A by an address A has not verified yet, `find_user`
+        # returns None, no block can be matched, and a row is created.
+        #
+        # This is the moment that row would become a real membership, and it is
+        # the first moment the address has an owner at all. Refusing here rather
+        # than matching unverified addresses earlier also closes a griefing
+        # route: otherwise somebody could put a stranger's address on their own
+        # profile, block the inviter, and stop that stranger being invited.
+        #
+        # The row is left behind rather than deleted, exactly like a blocked
+        # one: it is dormant, it grants nothing, and deleting it would let a
+        # second invitation quietly create a fresh one.
+        if row.added_by_id and blocks_between(user, row.added_by):
+            logger.info(
+                'Not claiming invitation %s: blocked between %s and %s',
+                row.pk, user.pk, row.added_by_id,
+            )
             continue
 
         existing = Participant.objects.filter(
@@ -1053,6 +1119,8 @@ def invite_by_phone(conversation, phone_number, display_name, by):
 
     if conversation.kind != Conversation.Kind.GROUP:
         raise JoinRefused('Only groups have members to invite.')
+
+    _refuse_blocked_invite(by, phone_number=phone_number)
 
     existing = _find_row(conversation, phone_number=phone_number)
     if existing is not None and existing.status == Participant.Status.BLOCKED:

@@ -53,6 +53,8 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     message whose `sender` and `sender_participant` disagree would render one
     name in the app and credit a different one in the SMS fan-out.
     """
+    _refuse_if_blocked(conversation, sender)
+
     if participant is None and sender is not None:
         # Explicit queryset, and explicitly ACTIVE: a message is credited to a
         # live membership or to none. Going through the relation would read the
@@ -137,6 +139,50 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     # sms/outbound.py:schedule.
     _schedule_delivery(message)
     return message
+
+
+def _refuse_if_blocked(conversation, sender):
+    """A direct conversation between blocked people takes no new messages.
+
+    Read-only rather than gone. The thread stays in both lists, with its
+    history, because deleting somebody's own record of a conversation they had
+    is a bigger thing than either person asked for - and because a thread that
+    vanished from BOTH sides would tell the blocked person exactly what had
+    happened.
+
+    Checked here because this is the single write path for every route - REST,
+    websocket, inbound SMS, inbound email - so there is one place to get it
+    right rather than four. Groups are not consulted at all: a block is about
+    direct contact, and both people stay full members of everything they share.
+
+    The copy differs by who is asking and that is the whole point. The blocker
+    is told plainly, because they already know. The blocked person is told
+    something indistinguishable from any other refusal, because §2 of the spec
+    forbids revealing that a block exists - and both come back as the same 403,
+    so the status code cannot be read as an answer either.
+    """
+    if conversation.kind != Conversation.Kind.DIRECT or sender is None:
+        return
+
+    other = (
+        Participant.objects.filter(conversation=conversation, user__isnull=False)
+        .exclude(user=sender)
+        .select_related('user')
+        .first()
+    )
+    if other is None:
+        return
+
+    from user.blocks import UserBlock, blocks_between
+
+    if not blocks_between(sender, other.user):
+        return
+
+    if UserBlock.objects.filter(blocker=sender, blocked_user=other.user).exists():
+        raise PostingNotAllowed(
+            'You blocked this person. Unblock them to send a message.'
+        )
+    raise PostingNotAllowed('Unable to send message.')
 
 
 def serialize_message(message):

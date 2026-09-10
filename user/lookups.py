@@ -5,8 +5,23 @@ someone to a group, and the search box - so the rules live in one place.
 
 Only active users are ever returned: an account that has not verified its
 email must not be discoverable, let alone messageable.
+
+AND NEITHER PARTY OF A BLOCK IS RETURNED TO THE OTHER, whenever a viewer is
+given. Both functions take a viewer as `exclude` - it already means "not me" -
+and the block filter rides alongside it, so somebody who has been blocked
+simply is not there, which is the same answer an unused username gives. Both
+functions, deliberately: hiding somebody from `search_users` while `find_user`
+still resolves their exact username would make the rule cosmetic.
+
+The `exclude=None` case is untouched, and one caller relies on that -
+`chat/membership.py:invite_by_email` passes no viewer. That is the right way
+round: a block must never make `find_user` return None THERE, because the
+caller reads None as "nobody has this address" and emails them an invitation.
+Refusing an invitation is the invite path's own job, not this function's.
 """
 from django.contrib.auth.models import User
+
+from user.blocks import blocked_user_ids
 
 # Below this, a search is a directory dump rather than a lookup.
 MIN_SEARCH_LENGTH = 2
@@ -51,6 +66,7 @@ def find_user(identifier, exclude=None):
     queryset = active_users()
     if exclude is not None:
         queryset = queryset.exclude(pk=exclude.pk)
+        queryset = queryset.exclude(pk__in=blocked_user_ids(exclude))
 
     if identifier.startswith('+'):
         return queryset.filter(
@@ -88,6 +104,7 @@ def search_users(term, exclude=None):
     queryset = active_users()
     if exclude is not None:
         queryset = queryset.exclude(pk=exclude.pk)
+        queryset = queryset.exclude(pk__in=blocked_user_ids(exclude))
 
     if term.startswith('+'):
         return queryset.filter(

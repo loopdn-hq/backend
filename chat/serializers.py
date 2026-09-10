@@ -765,6 +765,13 @@ class DirectConversationSerializer(serializers.Serializer):
         if other is None:
             # Deliberately vague: confirming "no such user" for arbitrary
             # input turns this into a directory oracle.
+            #
+            # A blocked person lands here too, and lands here IDENTICALLY -
+            # `find_user` already drops both sides of a block when it is given
+            # a viewer, so this raise is reached by the same path and says the
+            # same words. That is the §2 rule: nothing may reveal that a block
+            # exists, and a second error message written for blocks would be
+            # exactly such a reveal.
             raise serializers.ValidationError('No user found with that username or number.')
         self.other = other
         return value

@@ -4048,3 +4048,236 @@ class GroupEmailPreferenceTests(EnvelopeAssertions, APITestCase):
         response = self.delivery({'email_enabled': False})
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+import chat.models as chat_models
+
+
+class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
+    """A block stops direct contact and touches nothing else.
+
+    The narrowness is the feature. Suppressing what a blocked person's GROUP
+    messages trigger externally is a separate, deliberate, not-yet-built half -
+    so these hold the line in both directions: direct contact really stops, and
+    a shared group really does not change.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        # invite_by_email resolves through find_user, which only matches a
+        # VERIFIED address - so without this the invite tests would exercise
+        # the unclaimed-invitation branch instead of the one they name.
+        for account in (self.alice, self.bob):
+            account.profile.email_verified = True
+            account.profile.save(update_fields=['email_verified'])
+        self.client.force_authenticate(self.alice)
+
+    def block(self, blocker, username):
+        from user import blocks
+
+        blocks.block(blocker, user=User.objects.get(username=username))
+
+    def start_direct(self, identifier):
+        return self.client.post(
+            reverse('chat:conversation-direct'),
+            {'identifier': identifier},
+            format='json',
+        )
+
+    # --- starting one -------------------------------------------------------
+
+    def test_the_blocker_cannot_start_a_direct_conversation(self):
+        self.block(self.alice, 'bob')
+
+        self.assertFailure(self.start_direct('bob'))
+
+    def test_and_neither_can_the_blocked_person(self):
+        self.block(self.alice, 'bob')
+        self.client.force_authenticate(self.bob)
+
+        self.assertFailure(self.start_direct('alice'))
+
+    def test_the_refusal_says_the_same_thing_as_a_wrong_username(self):
+        # Nothing may reveal that a block exists - so this is compared
+        # character for character against the answer a name that was never
+        # taken gives.
+        self.block(self.alice, 'bob')
+        blocked = self.assertFailure(self.start_direct('bob'))
+        missing = self.assertFailure(self.start_direct('nobody-by-that-name'))
+
+        self.assertEqual(blocked['message'], missing['message'])
+
+    def test_an_unrelated_person_is_unaffected(self):
+        make_user('carol')
+        self.block(self.alice, 'bob')
+
+        self.assertSuccess(self.start_direct('carol'))
+
+    # --- an existing one goes read-only -------------------------------------
+
+    def test_an_existing_direct_conversation_stops_taking_messages(self):
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        create_message(conversation, self.alice, text='before')
+
+        self.block(self.alice, 'bob')
+
+        with self.assertRaises(chat_models.PostingNotAllowed):
+            create_message(conversation, self.alice, text='after')
+
+    def test_from_either_side(self):
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        self.block(self.alice, 'bob')
+
+        with self.assertRaises(chat_models.PostingNotAllowed):
+            create_message(conversation, self.bob, text='after')
+
+    def test_but_the_history_is_still_there(self):
+        # Read-only, not gone. Deleting somebody's own record of a conversation
+        # they had is more than either person asked for.
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        create_message(conversation, self.alice, text='before')
+
+        self.block(self.alice, 'bob')
+
+        self.assertEqual(conversation.messages.count(), 1)
+        listed = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        self.assertIn(conversation.pk, [row['id'] for row in rows])
+
+    def test_unblocking_makes_it_writable_again(self):
+        from user import blocks
+
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        self.block(self.alice, 'bob')
+        blocks.unblock(self.alice, user=self.bob)
+
+        message = create_message(conversation, self.alice, text='after')
+        self.assertIsNotNone(message.pk)
+
+    # --- invitations --------------------------------------------------------
+
+    def test_a_blocked_person_cannot_add_me_to_a_group(self):
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.bob, name='Bobs Group')
+
+        with self.assertRaises(membership.JoinRefused):
+            membership.invite_by_email(group, 'alice@example.com', self.bob)
+
+    def test_nor_i_them(self):
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.alice, name='Alices Group')
+
+        with self.assertRaises(membership.JoinRefused):
+            membership.invite_by_email(group, 'bob@example.com', self.alice)
+
+    def test_a_blocked_number_cannot_be_invited(self):
+        from user import blocks
+
+        blocks.block(self.alice, phone_number='+639171234567')
+        group = Conversation.start_group(self.alice, name='Family')
+
+        with self.assertRaises(membership.JoinRefused):
+            membership.invite_by_phone(
+                group, '+639171234567', 'Mom', self.alice
+            )
+
+    def test_an_unverified_address_is_not_a_way_round_the_invite_refusal(self):
+        # The bypass this nearly shipped with. A block is keyed on an account
+        # or a number, never a bare address - and an UNVERIFIED address
+        # resolves to nobody on purpose, so `invite_by_email` cannot match a
+        # block and creates an unclaimed row instead. The refusal has to happen
+        # at the moment that row would become real.
+        carol = make_user('carol')
+        self.block(self.alice, 'carol')
+        group = Conversation.start_group(self.alice, name='Family')
+
+        # Alice invites Carol by an address Carol has never verified.
+        membership.invite_by_email(group, 'carol@example.com', self.alice)
+        self.assertTrue(
+            Participant.objects.filter(
+                conversation=group, email='carol@example.com'
+            ).exists()
+        )
+
+        # Carol verifies it. The invitation must not turn into membership.
+        carol.profile.email_verified = True
+        carol.profile.save(update_fields=['email_verified'])
+
+        self.assertEqual(membership.claim_email_invitations(carol), 0)
+        self.assertFalse(
+            Participant.objects.filter(
+                conversation=group, user=carol,
+                status=Participant.Status.ACTIVE,
+            ).exists()
+        )
+
+    def test_but_an_ordinary_invitation_still_claims(self):
+        # The guard must not swallow the case the claim path exists for.
+        carol = make_user('carol')
+        group = Conversation.start_group(self.alice, name='Family')
+        membership.invite_by_email(group, 'carol@example.com', self.alice)
+
+        carol.profile.email_verified = True
+        carol.profile.save(update_fields=['email_verified'])
+
+        self.assertEqual(membership.claim_email_invitations(carol), 1)
+
+    # --- and the group is untouched -----------------------------------------
+
+    def test_a_shared_group_is_not_changed_at_all(self):
+        # The half that is deliberately NOT built. Both stay members, both
+        # still see each other, and the fan-out does not know blocks exist.
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+
+        self.block(self.alice, 'bob')
+
+        rows = Participant.objects.filter(conversation=group)
+        self.assertEqual(rows.count(), 2)
+        self.assertTrue(
+            all(r.status == Participant.Status.ACTIVE for r in rows)
+        )
+
+    def test_and_they_can_still_post_there(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+
+        message = create_message(group, self.bob, text='Dinner at 7')
+
+        self.assertIsNotNone(message.pk)
+        self.assertEqual(group.messages.count(), 1)
+
+    def test_and_the_delivery_ladder_still_says_yes(self):
+        # Explicit: the external-suppression half is not built, and this test
+        # will FAIL the day somebody builds it - which is the right way to be
+        # told that the scope changed.
+        from chat import delivery
+
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        alice_row = Participant.objects.get(conversation=group, user=self.alice)
+        self.block(self.alice, 'bob')
+
+        self.assertIsNone(
+            delivery.refusal_reason(alice_row, ChannelConsent.Channel.SMS)
+        )
+
+    def test_and_they_still_see_each_other_in_the_member_list(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+
+        listed = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-participants', args=[group.id])
+            )
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        usernames = [
+            (r['user'] or {}).get('username') for r in rows
+        ]
+        self.assertIn('bob', usernames)
