@@ -24,6 +24,7 @@ class Plan(models.Model):
     # Stripe's recurring Price for this plan. Blank until
     # `sync_stripe_billing` (or the dashboard) creates the Product/Price and
     # somebody pastes the id back - Free and Enterprise never get one.
+    stripe_product_id = models.CharField(max_length=255, blank=True, default='', db_default='')
     stripe_price_id = models.CharField(max_length=255, blank=True, default='', db_default='')
 
     # Usage limits. Null means "no limit" (Enterprise), never zero.

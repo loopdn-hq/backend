@@ -1696,6 +1696,27 @@
           }
         },
         {
+          "name": "Billing analytics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/billing/analytics/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "billing",
+                "analytics",
+                ""
+              ]
+            },
+            "description": "Analytics access is feature-gated by the caller's current plan.\n\nIf the plan has **Basic Analytics** (or **Advanced Analytics**), the response includes the `basic` section: conversation counts and 30-day message activity.\n\nIf the plan has **Advanced Analytics**, `advanced` is included with group-admin and group-size signals. Otherwise `advanced` is `null`.\n\nThe endpoint also returns `suggestions`, tailored by access level (`none`, `basic`, `advanced`) so clients can guide upgrades or improvements."
+          }
+        },
+        {
           "name": "Checkout: subscribe to a plan",
           "request": {
             "method": "POST",

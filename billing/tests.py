@@ -14,7 +14,7 @@ from rest_framework.test import APIClient
 from billing import services
 from billing.limits import check_can_create_group
 from billing.models import CreditPackage, Plan, Subscription, Wallet, WalletTransaction
-from chat.models import Conversation
+from chat.models import Conversation, Message, Participant
 
 
 class WalletLedgerTests(TestCase):
@@ -165,6 +165,10 @@ class StripeWebhookTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_price_created_with_plan_metadata_upserts_plan(self):
+        original = Plan.objects.get(code='premium')
+        original_name = original.name
+        original_price = original.monthly_price_cents
+
         event = {
             'id': 'evt_plan_price_1',
             'type': 'price.created',
@@ -199,12 +203,146 @@ class StripeWebhookTests(TestCase):
             response = self._post_event(event)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        plan = Plan.objects.get(code='premium')
+        original.refresh_from_db()
+        self.assertEqual(original.name, original_name)
+        self.assertEqual(original.monthly_price_cents, original_price)
+
+        plan = Plan.objects.filter(stripe_product_id='prod_plan_1').first()
+        self.assertIsNotNone(plan)
         self.assertEqual(plan.name, 'Premium Plus')
         self.assertEqual(plan.monthly_price_cents, 1999)
         self.assertEqual(plan.stripe_price_id, 'price_plan_1')
         self.assertEqual(plan.max_groups, 25)
         self.assertEqual(plan.features, ['Search'])
+
+    def test_product_created_without_price_concats_to_existing_plans(self):
+        before_count = Plan.objects.count()
+        event = {
+            'id': 'evt_plan_product_created_1',
+            'type': 'product.created',
+            'data': {'object': {
+                'id': 'prod_plan_new_1',
+                'name': 'Starter Plus',
+                'active': True,
+                'metadata': {
+                    'data': json.dumps({
+                        'type': 'plan',
+                        'code': 'starter_plus',
+                        'max_groups': 8,
+                        'max_members_per_group': 80,
+                        'max_admins_per_group': 2,
+                        'storage_gb': 3,
+                        'has_whatsapp': True,
+                        'has_telegram': False,
+                        'features': ['Basic Analytics'],
+                        'is_custom_pricing': True,
+                    })
+                },
+            }},
+        }
+
+        mocked_prices = mock.Mock()
+        mocked_prices.auto_paging_iter.return_value = iter([])
+        with mock.patch('stripe.Price.list', return_value=mocked_prices):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Plan.objects.count(), before_count + 1)
+        plan = Plan.objects.get(code='starter_plus')
+        self.assertEqual(plan.name, 'Starter Plus')
+        self.assertEqual(plan.monthly_price_cents, None)
+        self.assertTrue(plan.is_custom_pricing)
+        self.assertEqual(plan.features, ['Basic Analytics'])
+
+    def test_product_created_with_same_code_does_not_replace_existing_plan(self):
+        existing = Plan.objects.create(
+            code='basic',
+            name='Basic',
+            monthly_price_cents=990,
+            is_custom_pricing=False,
+            active=True,
+        )
+
+        event = {
+            'id': 'evt_plan_product_created_same_code',
+            'type': 'product.created',
+            'data': {'object': {
+                'id': 'prod_plan_same_code_1',
+                'name': 'Premium',
+                'active': True,
+                'metadata': {
+                    'data': json.dumps({
+                        'type': 'plan',
+                        'code': 'basic',
+                        'features': ['Basic Analytics'],
+                        'is_custom_pricing': True,
+                    })
+                },
+            }},
+        }
+        mocked_prices = mock.Mock()
+        mocked_prices.auto_paging_iter.return_value = iter([])
+        with mock.patch('stripe.Price.list', return_value=mocked_prices):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        existing.refresh_from_db()
+        self.assertEqual(existing.name, 'Basic')
+        self.assertEqual(existing.monthly_price_cents, 990)
+
+        appended = Plan.objects.filter(stripe_product_id='prod_plan_same_code_1').exclude(pk=existing.pk).first()
+        self.assertIsNotNone(appended)
+        self.assertEqual(appended.name, 'Premium')
+        self.assertNotEqual(appended.code, existing.code)
+
+    def test_price_created_with_same_code_and_new_product_appends_not_replaces(self):
+        existing = Plan.objects.create(
+            code='basic',
+            name='Basic',
+            monthly_price_cents=990,
+            is_custom_pricing=False,
+            active=True,
+        )
+
+        event = {
+            'id': 'evt_plan_price_same_code_new_product',
+            'type': 'price.created',
+            'data': {'object': {
+                'id': 'price_plan_same_code_new',
+                'product': 'prod_plan_same_code_new',
+                'unit_amount': 2999,
+                'currency': 'usd',
+                'recurring': {'interval': 'month'},
+                'metadata': {
+                    'data': json.dumps({
+                        'type': 'plan',
+                        'code': 'basic',
+                        'features': ['Advanced Analytics'],
+                        'is_custom_pricing': False,
+                        'max_groups': 50,
+                    })
+                },
+            }},
+        }
+
+        with mock.patch('stripe.Product.retrieve', return_value={
+            'id': 'prod_plan_same_code_new',
+            'name': 'Premium',
+            'active': True,
+            'metadata': {},
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        existing.refresh_from_db()
+        self.assertEqual(existing.name, 'Basic')
+        self.assertEqual(existing.monthly_price_cents, 990)
+
+        appended = Plan.objects.filter(stripe_product_id='prod_plan_same_code_new').exclude(pk=existing.pk).first()
+        self.assertIsNotNone(appended)
+        self.assertEqual(appended.name, 'Premium')
+        self.assertEqual(appended.monthly_price_cents, 2999)
+        self.assertNotEqual(appended.code, existing.code)
 
     def test_product_updated_with_credit_metadata_upserts_credit_package(self):
         event = {
@@ -280,6 +418,47 @@ class StripeWebhookTests(TestCase):
         self.assertEqual(package.credit_cents, 1500)
         self.assertEqual(package.stripe_product_id, 'prod_credit_optional')
         self.assertEqual(package.stripe_price_id, 'price_credit_optional_new')
+
+    def test_credit_without_id_and_same_name_creates_new_package_for_new_product(self):
+        existing = CreditPackage.objects.create(
+            name='Promo Credits',
+            price_cents=1100,
+            credit_cents=1100,
+            stripe_product_id='prod_credit_existing',
+            stripe_price_id='price_credit_existing',
+            active=True,
+        )
+
+        event = {
+            'id': 'evt_credit_same_name_new_product',
+            'type': 'price.created',
+            'data': {'object': {
+                'id': 'price_credit_new_product',
+                'product': 'prod_credit_new',
+                'unit_amount': 2500,
+                'currency': 'usd',
+                'metadata': {
+                    'data': json.dumps({'type': 'credit'})
+                },
+            }},
+        }
+        with mock.patch('stripe.Product.retrieve', return_value={
+            'id': 'prod_credit_new',
+            'name': 'Promo Credits',
+            'active': True,
+            'metadata': {},
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        existing.refresh_from_db()
+        self.assertEqual(existing.price_cents, 1100)
+        self.assertEqual(existing.stripe_product_id, 'prod_credit_existing')
+
+        created = CreditPackage.objects.filter(stripe_product_id='prod_credit_new').exclude(pk=existing.pk).first()
+        self.assertIsNotNone(created)
+        self.assertEqual(created.name, 'Promo Credits')
+        self.assertEqual(created.price_cents, 2500)
 
     def test_product_deleted_deactivates_matching_plan_and_credit_package(self):
         plan = Plan.objects.get(code=Plan.Code.PREMIUM)
@@ -377,6 +556,112 @@ class StripeWebhookTests(TestCase):
         self.assertFalse(package.active)
 
 
+class BillingAnalyticsTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='frank', password='pw')
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.url = reverse('billing:analytics')
+
+    def test_free_plan_returns_no_analytics_access(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        data = response.json()['data']
+        self.assertFalse(data['access']['has_basic_analytics'])
+        self.assertFalse(data['access']['has_advanced_analytics'])
+        self.assertEqual(data['access']['matched_feature'], 'none')
+        self.assertIsNone(data['basic'])
+        self.assertIsNone(data['advanced'])
+        codes = [item['code'] for item in data['suggestions']]
+        self.assertIn('upgrade-analytics-plan', codes)
+
+    def test_basic_plan_returns_basic_analytics_only(self):
+        subscription = services.get_or_create_subscription(self.user)
+        subscription.plan = Plan.objects.get(code=Plan.Code.PREMIUM)
+        subscription.save()
+
+        other = User.objects.create_user(username='gina', password='pw')
+        group = Conversation.start_group(self.user, name='Ops')
+        group.add_participant(other, role=Participant.Role.MEMBER)
+        direct, _ = Conversation.start_direct(self.user, other)
+
+        Message.objects.create(conversation=group, sender=self.user, text='hello team')
+        Message.objects.create(conversation=group, sender=other, text='reply')
+        Message.objects.create(conversation=direct, sender=other, text='ping')
+        services.credit_wallet(
+            self.user,
+            amount_cents=2000,
+            kind=WalletTransaction.Kind.CREDIT_PURCHASE,
+            description='top-up',
+        )
+        services.debit_wallet(self.user, amount_cents=300, description='sms usage')
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        data = response.json()['data']
+        self.assertTrue(data['access']['has_basic_analytics'])
+        self.assertFalse(data['access']['has_advanced_analytics'])
+        self.assertEqual(data['access']['matched_feature'], 'basic')
+        self.assertIsNone(data['advanced'])
+        self.assertEqual(data['basic']['conversation_counts']['group'], 1)
+        self.assertEqual(data['basic']['conversation_counts']['direct'], 1)
+        self.assertEqual(data['basic']['message_activity']['sent_last_30_days'], 1)
+        self.assertEqual(data['basic']['message_activity']['received_last_30_days'], 2)
+        self.assertEqual(data['basic']['plan_info']['code'], Plan.Code.PREMIUM)
+        self.assertEqual(data['basic']['wallet']['balance_cents'], 1700)
+        self.assertEqual(data['basic']['wallet']['usage_last_30_days']['purchased_cents'], 2000)
+        self.assertEqual(data['basic']['wallet']['usage_last_30_days']['used_cents'], 300)
+
+    def test_advanced_plan_returns_advanced_analytics(self):
+        advanced_plan = Plan.objects.create(
+            code='advanced-pro',
+            name='Advanced Pro',
+            monthly_price_cents=4999,
+            features=['Advanced Analytics'],
+            is_custom_pricing=False,
+            active=True,
+        )
+        subscription = services.get_or_create_subscription(self.user)
+        subscription.plan = advanced_plan
+        subscription.save()
+
+        member_a = User.objects.create_user(username='harry', password='pw')
+        member_b = User.objects.create_user(username='irene', password='pw')
+        group_a = Conversation.start_group(self.user, name='Alpha')
+        group_b = Conversation.start_group(self.user, name='Beta')
+        group_b.mode = Conversation.Mode.BROADCAST
+        group_b.save(update_fields=['mode'])
+        group_a.add_participant(member_a, role=Participant.Role.MEMBER)
+        group_a.add_participant(member_b, role=Participant.Role.MEMBER)
+        services.credit_wallet(
+            self.user,
+            amount_cents=5000,
+            kind=WalletTransaction.Kind.CREDIT_PURCHASE,
+            description='top-up',
+        )
+        services.debit_wallet(self.user, amount_cents=1200, description='sms usage')
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        data = response.json()['data']
+        self.assertTrue(data['access']['has_basic_analytics'])
+        self.assertTrue(data['access']['has_advanced_analytics'])
+        self.assertEqual(data['access']['matched_feature'], 'advanced')
+        self.assertIsNotNone(data['advanced'])
+        self.assertEqual(data['advanced']['group_admin_stats']['admin_groups'], 2)
+        self.assertEqual(data['advanced']['group_admin_stats']['broadcast_groups'], 1)
+        self.assertGreaterEqual(data['advanced']['group_size']['average_active_members'], 1)
+        self.assertEqual(data['basic']['plan_info']['code'], 'advanced-pro')
+        self.assertEqual(data['advanced']['plan_info']['code'], 'advanced-pro')
+        self.assertEqual(data['basic']['wallet']['balance_cents'], 3800)
+        self.assertEqual(data['advanced']['wallet']['balance_cents'], 3800)
+        self.assertEqual(data['advanced']['wallet']['usage_last_30_days']['purchased_cents'], 5000)
+        self.assertEqual(data['advanced']['wallet']['usage_last_30_days']['used_cents'], 1200)
+
+
 @override_settings(BILLING_ALLOWED_REDIRECT_ORIGINS={'https://loopdn.com'})
 class PlanCheckoutSecurityTests(TestCase):
     """success_url/cancel_url validation and the checkout rate limit."""
@@ -431,3 +716,27 @@ class PlanCheckoutSecurityTests(TestCase):
                 self.assertEqual(response.status_code, status.HTTP_200_OK)
             response = self.client.post(self.url, self.payload, format='json')
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_dynamic_plan_code_is_accepted(self):
+        Plan.objects.create(
+            code='premium-3',
+            name='Premium 3',
+            monthly_price_cents=2999,
+            active=True,
+            stripe_price_id='price_premium_3',
+        )
+        payload = {**self.payload, 'plan_code': 'premium-3'}
+
+        with mock.patch(
+            'billing.viewsets.v1.billing.services.create_plan_checkout_session',
+            return_value={'url': 'https://checkout.stripe.com/test'},
+        ):
+            response = self.client.post(self.url, payload, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_unknown_plan_code_is_rejected(self):
+        payload = {**self.payload, 'plan_code': 'premium-does-not-exist'}
+        response = self.client.post(self.url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('plan_code', response.json()['data'])

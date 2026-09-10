@@ -129,7 +129,9 @@ class StripeWebhook(APIView):
 
         plans = Plan.objects.filter(active=True).exclude(stripe_price_id='')
         for plan in plans:
-            if self._price_belongs_to_product(plan.stripe_price_id, product_id):
+            if plan.stripe_product_id == product_id or self._price_belongs_to_product(
+                plan.stripe_price_id, product_id
+            ):
                 plan.active = False
                 plan.save(update_fields=['active', 'updated_at'])
                 matched_plans += 1
@@ -166,6 +168,13 @@ class StripeWebhook(APIView):
         if product is None:
             logger.warning('Stripe %s without a retrievable product; skipping', event_type)
             return
+
+        if price is None and event_type == 'product.created':
+            payload = self._catalog_payload(product.get('metadata') or {}, {})
+            if payload and str(payload.get('type') or '').strip().lower() == 'plan':
+                self._upsert_plan_from_product_only(product, payload)
+                return
+
         if price is None:
             logger.warning('Stripe %s for product %s has no active price yet; skipping',
                            event_type, product.get('id'))
@@ -263,18 +272,18 @@ class StripeWebhook(APIView):
 
     def _upsert_plan_from_catalog(self, product, price, payload):
         code = str(payload.get('code') or '').strip().lower()
-        if not code:
-            logger.warning('Plan payload missing code for product %s; skipping', product.get('id'))
-            return
+        product_id = str(product.get('id') or '')
+        base_code = code or self._safe_plan_code_from_name(product.get('name') or 'plan')
 
         price_cents = self._coerce_int(price.get('unit_amount'))
         if price_cents is None:
-            logger.warning('Plan payload for code %s has no unit_amount; skipping', code)
+            logger.warning('Plan payload for code %s has no unit_amount; skipping', base_code)
             return
 
         defaults = {
-            'name': str(product.get('name') or code.title())[:40],
+            'name': str(product.get('name') or base_code.title())[:40],
             'monthly_price_cents': price_cents,
+            'stripe_product_id': product_id,
             'stripe_price_id': str(price.get('id') or ''),
             'max_groups': self._coerce_int(payload.get('max_groups')),
             'max_members_per_group': self._coerce_int(payload.get('max_members_per_group')),
@@ -287,7 +296,12 @@ class StripeWebhook(APIView):
             'active': self._coerce_bool(product.get('active'), default=True),
         }
 
-        plan, created = Plan.objects.update_or_create(code=code, defaults=defaults)
+        plan, created = self._upsert_plan_record(
+            product_id=product_id,
+            base_code=base_code,
+            defaults=defaults,
+            append_only=False,
+        )
         recurring = (price.get('recurring') or {}).get('interval') or 'one_time'
         price_display = f'${price_cents / 100:.2f}/{"mo" if recurring == "month" else recurring}'
         logger.info('Stripe catalog %s plan %s from product=%s price=%s (%s)',
@@ -296,6 +310,74 @@ class StripeWebhook(APIView):
                     product.get('id'),
                     price.get('id'),
                     price_display)
+
+    def _upsert_plan_from_product_only(self, product, payload):
+        code = str(payload.get('code') or '').strip().lower()
+        product_id = str(product.get('id') or '')
+        base_code = code or self._safe_plan_code_from_name(product.get('name') or 'plan')
+
+        defaults = {
+            'name': str(product.get('name') or base_code.title())[:40],
+            'monthly_price_cents': self._coerce_int(payload.get('monthly_price_cents')),
+            'stripe_product_id': product_id,
+            'max_groups': self._coerce_int(payload.get('max_groups')),
+            'max_members_per_group': self._coerce_int(payload.get('max_members_per_group')),
+            'max_admins_per_group': self._coerce_int(payload.get('max_admins_per_group')),
+            'storage_gb': self._coerce_int(payload.get('storage_gb')),
+            'has_whatsapp': self._coerce_bool(payload.get('has_whatsapp')),
+            'has_telegram': self._coerce_bool(payload.get('has_telegram')),
+            'features': payload.get('features') if isinstance(payload.get('features'), list) else [],
+            'is_custom_pricing': self._coerce_bool(payload.get('is_custom_pricing'), default=True),
+            'active': self._coerce_bool(product.get('active'), default=True),
+        }
+        plan, created = self._upsert_plan_record(
+            product_id=product_id,
+            base_code=base_code,
+            defaults=defaults,
+            append_only=True,
+        )
+        logger.info(
+            'Stripe catalog %s plan %s from product=%s without price yet',
+            'created' if created else 'updated',
+            plan.code,
+            product.get('id'),
+        )
+
+    def _upsert_plan_record(self, *, product_id, base_code, defaults, append_only):
+        if product_id:
+            plan = Plan.objects.filter(stripe_product_id=product_id).first()
+            if plan is not None:
+                for field, value in defaults.items():
+                    setattr(plan, field, value)
+                plan.save(update_fields=[*defaults.keys(), 'updated_at'])
+                return plan, False
+
+        if not product_id:
+            logger.warning('Plan payload has no Stripe product id; refusing code-based upsert for %s', base_code)
+            return Plan.objects.create(code=self._next_unique_plan_code(base_code), **defaults), True
+
+        code = self._next_unique_plan_code(base_code)
+        return Plan.objects.create(code=code, **defaults), True
+
+    def _next_unique_plan_code(self, base_code):
+        cleaned = ''.join(ch for ch in (base_code or 'plan').lower() if ch.isalnum() or ch in ('-', '_'))
+        cleaned = cleaned[:16] or 'plan'
+        if not Plan.objects.filter(code=cleaned).exists():
+            return cleaned
+
+        suffix = 2
+        while True:
+            suffix_text = str(suffix)
+            candidate = f'{cleaned[:16 - len(suffix_text) - 1]}-{suffix_text}'
+            if not Plan.objects.filter(code=candidate).exists():
+                return candidate
+            suffix += 1
+
+    def _safe_plan_code_from_name(self, name):
+        parts = str(name or 'plan').strip().lower().replace("'", '').split()
+        if not parts:
+            return 'plan'
+        return '_'.join(parts)[:16] or 'plan'
 
     def _upsert_credit_from_catalog(self, product, price, payload):
         product_id = str(product.get('id') or '')
@@ -321,7 +403,6 @@ class StripeWebhook(APIView):
             package = self._match_credit_package(
                 product_id=product_id,
                 price_id=defaults['stripe_price_id'],
-                package_name=defaults['name'],
             )
             if package is None:
                 package = CreditPackage.objects.create(**defaults)
@@ -341,7 +422,7 @@ class StripeWebhook(APIView):
                     price.get('id'),
                     price_display)
 
-    def _match_credit_package(self, *, product_id, price_id, package_name):
+    def _match_credit_package(self, *, product_id, price_id):
         if product_id:
             package = CreditPackage.objects.filter(stripe_product_id=product_id).first()
             if package:
@@ -349,11 +430,6 @@ class StripeWebhook(APIView):
 
         if price_id:
             package = CreditPackage.objects.filter(stripe_price_id=price_id).first()
-            if package:
-                return package
-
-        if package_name:
-            package = CreditPackage.objects.filter(name=package_name).first()
             if package:
                 return package
 
