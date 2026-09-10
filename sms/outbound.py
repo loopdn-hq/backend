@@ -117,6 +117,30 @@ def _address_reason(participant):
     return None
 
 
+def still_eligible(participant):
+    """Why this member must not be texted RIGHT NOW, or None if they may be.
+
+    Both halves of the decision - the shared membership ladder and SMS's own
+    address question - which together are exactly what `recipients_for` asks
+    for a fresh fan-out.
+
+    It exists as its own function because the fan-out is not the only thing
+    that sends: `retry_delivery` picks a row up minutes or hours later, and the
+    world moves in between. A decision taken at fan-out time is not still true
+    when the retry runs.
+
+    Named without a leading underscore, and asked again at every send, because
+    "did we check?" should never be answerable by reading how a function was
+    called.
+    """
+    if participant is None:
+        return 'the membership is gone'
+    return (
+        delivery.refusal_reason(participant, ChannelConsent.Channel.SMS)
+        or _address_reason(participant)
+    )
+
+
 def number_for(participant):
     """The E.164 to text for this member."""
     if participant.user_id is None:
@@ -653,6 +677,21 @@ def retry_delivery(delivery):
     Claimed with a conditional UPDATE before anything is sent, so two workers
     picking up the same row cannot both text the person. `attempts` bounds how
     many times this can ever happen for one row.
+
+    THE ELIGIBILITY CHECK IS RE-RUN, AND HAS TO BE. A retry can fire up to six
+    hours after the message was written, and the reason it failed the first
+    time - a carrier hiccup - says nothing about whether the person still wants
+    it. In that window they can text STOP, mute the group, leave it, or be
+    removed from it. Deciding once at fan-out time and trusting it hours later
+    is how somebody who has said no gets texted anyway, twice.
+
+    `sms/maintenance.py:PERMANENT_REASONS` does not cover this: it excludes
+    rows whose reason was ALREADY a policy refusal, and cannot know about a
+    refusal that only became true afterwards.
+
+    The row is marked SKIPPED rather than FAILED when that happens, which is
+    both accurate - it is a decision, not a failure - and self-limiting, since
+    the sweep never retries a SKIPPED row.
     """
     claimed = SmsDelivery.objects.filter(
         pk=delivery.pk, status=SmsDelivery.Status.FAILED
@@ -666,8 +705,25 @@ def retry_delivery(delivery):
 
     delivery.refresh_from_db()
     conversation = delivery.conversation
-    participant = delivery.participant
-    number = number_for(participant) if participant else None
+
+    # Read fresh, with the consent rows, rather than trusting whatever the
+    # sweep's queryset loaded: the point of the check below is that the world
+    # has moved since this row was written.
+    participant = (
+        Participant.objects.filter(pk=delivery.participant_id)
+        .select_related('user__profile')
+        .prefetch_related('channel_consents')
+        .first()
+    )
+
+    refusal = still_eligible(participant)
+    if refusal is not None:
+        delivery.status = SmsDelivery.Status.SKIPPED
+        delivery.reason = refusal
+        delivery.save(update_fields=['status', 'reason', 'updated_at'])
+        return False
+
+    number = number_for(participant)
     group_number = GroupNumber.for_number_of(conversation) if conversation else None
 
     if not number or group_number is None:

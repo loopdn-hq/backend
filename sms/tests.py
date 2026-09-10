@@ -2251,6 +2251,58 @@ class MaintenanceTests(TransactionTestCase):
         self.a_failed_delivery(reason='no verified number')
         self.assertEqual(maintenance.retry_failed_deliveries(), 0)
 
+    def test_a_retry_is_dropped_if_they_said_stop_meanwhile(self):
+        # The window between a failure and its retry is up to six hours, and
+        # PERMANENT_REASONS cannot help: it excludes rows that were ALREADY a
+        # policy refusal, not ones that became one afterwards.
+        row = self.a_failed_delivery()
+        inbound.handle_inbound(self.group, '+639171111111', 'STOP')
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, SmsDelivery.Status.SKIPPED)
+        # The switch, not the consent row, because §23's ladder asks "channel
+        # disabled?" before "no consent?" and STOP sets both.
+        self.assertEqual(row.reason, 'sms disabled for this group')
+
+    def test_and_that_ends_it_rather_than_coming_round_again(self):
+        # SKIPPED is not just accurate, it is self-limiting: the sweep never
+        # picks a SKIPPED row up.
+        self.a_failed_delivery()
+        inbound.handle_inbound(self.group, '+639171111111', 'STOP')
+        maintenance.retry_failed_deliveries()
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+    def test_a_retry_is_dropped_if_they_muted_meanwhile(self):
+        row = self.a_failed_delivery()
+        membership.set_muted(self.mom, True)
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.reason, 'muted')
+
+    def test_a_retry_is_dropped_if_they_left_meanwhile(self):
+        row = self.a_failed_delivery()
+        self.mom.status = Participant.Status.LEFT
+        self.mom.save(update_fields=['status'])
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.reason, 'not an active member')
+
+    def test_but_an_ordinary_failure_is_still_retried(self):
+        # The guard must not swallow the case the retry exists for.
+        row = self.a_failed_delivery()
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 1)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, SmsDelivery.Status.SENT)
+
     def test_an_old_failure_is_left_alone(self):
         # Nobody wants yesterday's "dinner at 7".
         row = self.a_failed_delivery()
@@ -2616,6 +2668,71 @@ class GroupConsentTests(TestCase):
 
         self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.OPTED_IN)
         self.assertEqual(self.family.messages.count(), 0)
+
+    # --- STOP is about the NUMBER, not about which row answered -------------
+
+    def test_stop_from_an_account_row_silences_their_phone_only_rows(self):
+        # One human, two kinds of row, one number. The sweep used to ask which
+        # kind had answered and only sweep the matching kind, so this
+        # arrangement left Work texting a number that had just said STOP.
+        self.alice.profile.phone_number = self.number
+        self.alice.profile.phone_no_verified = True
+        self.alice.profile.save()
+        work_row = self.invite_to(self.work)
+        self.send(self.work, 'YES')
+
+        # Alice answers from her own (account) row in Family.
+        self.send(self.family, 'STOP')
+
+        work_row.refresh_from_db()
+        self.assertFalse(work_row.sms_enabled)
+
+    def test_stop_from_a_phone_only_row_silences_the_account_too(self):
+        # The mirror. The profile write used to be guarded on the answering
+        # row having an account, so a phone-only STOP never reached it - and
+        # the account's own groups are gated on the profile switch.
+        bob = User.objects.create_user(username='bob', password='x')
+        bob.profile.phone_number = self.number
+        bob.profile.phone_no_verified = True
+        bob.profile.save()
+        self.invite_to(self.family)
+
+        self.send(self.family, 'STOP')
+
+        bob.profile.refresh_from_db()
+        self.assertFalse(bob.profile.sms_enabled)
+        self.assertIsNotNone(bob.profile.sms_opt_out_at)
+
+    def test_start_brings_the_account_back_too(self):
+        bob = User.objects.create_user(username='bob', password='x')
+        bob.profile.phone_number = self.number
+        bob.profile.phone_no_verified = True
+        bob.profile.save()
+        self.invite_to(self.family)
+        self.send(self.family, 'STOP')
+
+        self.send(self.family, 'START')
+
+        bob.profile.refresh_from_db()
+        self.assertTrue(bob.profile.sms_enabled)
+
+    def test_the_delivery_engine_agrees_across_both_kinds(self):
+        # Through the ladder rather than the columns, because a column only
+        # matters if something reads it.
+        from chat import delivery
+
+        self.alice.profile.phone_number = self.number
+        self.alice.profile.phone_no_verified = True
+        self.alice.profile.save()
+        work_row = self.invite_to(self.work)
+        self.send(self.work, 'YES')
+
+        self.send(self.family, 'STOP')
+
+        work_row.refresh_from_db()
+        self.assertIsNotNone(
+            delivery.refusal_reason(work_row, ChannelConsent.Channel.SMS)
+        )
 
     # --- silence while pending ----------------------------------------------
 
