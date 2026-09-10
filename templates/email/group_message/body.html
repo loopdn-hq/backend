@@ -1,0 +1,25 @@
+{% extends "email/base.html" %}
+
+{% block title %}New message in {{ group_name }}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 4px; font-size:14px; color:#71717a;">
+  {{ group_name }}
+</p>
+<p style="margin:0 0 8px; font-weight:600;">
+  {{ sender_name }}
+</p>
+{% comment %}
+linebreaks, not linebreaksbr: a message somebody typed has paragraphs in it,
+and every variable here is autoescaped, so what a member wrote cannot become
+markup in everybody else's inbox.
+{% endcomment %}
+<div style="margin:0 0 24px;">{{ body|linebreaks }}</div>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  {% if can_reply %}
+    Reply to this email to respond to the group.
+  {% else %}
+    Open {{ product_name }} to respond to the group.
+  {% endif %}
+</p>
+{% endblock %}

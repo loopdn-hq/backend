@@ -1,0 +1,5 @@
+{{ sender_name }}:
+
+{{ body }}
+
+{% if can_reply %}Reply to this email to respond to the group.{% else %}Open {{ product_name }} to respond to the group.{% endif %}

@@ -10,13 +10,20 @@ speak to.
 
 The default is the answer the old single column encoded:
 
-    an account holder   opted in - they agreed to SMS in their own settings,
-                        so there was never a group question to ask
-    phone-only          pending - somebody put their number in a group, and
-                        silence is not agreement
+    an account holder   opted in - they agreed in their own settings, so there
+                        was never a group question to ask
+    phone or email only pending - somebody put their number or address in a
+                        group, and silence is not agreement
 
 That distinction is the product's consent story, not a convenience: texting a
 number nobody confirmed is the thing carriers suspend campaigns for.
+
+The default is where the two channels stop agreeing, and it is worth being
+explicit about why. A row that later gains an account is upgraded for EMAIL and
+never for SMS - see `chat/membership.py:claim_email_invitations`. Verifying an
+address proves the person reading it is the person who was invited, so there is
+nothing left to ask about email. Nobody has confirmed the phone number by text,
+so for SMS there still is.
 """
 from django.db.models.signals import post_save
 from django.dispatch import receiver
@@ -31,14 +38,19 @@ def seed_channel_consent(sender, instance, created, **kwargs):
     if not created:
         return
 
-    ChannelConsent.objects.get_or_create(
-        participant=instance,
-        channel=ChannelConsent.Channel.SMS,
-        defaults={'status': _default_sms_status(instance)},
-    )
+    default = _default_status(instance)
+    for channel in (
+        ChannelConsent.Channel.SMS,
+        ChannelConsent.Channel.EMAIL,
+    ):
+        ChannelConsent.objects.get_or_create(
+            participant=instance,
+            channel=channel,
+            defaults={'status': default},
+        )
 
 
-def _default_sms_status(participant):
+def _default_status(participant):
     if participant.user_id is None:
         return ChannelConsent.Status.PENDING
     return ChannelConsent.Status.OPTED_IN

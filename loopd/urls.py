@@ -40,6 +40,10 @@ urlpatterns = [
     # rather than by a token - see sms/webhooks.py.
     path('api/v1/sms/', include('sms.urls')),
 
+    # The other one: replies members send to a group's reply address. Same
+    # contract - signature, not a token. See mail/webhooks.py.
+    path('api/v1/mail/', include('mail.urls')),
+
     path('api/v1/billing/', include('billing.urls')),
 ]
 

@@ -158,6 +158,9 @@ INSTALLED_APPS = [
     'otp',
     'chat',
     'sms',
+    # `mail`, not `email`: a top-level app called `email` would shadow the
+    # standard library module for everything on the path.
+    'mail',
     'billing',
 ]
 
@@ -353,6 +356,45 @@ EMAIL_REQUEST_TIMEOUT = 10
 # Available to every email template without the caller passing them.
 EMAIL_PRODUCT_NAME = os.environ.get('EMAIL_PRODUCT_NAME', 'Loopd')
 EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMAIL)
+
+# --- group email --------------------------------------------------------
+#
+# The second delivery channel, alongside SMS. Same shape as the SMS block
+# below: keyed on the presence of configuration rather than on DEBUG, so a
+# laptop runs the whole decision path and logs instead of sending.
+
+# The master switch for outbound group email. Off by default, unlike SMS:
+# turning a channel on for every existing group is a decision somebody should
+# make on purpose, and a domain's sending reputation is not recoverable by
+# turning it off again afterwards.
+MAIL_SENDING_ENABLED = os.environ.get('MAIL_SENDING_ENABLED', 'False').lower() in (
+    '1', 'true', 'yes'
+)
+
+# The domain the inbound provider receives replies on, e.g. reply.loopdn.com.
+# It must NOT be the domain that receives ordinary mail for the company: every
+# address under it is a machine-readable reply handle. Empty means replies are
+# not accepted, and the templates then say "open Loopd to respond" instead of
+# inviting one that would land nowhere.
+MAIL_REPLY_DOMAIN = os.environ.get('MAIL_REPLY_DOMAIN', '').strip().lower()
+
+# Signs the inbound email webhook. Empty skips verification - development only,
+# and mail/checks.py raises an error if a reply domain is configured without it.
+RESEND_WEBHOOK_SECRET = os.environ.get('RESEND_WEBHOOK_SECRET', '')
+
+# How far out of date a webhook signature may be. Same reasoning as
+# SMS_WEBHOOK_TOLERANCE_SECONDS: long enough to survive clock drift, short
+# enough that a captured request cannot be replayed tomorrow.
+MAIL_WEBHOOK_TOLERANCE_SECONDS = int(
+    os.environ.get('MAIL_WEBHOOK_TOLERANCE_SECONDS', '300')
+)
+
+# Above this, the email leg stops and everybody still gets the message in the
+# app. A large group mailing every message is how a sending domain earns a
+# reputation it cannot spend its way out of.
+MAIL_MAX_RECIPIENTS_PER_MESSAGE = int(
+    os.environ.get('MAIL_MAX_RECIPIENTS_PER_MESSAGE', '100')
+)
 
 # Where the frontend lives, for building links that go out in email (password
 # reset today). No trailing slash - callers append their own path.

@@ -118,11 +118,22 @@ GROUP_INVITATION = EmailTemplate(
     context_keys=('group_name', 'inviter_name', 'join_url'),
 )
 
+# One message posted in a group, delivered to a member who takes part by
+# email. Unlike everything else here this is not transactional mail about the
+# account - it is the conversation itself, which is why it carries a reply
+# address and why `can_reply` exists: a deployment with no inbound email must
+# not print an invitation to reply that goes nowhere.
+GROUP_MESSAGE = EmailTemplate(
+    slug='group_message',
+    context_keys=('group_name', 'sender_name', 'body', 'can_reply'),
+)
+
 CATALOGUE = {
     template.slug: template
     for template in (
         VERIFICATION_CODE,
         GROUP_INVITATION,
+        GROUP_MESSAGE,
     )
 }
 
@@ -172,12 +183,22 @@ def send_templated_email(template, to, context=None, **kwargs):
     )
 
 
-def send_email(to, subject, html, text=None, *, reply_to=None, idempotency_key=None):
+def send_email(to, subject, html, text=None, *, reply_to=None, from_email=None,
+               headers=None, idempotency_key=None):
     """Hand a finished message to Resend.
 
     Prefer `send_templated_email`. This is the transport, exposed because a
     one-off - an operational notice from a management command - should not have
     to invent a template directory to exist.
+
+    `from_email` overrides the sender for callers that need a display name -
+    `Family via Loopd <no-reply@loopdn.com>` for a group's own messages. The
+    address part still has to be on a domain Resend has verified, so this
+    changes the name in front of it and not who is really sending.
+
+    `headers` adds raw headers. Used for the ones that only mean anything to
+    another mail system rather than to a person - `Auto-Submitted`, and
+    threading - so they do not each need a parameter of their own.
 
     Returns the Resend message id, or None when running unconfigured.
     Raises EmailError if Resend refused or could not be reached.
@@ -194,6 +215,12 @@ def send_email(to, subject, html, text=None, *, reply_to=None, idempotency_key=N
         if '\n' in address or '\r' in address:
             raise EmailError('That email address is not valid.')
 
+    sender = (from_email or settings.DEFAULT_FROM_EMAIL).strip()
+    # The same rule for the From header, and it matters more here: the display
+    # name in front of the address is a GROUP NAME, which somebody typed.
+    if '\n' in sender or '\r' in sender:
+        raise EmailError('That sender address is not valid.')
+
     if not _is_configured():
         logger.info(
             'Email (not sent - Resend not configured) to %s\nSubject: %s\n%s',
@@ -204,7 +231,7 @@ def send_email(to, subject, html, text=None, *, reply_to=None, idempotency_key=N
         return None
 
     payload = {
-        'from': settings.DEFAULT_FROM_EMAIL,
+        'from': sender,
         'to': recipients,
         'subject': subject,
         'html': html,
@@ -218,6 +245,13 @@ def send_email(to, subject, html, text=None, *, reply_to=None, idempotency_key=N
         payload['text'] = text
     if reply_to:
         payload['reply_to'] = reply_to
+    if headers:
+        # Same rule as the addresses above, and for the same reason: a newline
+        # in a header value appends headers of the sender's choosing.
+        for key, value in headers.items():
+            if '\n' in str(value) or '\r' in str(value):
+                raise EmailError('That email header is not valid.')
+        payload['headers'] = {key: str(value) for key, value in headers.items()}
 
     data = _post(
         f'{RESEND_API_ROOT}/emails',

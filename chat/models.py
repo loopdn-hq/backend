@@ -399,6 +399,12 @@ class Conversation(models.Model):
             phone_row.user = user
             phone_row.status = Participant.Status.ACTIVE
             phone_row.save(update_fields=['user', 'status'])
+            # The row now belongs to a verified account, so email applies to it
+            # the way it does to any other member. SMS deliberately does not -
+            # see chat/membership.py:grant_email_consent_on_claim.
+            from chat.membership import grant_email_consent_on_claim
+
+            grant_email_consent_on_claim(phone_row)
             return phone_row
 
         # Already here as an account *and* as a number: one human, two rows.
@@ -794,6 +800,11 @@ class Message(models.Model):
     class Source(models.TextChoices):
         APP = 'app', 'App'
         SMS = 'sms', 'SMS'
+        # Somebody replied to one of the group's emails. Stored for the same
+        # reason SMS is: the message itself is an ordinary message and reads
+        # identically to everyone, but where it came in matters when working
+        # out why a delivery behaved the way it did.
+        EMAIL = 'email', 'Email'
         SYSTEM = 'system', 'System'
 
     conversation = models.ForeignKey(

@@ -463,6 +463,35 @@ def set_channel_consent(participant, channel, status, *, when=None):
     return consent
 
 
+def grant_email_consent_on_claim(participant):
+    """A row that has just gained an account may be emailed about this group.
+
+    Called from the two paths that turn a phone-only or address-only row into a
+    real membership. Both of them mean the same thing: the person reading that
+    mailbox proved it is theirs, and being added to a group by an address you
+    have verified is agreeing to hear from it - that is what the invitation
+    said and what accepting it was.
+
+    Deliberately NOT the same treatment as SMS, and the asymmetry is the point.
+    Nobody has confirmed the phone number by text, so its answer stays PENDING
+    until they reply YES. Signing up with an email address is not a reply to a
+    question about a number.
+
+    Only PENDING is upgraded. Somebody who declined this group, or who replied
+    STOP, has answered - and verifying an address is not a way to overwrite it.
+    """
+    if participant.user_id is None:
+        return None
+
+    answer = consent_status(participant, ChannelConsent.Channel.EMAIL)
+    if answer is not None and answer != ChannelConsent.Status.PENDING:
+        return None
+
+    return set_channel_consent(
+        participant, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.OPTED_IN
+    )
+
+
 def consent_status(participant, channel):
     """This member's answer for one channel, or None if there is no record."""
     consent = ChannelConsent.objects.filter(
@@ -906,6 +935,7 @@ def claim_email_invitations(user):
             row.email = None
             row.status = Participant.Status.ACTIVE
             row.save(update_fields=['user', 'email', 'status'])
+            grant_email_consent_on_claim(row)
             claimed += 1
             _announce_membership(row)
             continue

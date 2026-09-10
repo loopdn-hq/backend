@@ -27,8 +27,19 @@ Archive is the one that has to be stated rather than assumed. It hides a
 conversation from a list; it is not a request for silence. Muting is how
 somebody asks for that, and a member who tidied a group away still expects the
 text when somebody posts.
+
+CHANNELS REGISTER THEMSELVES
+----------------------------
+`chat` does not know which channels exist. Each one calls `register_channel`
+from its own AppConfig.ready(), so adding voice is a new app and not an edit to
+the path every message in the product goes through - see `schedule_all` at the
+foot of this module.
 """
+import logging
+
 from chat.models import ChannelConsent, Participant
+
+logger = logging.getLogger(__name__)
 
 
 def refusal_reason(participant, channel):
@@ -123,3 +134,47 @@ def _consent_reason(consent):
     if consent.status == ChannelConsent.Status.DECLINED:
         return 'declined this group'
     return 'consent not granted'
+
+
+# --- the registry ----------------------------------------------------------
+#
+# One entry per installed channel. Held in a module global rather than read
+# from settings because the list is a fact about which apps are installed, and
+# an app that is installed but forgot to register is a bug worth having no
+# second place to hide.
+
+_channels = {}
+
+
+def register_channel(name, scheduler):
+    """Announce that this channel wants a copy of every new message.
+
+    `scheduler` is called with the Message and is responsible for queueing its
+    own fan-out after the transaction commits - never for sending anything
+    inline. Registering the same name twice replaces it, which is what keeps a
+    reloaded AppConfig from doubling the fan-out.
+    """
+    _channels[name] = scheduler
+
+
+def registered_channels():
+    """The channel names currently installed, for checks and diagnostics."""
+    return sorted(_channels)
+
+
+def schedule_all(message):
+    """Offer one new message to every installed channel.
+
+    Nothing raised by a channel may escape. This is called from the message
+    write path, so one channel's misconfiguration must not fail a message that
+    is already stored and already visible in the app to everybody else - and it
+    must not stop the other channels either, which is why the loop catches per
+    channel rather than around the whole thing.
+    """
+    for name, scheduler in list(_channels.items()):
+        try:
+            scheduler(message)
+        except Exception:
+            logger.exception(
+                'Could not schedule %s delivery for message %s', name, message.pk
+            )

@@ -103,6 +103,17 @@ class Profile(models.Model):
     # address changes, which is why is_active must not follow it.
     email_verified = models.BooleanField(default=False)
 
+    # The same master switch as `sms_enabled`, for group email, and it works
+    # the same way: it only ever subtracts. Whether a given group emails you is
+    # decided per membership by `chat.ChannelConsent`; this is the one control
+    # that stops every group at once.
+    #
+    # Only group traffic. Verification codes and password resets are not
+    # subject to it - an account that cannot receive the code to get back into
+    # itself is an account somebody has locked themselves out of, and nobody
+    # who unticks "email updates" means that.
+    email_enabled = models.BooleanField(default=True, db_default=True)
+
     bio = models.CharField(max_length=280, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
 

@@ -131,10 +131,11 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     # workers would otherwise race the transaction and fetch nothing.
     transaction.on_commit(lambda: broadcast_message(message))
 
-    # And out to anybody taking part by text. Scheduled, never run inline: this
-    # is N provider calls, and it must not happen inside the transaction that
-    # is still holding the row - see sms/outbound.py:schedule.
-    _schedule_sms_fanout(message)
+    # And out to anybody taking part on a channel outside the app. Scheduled,
+    # never run inline: each channel is N provider calls, and none of it may
+    # happen inside the transaction still holding this row - see
+    # sms/outbound.py:schedule.
+    _schedule_delivery(message)
     return message
 
 
@@ -293,18 +294,21 @@ def broadcast_removed_from_conversation(conversation, users):
         )
 
 
-def _schedule_sms_fanout(message):
-    """Hand a new message to the SMS fan-out, if the app is installed.
+def _schedule_delivery(message):
+    """Hand a new message to every delivery channel that is installed.
+
+    This used to name `sms.outbound.schedule` directly. It does not any more,
+    because the second channel would have added a second import and a second
+    call here - and the third a third, on the single code path every message in
+    the product goes through. Channels register themselves instead; see
+    `chat/delivery.py:register_channel`.
 
     A function-local import, which is the house style for the one direction
-    `chat` must not depend on at module level: `sms` imports `chat`, so the
-    reverse at import time would be a cycle.
+    `chat` must not depend on at module level.
     """
-    try:
-        from sms.outbound import schedule
-    except ImportError:  # pragma: no cover - sms is always installed today
-        return
-    schedule(message)
+    from chat import delivery
+
+    delivery.schedule_all(message)
 
 
 def broadcast_join_request(conversation, participant):
