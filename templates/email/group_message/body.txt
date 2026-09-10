@@ -3,3 +3,9 @@
 {{ body }}
 
 {% if can_reply %}Reply to this email to respond to the group.{% else %}Open {{ product_name }} to respond to the group.{% endif %}
+
+-- 
+You are getting this because you are in {{ group_name }} on {{ product_name }}.
+{% if can_reply %}To stop emails from this group, reply: {{ stop_keyword }}
+{% endif %}{% if unsubscribe_url %}{% if can_reply %}Or use this link{% else %}To stop emails from this group, use this link{% endif %}: {{ unsubscribe_url }}
+{% endif %}Other groups are not affected.

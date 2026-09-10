@@ -381,11 +381,17 @@ def set_role(participant, role, by):
     return participant
 
 
-def set_delivery(participant, *, muted=None, sms_enabled=None):
+def set_delivery(participant, *, muted=None, sms_enabled=None, email_enabled=None):
     """Change how one member receives one conversation.
 
     Only what was asked for is written, so a client toggling the mute switch
     cannot accidentally reset somebody's SMS preference back to the default.
+
+    The three switches do not live in the same place, and that is not an
+    inconsistency. `muted` and `sms_enabled` are columns on the membership;
+    email's answer is a ChannelConsent row, because consent is per channel and
+    a column per channel would mean a migration every time one is added. This
+    function is where that stops mattering to a caller.
     """
     if participant.status != Participant.Status.ACTIVE:
         raise NotAMember('You are not a member of that conversation.')
@@ -400,6 +406,9 @@ def set_delivery(participant, *, muted=None, sms_enabled=None):
 
     if fields:
         participant.save(update_fields=fields)
+
+    if email_enabled is not None:
+        set_group_email(participant, email_enabled)
     return participant
 
 
@@ -456,11 +465,74 @@ def set_channel_consent(participant, channel, status, *, when=None):
     consent.status = status
     if status == ChannelConsent.Status.OPTED_IN:
         consent.consented_at = stamp
-    elif status == ChannelConsent.Status.OPTED_OUT:
+    elif status in (
+        ChannelConsent.Status.OPTED_OUT,
+        ChannelConsent.Status.DECLINED,
+    ):
+        # DECLINED belongs here too. It used to stamp nothing at all, which
+        # contradicts the paragraph above: when somebody said NO is exactly
+        # what a consent complaint turns on, and it is the harder of the two
+        # to reconstruct afterwards - an opt-in usually has an invitation
+        # beside it, a refusal has nothing.
         consent.opted_out_at = stamp
 
     consent.save(update_fields=['status', 'consented_at', 'opted_out_at', 'updated_at'])
     return consent
+
+
+def decline_email(participant):
+    """Stop this group emailing this member. The one-way exit.
+
+    Behind the unsubscribe link, the mail client's one-click POST, and a reply
+    of STOP EMAILS - three doors into one room, so there is one place to get
+    the rule right.
+
+    Deliberately does NOT require an active membership, unlike every other
+    self-service setter here. The link is printed into an email and lives in a
+    mailbox for as long as the mail does, so it will be pressed by people who
+    have since left, been removed, or been blocked. Recording their answer is
+    correct and it survives a rejoin: `grant_email_consent_on_claim` only
+    upgrades PENDING, so it will not overwrite this.
+
+    Returns True when something actually changed, so a caller can be honest
+    about a repeat without having to compare the row itself.
+    """
+    already = consent_status(participant, ChannelConsent.Channel.EMAIL)
+    set_channel_consent(
+        participant, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.DECLINED
+    )
+    return already != ChannelConsent.Status.DECLINED
+
+
+def set_group_email(participant, enabled):
+    """The member's own switch for one group's email, from inside the app.
+
+    The only door that turns email back ON, which is why this one does require
+    an active membership and the unsubscribe link does not. Nothing reachable
+    from an emailed token may add - a forwarded link must not let a stranger
+    undo somebody's decision.
+
+    It will not clear an OPTED_OUT. That state is the provider's verdict - a
+    spam complaint the mailbox provider already acted on - and an app toggle
+    must not overturn it, for the same reason `invite_by_phone` refuses to
+    reset a STOP and only START may. Nothing writes email OPTED_OUT yet; the
+    guard goes in now because the complaint webhook is the next piece of work
+    and this is the rule the SMS side learned the hard way.
+    """
+    if participant.status != Participant.Status.ACTIVE:
+        raise NotAMember('You are not a member of that conversation.')
+
+    answer = consent_status(participant, ChannelConsent.Channel.EMAIL)
+    if answer == ChannelConsent.Status.OPTED_OUT:
+        return participant
+
+    set_channel_consent(
+        participant,
+        ChannelConsent.Channel.EMAIL,
+        ChannelConsent.Status.OPTED_IN if enabled
+        else ChannelConsent.Status.DECLINED,
+    )
+    return participant
 
 
 def grant_email_consent_on_claim(participant):

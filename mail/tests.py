@@ -34,12 +34,19 @@ from chat.models import (
     Participant,
 )
 from chat.services import create_message
-from mail import inbound, outbound
+from mail import commands, inbound, outbound
 from mail.models import EmailDelivery, EmailWebhookEvent
 from mail.quoting import strip_quoted_reply
-from mail.tokens import participant_id_from, reply_address
+from mail.tokens import (
+    participant_id_from,
+    participant_id_from_unsubscribe,
+    reply_address,
+    unsubscribe_token_for,
+    unsubscribe_url,
+)
 
 REPLY_DOMAIN = 'reply.loopdn.com'
+API_URL = 'https://api.loopdn.com'
 
 
 def make_user(username, *, verified=True):
@@ -904,3 +911,496 @@ class ChannelConsentDefaultTests(TestCase):
             membership.consent_status(row, ChannelConsent.Channel.SMS),
             ChannelConsent.Status.PENDING,
         )
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, API_PUBLIC_URL=API_URL)
+class UnsubscribeTokenTests(TestCase):
+    """The link is a name, not a permission - and not the reply address."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.bob_row = Participant.objects.get(
+            conversation=self.group, user=self.bob
+        )
+
+    def test_a_token_resolves_back_to_its_membership(self):
+        token = unsubscribe_token_for(self.bob_row.pk)
+
+        self.assertEqual(participant_id_from_unsubscribe(token), self.bob_row.pk)
+
+    def test_a_reply_token_is_not_an_unsubscribe_token(self):
+        # The reason the two salts differ, and the security boundary of the
+        # whole feature: the reply address is printed in every group email and
+        # travels in every forward of it. If the tags were interchangeable,
+        # holding one would be holding both.
+        reply_tag = reply_address(self.bob_row).split('@')[0].split('.')[1]
+
+        self.assertIsNone(
+            participant_id_from_unsubscribe(f'{self.bob_row.pk}.{reply_tag}')
+        )
+
+    def test_and_an_unsubscribe_token_is_not_a_reply_address(self):
+        tag = unsubscribe_token_for(self.bob_row.pk).split('.')[1]
+
+        self.assertIsNone(
+            participant_id_from(f'reply+{self.bob_row.pk}.{tag}@{REPLY_DOMAIN}')
+        )
+
+    def test_a_tampered_tag_resolves_to_nothing(self):
+        token = unsubscribe_token_for(self.bob_row.pk)
+        forged = f'{token[:-1]}{"0" if token[-1] != "0" else "1"}'
+
+        self.assertIsNone(participant_id_from_unsubscribe(forged))
+
+    def test_pointing_a_valid_tag_at_somebody_else_resolves_to_nothing(self):
+        tag = unsubscribe_token_for(self.bob_row.pk).split('.')[1]
+        alice_row = Participant.objects.get(
+            conversation=self.group, user=self.alice
+        )
+
+        self.assertIsNone(
+            participant_id_from_unsubscribe(f'{alice_row.pk}.{tag}')
+        )
+
+    def test_nonsense_resolves_to_nothing(self):
+        for token in ['', 'nonsense', '1.', '.abc', '1.NOTHEX0000000000000']:
+            with self.subTest(token=token):
+                self.assertIsNone(participant_id_from_unsubscribe(token))
+
+    def test_the_url_is_short_and_url_safe(self):
+        url = unsubscribe_url(self.bob_row)
+
+        self.assertTrue(url.startswith(f'{API_URL}/mail/unsubscribe/'))
+        self.assertTrue(url.endswith('/'))
+        self.assertNotIn('api/v1', url)
+        # Wrapped URLs break in text/plain bodies.
+        self.assertLess(len(url), 78)
+
+    @override_settings(API_PUBLIC_URL='')
+    def test_with_no_public_url_there_is_no_link(self):
+        self.assertIsNone(unsubscribe_url(self.bob_row))
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, API_PUBLIC_URL=API_URL)
+class UnsubscribeEndpointTests(APITestCase):
+    """The public page. Idempotent, inert on GET, and never an oracle."""
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.family = Conversation.start_group(self.alice, name='Family')
+        self.work = Conversation.start_group(self.alice, name='Work')
+        self.family.add_participant(self.bob)
+        self.work.add_participant(self.bob)
+        self.bob_family = Participant.objects.get(
+            conversation=self.family, user=self.bob
+        )
+        self.bob_work = Participant.objects.get(
+            conversation=self.work, user=self.bob
+        )
+
+    def url(self, participant=None):
+        token = unsubscribe_token_for((participant or self.bob_family).pk)
+        return reverse('mail-unsubscribe', args=[token])
+
+    def email_consent(self, participant):
+        return membership.consent_status(
+            participant, ChannelConsent.Channel.EMAIL
+        )
+
+    # --- GET writes nothing -------------------------------------------------
+
+    def test_get_changes_nothing(self):
+        # Corporate link scanners fetch every URL in every inbound message.
+        # A state-changing GET would opt out a whole company on the first send.
+        response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_get_names_the_group(self):
+        response = self.client.get(self.url())
+
+        self.assertContains(response, 'Family')
+
+    def test_get_is_not_cached_or_indexed(self):
+        response = self.client.get(self.url())
+
+        self.assertEqual(response['Cache-Control'], 'no-store')
+        self.assertIn('noindex', response['X-Robots-Tag'])
+
+    # --- POST acts, once ----------------------------------------------------
+
+    def test_post_stops_that_group(self):
+        response = self.client.post(self.url())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+    def test_and_leaves_every_other_group_alone(self):
+        # The requirement this whole feature turns on.
+        self.client.post(self.url())
+
+        self.assertEqual(
+            self.email_consent(self.bob_work), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_and_leaves_the_account_wide_switch_alone(self):
+        self.client.post(self.url())
+
+        self.bob.profile.refresh_from_db()
+        self.assertTrue(self.bob.profile.email_enabled)
+
+    def test_and_leaves_sms_alone(self):
+        self.client.post(self.url())
+
+        self.assertEqual(
+            membership.consent_status(
+                self.bob_family, ChannelConsent.Channel.SMS
+            ),
+            ChannelConsent.Status.OPTED_IN,
+        )
+
+    def test_it_records_when_they_said_no(self):
+        self.client.post(self.url())
+
+        consent = self.bob_family.channel_consents.get(
+            channel=ChannelConsent.Channel.EMAIL
+        )
+        self.assertIsNotNone(consent.opted_out_at)
+
+    def test_posting_twice_is_one_outcome(self):
+        self.client.post(self.url())
+        response = self.client.post(self.url())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+    def test_the_fan_out_then_skips_them(self):
+        self.client.post(self.url())
+
+        send_to, skipped = outbound.recipients_for(
+            create_message(self.family, self.alice, text='Dinner at 7 PM.')
+        )
+
+        self.assertEqual(send_to, [])
+        self.assertEqual(
+            dict((row.pk, reason) for row, reason in skipped)[self.bob_family.pk],
+            'declined this group',
+        )
+
+    def test_somebody_who_left_can_still_stop_it(self):
+        # The link outlives the membership - it is in a mailbox for as long as
+        # the mail is.
+        membership.leave(self.bob_family)
+
+        response = self.client.post(self.url())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+    # --- and is never an oracle ---------------------------------------------
+
+    def test_a_tampered_token_looks_exactly_the_same(self):
+        good = self.client.post(self.url())
+        bad = self.client.post(
+            reverse('mail-unsubscribe', args=['999999.0000000000000000abcd'])
+        )
+
+        self.assertEqual(bad.status_code, good.status_code)
+        self.assertEqual(
+            self.email_consent(self.bob_work), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_past_the_cap_it_still_answers(self):
+        # Idempotent, so telling them it is done is true rather than a fiction.
+        for _ in range(25):
+            response = self.client.post(self.url())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, API_PUBLIC_URL=API_URL)
+class GroupEmailFooterTests(TestCase):
+    """Every group email carries a way out, in both parts."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+
+    def send(self):
+        with capture_sent() as sent:
+            outbound.fan_out(
+                create_message(self.group, self.alice, text='Dinner at 7 PM.')
+            )
+        return sent[0]
+
+    def test_it_carries_one_click_unsubscribe(self):
+        payload = self.send()
+
+        self.assertTrue(
+            payload['headers']['List-Unsubscribe'].startswith(f'<{API_URL}/mail/')
+        )
+        self.assertEqual(
+            payload['headers']['List-Unsubscribe-Post'],
+            'List-Unsubscribe=One-Click',
+        )
+
+    def test_the_link_is_ours_and_not_the_providers(self):
+        # A provider-hosted unsubscribe lands on its ACCOUNT suppression list,
+        # which really would stop every Loopd email to that address.
+        payload = self.send()
+
+        self.assertNotIn('resend', payload['headers']['List-Unsubscribe'].lower())
+        self.assertNotIn('RESEND_UNSUBSCRIBE_URL', payload['html'])
+
+    def test_it_carries_a_per_group_list_id(self):
+        # Mail clients key their own unsubscribe control on the SENDER, and
+        # every group shares one From address. This is what tells them apart.
+        payload = self.send()
+
+        self.assertEqual(
+            payload['headers']['List-ID'], f'<group-{self.group.pk}.lists.loopdn.com>'
+        )
+
+    def test_two_members_get_different_links(self):
+        carol = make_user('carol')
+        self.group.add_participant(carol)
+
+        with capture_sent() as sent:
+            outbound.fan_out(
+                create_message(self.group, self.alice, text='Dinner at 7 PM.')
+            )
+
+        links = {payload['headers']['List-Unsubscribe'] for payload in sent}
+        self.assertEqual(len(links), 2)
+
+    def test_the_text_part_carries_the_keyword_and_the_link(self):
+        payload = self.send()
+
+        self.assertIn(commands.KEYWORD, payload['text'])
+        self.assertIn('/mail/unsubscribe/', payload['text'])
+
+    def test_the_html_part_carries_them_too(self):
+        payload = self.send()
+
+        self.assertIn(commands.KEYWORD, payload['html'])
+        self.assertIn('/mail/unsubscribe/', payload['html'])
+
+    def test_the_footer_opens_with_a_signature_marker(self):
+        # `-- ` with its trailing space is RFC 3676, and it is what every
+        # quote-stripper cuts at - which is what stops our own footer being
+        # read back as a command. Editors strip trailing whitespace on save,
+        # so this asserts it survived.
+        payload = self.send()
+
+        self.assertIn('\n-- \n', payload['text'])
+
+    def test_both_parts_say_other_groups_are_unaffected(self):
+        # The only sentence that reaches somebody who pressed their mail
+        # client's own Unsubscribe button, since the client never renders our
+        # response.
+        payload = self.send()
+
+        self.assertIn('Other groups are not affected', payload['text'])
+        self.assertIn('Other groups are not affected', payload['html'])
+
+    @override_settings(MAIL_REPLY_DOMAIN='')
+    def test_with_replies_off_the_link_stands_alone(self):
+        payload = self.send()
+
+        self.assertNotIn(commands.KEYWORD, payload['text'])
+        self.assertIn('/mail/unsubscribe/', payload['text'])
+
+    @override_settings(API_PUBLIC_URL='')
+    def test_with_no_public_url_there_is_no_header(self):
+        payload = self.send()
+
+        self.assertNotIn('List-Unsubscribe', payload['headers'])
+        self.assertIn('List-ID', payload['headers'])
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, API_PUBLIC_URL=API_URL)
+class EmailKeywordTests(TestCase):
+    """Replying STOP EMAILS, and everything that is not that."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.family = Conversation.start_group(self.alice, name='Family')
+        self.work = Conversation.start_group(self.alice, name='Work')
+        self.family.add_participant(self.bob)
+        self.work.add_participant(self.bob)
+        self.bob_family = Participant.objects.get(
+            conversation=self.family, user=self.bob
+        )
+        self.bob_work = Participant.objects.get(
+            conversation=self.work, user=self.bob
+        )
+
+    def reply(self, body, participant=None):
+        row = participant or self.bob_family
+        return inbound.handle_inbound(
+            reply_address(row), 'bob@example.com', body
+        )
+
+    def email_consent(self, participant):
+        return membership.consent_status(
+            participant, ChannelConsent.Channel.EMAIL
+        )
+
+    def test_the_keyword_stops_that_group(self):
+        result = self.reply('STOP EMAILS')
+
+        self.assertEqual(result.action, 'email_declined')
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+    def test_and_posts_nothing_into_the_group(self):
+        self.reply('STOP EMAILS')
+
+        self.assertEqual(self.family.messages.count(), 0)
+
+    def test_and_leaves_other_groups_alone(self):
+        self.reply('STOP EMAILS')
+
+        self.assertEqual(
+            self.email_consent(self.bob_work), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_the_shapes_a_person_actually_types(self):
+        for body in ['stop emails', 'Stop Emails', 'STOP EMAILS.', ' STOP EMAILS ',
+                     'STOP EMAIL', 'STOP  EMAILS', 'STOP\nEMAILS']:
+            with self.subTest(body=body):
+                self.assertTrue(commands.is_stop_emails(body))
+
+    def test_the_words_inside_a_sentence_are_a_message(self):
+        # The SMS lesson, held for email: a command is the whole message.
+        result = self.reply('please stop emails about the party, thanks')
+
+        self.assertEqual(result.action, 'posted')
+        self.assertEqual(self.family.messages.count(), 1)
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_our_own_footer_quoted_back_is_not_a_command(self):
+        # Every group email prints the keyword, so most replies carry it in the
+        # thread underneath. Stripping runs first, which is what stops us
+        # reading our own instructions as an instruction.
+        result = self.reply(
+            "See you there.\n"
+            "\n"
+            "On Mon, Family via Loopd wrote:\n"
+            "> Dinner at 7 PM.\n"
+            ">\n"
+            "> -- \n"
+            "> You are getting this because you are in Family on Loopd.\n"
+            "> To stop emails from this group, reply: STOP EMAILS\n"
+            "> Other groups are not affected.\n"
+        )
+
+        self.assertEqual(result.action, 'posted')
+        self.assertEqual(self.family.messages.first().text, 'See you there.')
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_the_keyword_from_the_wrong_address_does_nothing(self):
+        result = inbound.handle_inbound(
+            reply_address(self.bob_family), 'mallory@example.com', 'STOP EMAILS'
+        )
+
+        self.assertEqual(result.action, 'ignored_address_mismatch')
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_a_second_one_is_idempotent(self):
+        self.reply('STOP EMAILS')
+        result = self.reply('STOP EMAILS')
+
+        self.assertEqual(result.action, 'email_declined')
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+    def test_they_can_still_reply_normally_afterwards(self):
+        # Consent is about receiving. Somebody who stopped the email still
+        # takes part.
+        self.reply('STOP EMAILS')
+
+        result = self.reply('On my way')
+
+        self.assertEqual(result.action, 'posted')
+
+
+class UnsubscribeConfirmationTests(TransactionTestCase):
+    """The one path that gets an email back, and the ones that do not.
+
+    TransactionTestCase because the confirmation is queued with
+    `transaction.on_commit` - deliberately, so nothing is sent about a
+    preference that then rolls back.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.bob_row = Participant.objects.get(
+            conversation=self.group, user=self.bob
+        )
+
+    @override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, API_PUBLIC_URL=API_URL)
+    def test_the_keyword_gets_one_email_back(self):
+        # A member who replies and hears nothing does not know it worked, and
+        # the next thing they do is press Report spam.
+        with capture_sent() as sent:
+            inbound.handle_inbound(
+                reply_address(self.bob_row), 'bob@example.com', 'STOP EMAILS'
+            )
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]['to'], ['bob@example.com'])
+        self.assertIn('Family', sent[0]['subject'])
+
+    @override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, API_PUBLIC_URL=API_URL)
+    def test_and_it_does_not_offer_to_unsubscribe_again(self):
+        with capture_sent() as sent:
+            inbound.handle_inbound(
+                reply_address(self.bob_row), 'bob@example.com', 'STOP EMAILS'
+            )
+
+        self.assertNotIn('List-Unsubscribe', sent[0]['headers'])
+
+    @override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, API_PUBLIC_URL=API_URL)
+    def test_the_link_path_gets_no_email(self):
+        # A mail arriving AFTER somebody pressed unsubscribe reads as being
+        # ignored, and that is the click that becomes a spam complaint.
+        token = unsubscribe_token_for(self.bob_row.pk)
+
+        with capture_sent() as sent:
+            self.client.post(reverse('mail-unsubscribe', args=[token]))
+
+        self.assertEqual(sent, [])

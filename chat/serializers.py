@@ -9,6 +9,7 @@ from chat.models import (
     Notification,
     Attachment,
     BlockedFromConversation,
+    ChannelConsent,
     Conversation,
     Message,
     Participant,
@@ -150,6 +151,7 @@ class ParticipantSerializer(serializers.ModelSerializer):
     user = PublicUserSerializer(read_only=True)
     display_label = serializers.CharField(read_only=True)
     is_phone_only = serializers.BooleanField(read_only=True)
+    email_enabled = serializers.SerializerMethodField()
 
     class Meta:
         model = Participant
@@ -162,6 +164,7 @@ class ParticipantSerializer(serializers.ModelSerializer):
             'status',
             'muted',
             'sms_enabled',
+            'email_enabled',
             # How far this member has read, so a client can show a sender
             # whether their message has been seen. Null for anybody who has
             # read nothing - and permanently null for a phone-only member,
@@ -171,6 +174,22 @@ class ParticipantSerializer(serializers.ModelSerializer):
             'joined_at',
         ]
         read_only_fields = fields
+
+    def get_email_enabled(self, obj):
+        """Whether this member currently takes this group by email.
+
+        Derived rather than stored. Email's answer is a ChannelConsent row and
+        not a column, because consent is per channel and a column per channel
+        would mean a migration every time one is added. A client toggling it
+        posts to `delivery/` exactly as it does for the other two switches, so
+        the asymmetry stops here rather than reaching the API.
+
+        Reads the prefetch when there is one - the same reader the fan-out uses.
+        """
+        from chat.delivery import consent_for
+
+        consent = consent_for(obj, ChannelConsent.Channel.EMAIL)
+        return bool(consent and consent.allows_delivery)
 
 
 class GroupSettingsFieldsSerializer(serializers.Serializer):
@@ -1164,23 +1183,28 @@ class MarkReadSerializer(serializers.Serializer):
 class DeliveryPreferenceSerializer(serializers.Serializer):
     """How one member wants one group delivered to them.
 
-    Two separate switches, because they answer different questions:
+    Three separate switches, because they answer different questions:
 
-      muted        silence this group entirely, on every channel. The member's
-                   own act, and what texting MUTE sets.
-      sms_enabled  whether SMS is one of this group's channels for them at all.
-                   On by default; off means app-only.
+      muted         silence this group entirely, on every channel. The member's
+                    own act, and what texting MUTE sets.
+      sms_enabled   whether SMS is one of this group's channels for them at all.
+                    On by default; off means app-only.
+      email_enabled the same question for email. Off is what the unsubscribe
+                    link in every group email writes - and this endpoint is the
+                    only thing that can turn it back ON, because nothing
+                    reachable from an emailed token may add.
 
-    Both optional, so a client changing one does not have to know the other.
+    All optional, so a client changing one does not have to know the others.
     """
 
     muted = serializers.BooleanField(required=False)
     sms_enabled = serializers.BooleanField(required=False)
+    email_enabled = serializers.BooleanField(required=False)
 
     def validate(self, attrs):
         if not attrs:
             raise serializers.ValidationError(
-                'Set muted, sms_enabled, or both.'
+                'Set muted, sms_enabled, email_enabled, or any combination.'
             )
         return attrs
 

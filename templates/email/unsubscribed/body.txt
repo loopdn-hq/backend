@@ -1,0 +1,11 @@
+Done - emails from "{{ group_name }}" are off.
+
+Your other groups are not affected, and you will still see every message in
+{{ product_name }}.
+
+To turn them back on, open {{ group_name }} in {{ product_name }} and switch
+email updates on:
+
+{{ app_url }}
+
+Questions? Reach us at {{ support_address }}.

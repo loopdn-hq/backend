@@ -396,6 +396,32 @@ MAIL_MAX_RECIPIENTS_PER_MESSAGE = int(
     os.environ.get('MAIL_MAX_RECIPIENTS_PER_MESSAGE', '100')
 )
 
+# This API's own public origin, for the links it prints INTO email. Distinct
+# from FRONTEND_URL, which is where the app lives: the unsubscribe page is
+# served by Django, because a static export on another origin cannot verify a
+# token and must not be what stands between somebody and the way out.
+#
+# There is nothing to build an absolute URL from at send time - the fan-out
+# runs on a Celery worker with no request - so this is configuration rather
+# than something to derive. mail/checks.py refuses a deploy that has group
+# email on and leaves this empty.
+API_PUBLIC_URL = os.environ.get('API_PUBLIC_URL', '').rstrip('/')
+
+# A leaked unsubscribe link must not become a write amplifier. Same cache
+# fixed-window idiom as sms/inbound.py:_join_attempt_allowed. High enough that
+# a real member clicking twice never notices; and because the operation is
+# idempotent, a caller past the cap is simply told what is already true.
+MAIL_MAX_UNSUBSCRIBE_ATTEMPTS_PER_HOUR = int(
+    os.environ.get('MAIL_MAX_UNSUBSCRIBE_ATTEMPTS_PER_HOUR', '20')
+)
+
+# Signs the unsubscribe token. Defaults to SECRET_KEY, so leaving it unset
+# changes nothing at all - it exists so that rotating SECRET_KEY one day does
+# not have to invalidate every unsubscribe link already sitting in somebody's
+# mailbox, which is a worse failure than it sounds: unlike a reply address,
+# nothing replaces a dead unsubscribe link except the next email.
+MAIL_TOKEN_SECRET = os.environ.get('MAIL_TOKEN_SECRET', '') or SECRET_KEY
+
 # Where the frontend lives, for building links that go out in email (password
 # reset today). No trailing slash - callers append their own path.
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://loopdn.com').rstrip('/')

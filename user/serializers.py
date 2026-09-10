@@ -54,6 +54,10 @@ class ProfileSerializer(serializers.ModelSerializer):
             'phone_number',
             'phone_no_verified',
             'email_verified',
+            # The account-wide switch for group email. Writable, unlike its SMS
+            # sibling: SMS has a carrier word for this and email does not, so
+            # without an endpoint there would be nowhere at all to turn it off.
+            'email_enabled',
             'bio',
             'date_of_birth',
             'is_online',

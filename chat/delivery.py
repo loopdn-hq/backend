@@ -122,8 +122,23 @@ def _channel_enabled(participant, channel):
     """
     if channel == ChannelConsent.Channel.SMS:
         return participant.sms_enabled
-    # Email and voice have no per-membership switch yet. When they gain one it
-    # belongs here, beside SMS's, rather than in the channel's own module.
+
+    # EMAIL DELIBERATELY HAS NO SWITCH HERE, and should not gain one.
+    #
+    # SMS needs both a switch and an answer for reasons email does not share:
+    # `sms_enabled` is also written by an admin screen, and a carrier STOP
+    # sweeps it across every group a phone-only row belongs to. Email has
+    # neither - `mail/outbound.py` refuses every row with no account, so there
+    # are no account-less email recipients, and there is no carrier sweep.
+    #
+    # A `Participant.email_enabled` column would therefore have one writer and
+    # one reader and would always agree with the consent row. Two fields that
+    # must agree is the exact shape of the bug `sms/outbound.py:send_notice`
+    # was fixed for: it read consent alone, the two disagreed, and the notice
+    # believed the wrong one. The member's own answer belongs in one place.
+    #
+    # An ADMIN turning a group's email off is a different question and belongs
+    # on the Conversation, beside `sms_delivery_enabled`, not here.
     return True
 
 

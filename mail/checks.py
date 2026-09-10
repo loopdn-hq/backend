@@ -47,6 +47,25 @@ def check_mail_configuration(app_configs, **kwargs):
             )
         )
 
+    # The one that closes the release blocker for good. Group email shipped
+    # switched off because there was no way for a member to stop it; the way
+    # out is a link this service prints into every message, and it cannot build
+    # an absolute URL without knowing its own public origin. Without it the
+    # channel would ship exactly as broken as before, and silently.
+    if getattr(settings, 'MAIL_SENDING_ENABLED', False) and not getattr(
+        settings, 'API_PUBLIC_URL', ''
+    ):
+        problems.append(
+            Error(
+                'MAIL_SENDING_ENABLED is on but API_PUBLIC_URL is empty, so group '
+                'email would go out with no unsubscribe link and no '
+                'List-Unsubscribe header.',
+                hint="Set API_PUBLIC_URL to this API's public origin, e.g. "
+                     'https://api.loopdn.com.',
+                id='mail.E002',
+            )
+        )
+
     # Outbound with no inbound is a usable product - people read in email and
     # reply in the app - but it is worth saying out loud, because the usual
     # cause is that the reply domain was never configured.

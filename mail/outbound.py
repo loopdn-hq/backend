@@ -29,8 +29,9 @@ from django.db import transaction
 
 from chat import delivery
 from chat.models import ChannelConsent
+from mail import commands
 from mail.models import EmailDelivery
-from mail.tokens import reply_address
+from mail.tokens import reply_address, unsubscribe_url
 from utils.mail import GROUP_MESSAGE, EmailError, send_templated_email
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,31 @@ def from_header(conversation):
     name = ' '.join((conversation.name or '').split())
     label = f'{name} via {settings.EMAIL_PRODUCT_NAME}'
     return formataddr((label, settings.DEFAULT_FROM_EMAIL))
+
+
+def list_id_for(conversation):
+    """`<group-312.lists.loopdn.com>` - RFC 2919, and it earns its place.
+
+    THE PROBLEM IT SOLVES. A mail client's own unsubscribe control keys on the
+    SENDER, and `from_header` puts every group behind one address with only the
+    display name changing. So Gmail can offer "Unsubscribe from
+    no-reply@loopdn.com?", the member presses it believing everything stops, we
+    stop one group, mail keeps arriving from the others - and THAT is what
+    produces a spam complaint, which is the one event that really does suppress
+    an address account-wide at the provider.
+
+    List-ID says "this message belongs to one specific list", which is the
+    standards-blessed way to tell a client that these groups are not one
+    stream. The eventual right answer is a per-group From address, which
+    changes deliverability posture and needs catch-all handling; this gets most
+    of the benefit for one header.
+
+    Deliberately no human-readable phrase part. A group name is user input, a
+    `<` or `>` in it would break the header, and `utils/mail.py` only rejects
+    newlines. The id form is machine-stable and has no injection surface.
+    """
+    domain = (settings.DEFAULT_FROM_EMAIL or '').rpartition('@')[2] or 'loopdn.com'
+    return f'<group-{conversation.pk}.lists.{domain}>'
 
 
 def body_for(message):
@@ -183,6 +209,7 @@ def fan_out(message):
 def _send_one(message, participant, sender, body):
     address = address_for(participant)
     reply_to = reply_address(participant)
+    stop_url = unsubscribe_url(participant)
 
     record = _record(
         message, participant, EmailDelivery.Status.SENDING
@@ -199,6 +226,11 @@ def _send_one(message, participant, sender, body):
                 # False on a deployment with no inbound email, so the template
                 # does not invite a reply that would land nowhere.
                 'can_reply': bool(reply_to),
+                # The way out, in every single message. None when no public API
+                # URL is configured, which the templates branch on - and which
+                # mail/checks.py refuses to let a real deployment do.
+                'unsubscribe_url': stop_url,
+                'stop_keyword': commands.KEYWORD,
             },
             from_email=sender,
             reply_to=reply_to,
@@ -212,7 +244,7 @@ def _send_one(message, participant, sender, body):
             # the header still gets through, and catching that needs the
             # headers off the inbound event, which waits on the real provider
             # payload. This is the half that costs nothing.
-            headers={'Auto-Submitted': 'auto-generated'},
+            headers=_headers_for(message.conversation, stop_url),
             # One send per recipient per message, enforced at the provider as
             # well as by the constraint above - a retry that got as far as
             # Resend must not become a second copy in somebody's inbox.
@@ -233,6 +265,38 @@ def _send_one(message, participant, sender, body):
         update_fields=['status', 'provider', 'provider_message_id', 'updated_at']
     )
     return record
+
+
+def _headers_for(conversation, stop_url):
+    """The headers that only another mail system reads.
+
+    `List-Unsubscribe` and its `-Post` partner are RFC 8058 one-click: together
+    they are what makes a mail client render its own unsubscribe control and
+    POST to us when it is pressed. Gmail and Yahoo's bulk-sender rules expect
+    them, and a missing pair measurably drives complaints - which is the exact
+    outcome this whole path exists to avoid.
+
+    The URL is OURS. Never the provider's unsubscribe machinery, never its
+    merge token: those are account-scoped by construction, so a click on one
+    really would stop all of this product's mail to that address, including the
+    password reset somebody needs to get back into their own account. Ours
+    touches one ChannelConsent row.
+
+    No `mailto:` alternative. `mail/inbound.py` reads the body, and a client
+    that sends an empty-bodied mailto would be answered by silence - a way out
+    that quietly does nothing is worse than not offering it. The https form is
+    what the bulk-sender rules require anyway.
+    """
+    headers = {
+        # RFC 3834: a human did not type this particular send, which is the
+        # signal that stops a vacation responder answering it.
+        'Auto-Submitted': 'auto-generated',
+        'List-ID': list_id_for(conversation),
+    }
+    if stop_url:
+        headers['List-Unsubscribe'] = f'<{stop_url}>'
+        headers['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
+    return headers
 
 
 def _record(message, participant, status, *, reason=''):

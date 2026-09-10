@@ -125,7 +125,23 @@ GROUP_INVITATION = EmailTemplate(
 # not print an invitation to reply that goes nowhere.
 GROUP_MESSAGE = EmailTemplate(
     slug='group_message',
-    context_keys=('group_name', 'sender_name', 'body', 'can_reply'),
+    # `unsubscribe_url` and `stop_keyword` are declared here on purpose, and
+    # this is the line that makes "every group email carries a way out" true in
+    # code rather than by convention: a missing context key raises below,
+    # BEFORE a byte reaches the provider. A group message with no opt-out in it
+    # is now unsendable.
+    context_keys=(
+        'group_name', 'sender_name', 'body', 'can_reply',
+        'unsubscribe_url', 'stop_keyword',
+    ),
+)
+
+# The one email somebody gets AFTER they have asked for no more. Sent only when
+# the request arrived by email, so the answer arrives the same way - see
+# mail/optout.py for why the link path deliberately gets no email at all.
+UNSUBSCRIBED = EmailTemplate(
+    slug='unsubscribed',
+    context_keys=('group_name', 'app_url'),
 )
 
 CATALOGUE = {
@@ -134,6 +150,7 @@ CATALOGUE = {
         VERIFICATION_CODE,
         GROUP_INVITATION,
         GROUP_MESSAGE,
+        UNSUBSCRIBED,
     )
 }
 

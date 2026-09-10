@@ -1187,3 +1187,82 @@ class EmailLookupTests(APITestCase):
         with self.assertRaises(Exception) as caught:
             resolve_members(['ghost@example.com'])
         self.assertIn('ghost@example.com', str(caught.exception))
+
+
+class EmailPreferenceTests(EnvelopeAssertions, APITestCase):
+    """The account-wide switch for group email.
+
+    Exposed, unlike its SMS sibling, and the asymmetry is the point: SMS has a
+    carrier word for this and email does not, so without an endpoint there
+    would be nowhere at all to turn group email off for every group at once.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='alice', password='a-strong-passphrase-42',
+            email='alice@example.com',
+        )
+        self.client.force_authenticate(self.user)
+
+    def url(self):
+        return reverse('user:user-me-profile')
+
+    def test_it_is_on_by_default_and_readable(self):
+        data = self.assertSuccess(self.client.get(self.url()))
+
+        self.assertTrue(data['email_enabled'])
+
+    def test_it_can_be_turned_off(self):
+        data = self.assertSuccess(
+            self.client.patch(self.url(), {'email_enabled': False})
+        )
+
+        self.assertFalse(data['email_enabled'])
+        self.user.profile.refresh_from_db()
+        self.assertFalse(self.user.profile.email_enabled)
+
+    def test_and_back_on(self):
+        self.client.patch(self.url(), {'email_enabled': False})
+
+        data = self.assertSuccess(
+            self.client.patch(self.url(), {'email_enabled': True})
+        )
+
+        self.assertTrue(data['email_enabled'])
+
+    def test_it_does_not_disturb_anything_else(self):
+        self.assertSuccess(
+            self.client.patch(self.url(), {'email_enabled': False})
+        )
+
+        self.user.profile.refresh_from_db()
+        self.assertTrue(self.user.profile.sms_enabled)
+
+    def test_the_sms_switch_is_still_not_writable(self):
+        # Its absence is deliberate: the only thing that writes it is a carrier
+        # STOP. DRF discards an unknown field rather than refusing it, so this
+        # asserts the outcome and not the status code.
+        self.client.patch(self.url(), {'sms_enabled': False})
+
+        self.user.profile.refresh_from_db()
+        self.assertTrue(self.user.profile.sms_enabled)
+
+    def test_turning_group_email_off_does_not_stop_a_verification_code(self):
+        # An account that cannot receive the code to get back into itself is an
+        # account somebody has locked themselves out of, and nobody who unticks
+        # "email updates" means that.
+        from utils.mail import VERIFICATION_CODE, send_templated_email
+
+        profile = self.user.profile
+        profile.email_enabled = False
+        profile.save(update_fields=['email_enabled'])
+
+        with mock.patch('utils.mail._is_configured', return_value=True), \
+                mock.patch('utils.mail._post', return_value={'id': 'x'}) as post:
+            send_templated_email(
+                VERIFICATION_CODE,
+                to=self.user.email,
+                context={'code': '123456', 'expires_in_minutes': 10},
+            )
+
+        self.assertEqual(post.call_count, 1)

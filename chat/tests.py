@@ -3888,6 +3888,22 @@ class DeliveryEngineTests(EnvelopeAssertions, APITestCase):
         self.assertEqual(send_to, [])
         self.assertEqual([reason for _, reason in skipped], ['muted'])
 
+    def test_declining_one_channel_leaves_the_other_alone(self):
+        # The whole reason the ladder is shared is that email and voice ask it
+        # too - so the thing it could quietly get wrong is answering for the
+        # wrong channel.
+        membership.set_channel_consent(
+            self.bob_row,
+            ChannelConsent.Channel.EMAIL,
+            ChannelConsent.Status.DECLINED,
+        )
+
+        self.assertEqual(
+            delivery.refusal_reason(self.bob_row, ChannelConsent.Channel.EMAIL),
+            'declined this group',
+        )
+        self.assertIsNone(self.refusal())
+
     def test_a_new_member_has_an_answer_on_record(self):
         # A missing row reads as a refusal, so a membership created by any
         # route without one would silently stop receiving anything.
@@ -3898,3 +3914,137 @@ class DeliveryEngineTests(EnvelopeAssertions, APITestCase):
         self.assertIsNotNone(
             membership.consent_status(row, ChannelConsent.Channel.SMS)
         )
+
+
+class GroupEmailPreferenceTests(EnvelopeAssertions, APITestCase):
+    """The member's own switch for one group's email.
+
+    The only door that turns email back ON. The unsubscribe link printed in
+    every group email can only ever subtract, because a forwarded link must not
+    let a stranger undo somebody's decision - so this is where the other half
+    of that lives.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.family = Conversation.start_group(self.alice, name='Family')
+        self.work = Conversation.start_group(self.alice, name='Work')
+        self.family.add_participant(self.bob)
+        self.work.add_participant(self.bob)
+        self.bob_family = Participant.objects.get(
+            conversation=self.family, user=self.bob
+        )
+        self.bob_work = Participant.objects.get(
+            conversation=self.work, user=self.bob
+        )
+        self.client.force_authenticate(self.bob)
+
+    def delivery(self, payload, conversation=None):
+        return self.client.post(
+            reverse(
+                'chat:conversation-delivery',
+                args=[(conversation or self.family).id],
+            ),
+            payload,
+            format='json',
+        )
+
+    def email_consent(self, participant):
+        return membership.consent_status(
+            participant, ChannelConsent.Channel.EMAIL
+        )
+
+    def test_turning_email_off_declines_that_group(self):
+        data = self.assertSuccess(self.delivery({'email_enabled': False}))
+
+        self.assertFalse(data['email_enabled'])
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+    def test_and_leaves_every_other_group_alone(self):
+        self.delivery({'email_enabled': False})
+
+        self.assertEqual(
+            self.email_consent(self.bob_work), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_turning_it_back_on_opts_in_again(self):
+        self.delivery({'email_enabled': False})
+
+        data = self.assertSuccess(self.delivery({'email_enabled': True}))
+
+        self.assertTrue(data['email_enabled'])
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_it_will_not_clear_a_provider_level_opt_out(self):
+        # OPTED_OUT is the provider's verdict - a spam complaint the mailbox
+        # provider already acted on - and an app toggle must not overturn it,
+        # exactly as only START clears an SMS stop.
+        membership.set_channel_consent(
+            self.bob_family,
+            ChannelConsent.Channel.EMAIL,
+            ChannelConsent.Status.OPTED_OUT,
+        )
+
+        self.delivery({'email_enabled': True})
+
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.OPTED_OUT
+        )
+
+    def test_it_is_mine_alone(self):
+        self.delivery({'email_enabled': False})
+
+        alice_row = Participant.objects.get(
+            conversation=self.family, user=self.alice
+        )
+        self.assertEqual(
+            self.email_consent(alice_row), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_it_does_not_disturb_the_other_two_switches(self):
+        membership.set_muted(self.bob_family, True)
+
+        self.delivery({'email_enabled': False})
+
+        self.bob_family.refresh_from_db()
+        self.assertTrue(self.bob_family.muted)
+        self.assertTrue(self.bob_family.sms_enabled)
+
+    def test_it_leaves_sms_consent_alone(self):
+        self.delivery({'email_enabled': False})
+
+        self.assertEqual(
+            membership.consent_status(
+                self.bob_family, ChannelConsent.Channel.SMS
+            ),
+            ChannelConsent.Status.OPTED_IN,
+        )
+
+    def test_all_three_switches_can_travel_together(self):
+        self.assertSuccess(
+            self.delivery(
+                {'muted': True, 'sms_enabled': False, 'email_enabled': False}
+            )
+        )
+
+        self.bob_family.refresh_from_db()
+        self.assertTrue(self.bob_family.muted)
+        self.assertFalse(self.bob_family.sms_enabled)
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+    def test_an_empty_body_is_still_refused(self):
+        self.assertFailure(self.delivery({}))
+
+    def test_a_non_member_gets_a_404(self):
+        self.client.force_authenticate(make_user('mallory'))
+
+        response = self.delivery({'email_enabled': False})
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)

@@ -1,0 +1,33 @@
+{% extends "mail/_page.html" %}
+
+{% comment %}
+The done page. Renders on POST, for every outcome including a token that did not
+verify and a caller past the rate limit - one page, one status. See the module
+docstring in mail/views.py.
+{% endcomment %}
+
+{% block title %}Emails stopped{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 8px; font-size:20px; font-weight:600;">
+  {% if group_name %}Done &mdash; emails from {{ group_name }} are off.{% else %}Done.{% endif %}
+</p>
+<p style="margin:0 0 16px; color:#52525b;">
+  Your other groups are not affected, and you will still see every message in
+  {{ product_name }}.
+</p>
+<p style="margin:0 0 24px; color:#52525b;">
+  {% if group_name %}
+    To turn them back on, open {{ group_name }} in {{ product_name }} and switch
+    email updates on.
+  {% else %}
+    You can manage email for each group in {{ product_name }}.
+  {% endif %}
+</p>
+<p style="margin:0;">
+  <a href="{{ app_url }}"
+     style="display:inline-block; background-color:#0284c7; color:#ffffff; text-decoration:none; border-radius:8px; padding:12px 24px; font-weight:600;">
+    Open {{ product_name }}
+  </a>
+</p>
+{% endblock %}

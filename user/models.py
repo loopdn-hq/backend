@@ -72,9 +72,12 @@ class Profile(models.Model):
     #
     #     send = participant.sms_enabled and profile.sms_enabled
     #
-    # so this is the one control that stops everything at once - which is why
-    # it defaults to True and is written from the profile endpoint, while the
-    # per-group flags default to False and are opted into individually.
+    # so this is the one control that stops everything at once. It defaults to
+    # True and only ever subtracts.
+    #
+    # It is NOT on the profile endpoint, deliberately: the only thing that
+    # writes it is a carrier STOP. Its email counterpart below IS exposed,
+    # because email has no carrier word and a member needs a switch somewhere.
     #
     # Members who have no account have no Profile and therefore no switch here:
     # replying STOP is their only way out, which is why STOP handling is not

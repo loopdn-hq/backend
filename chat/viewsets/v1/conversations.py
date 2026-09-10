@@ -14,7 +14,8 @@
     GET  /api/v1/chat/conversations/<id>/requests/ admin: who is waiting
     POST /api/v1/chat/conversations/<id>/requests/ admin: approve or decline
     POST /api/v1/chat/conversations/<id>/remove/   admin removes or blocks
-    POST /api/v1/chat/conversations/<id>/delivery/ mute it, or turn its texts off
+    POST /api/v1/chat/conversations/<id>/delivery/ mute it, or turn its texts
+                                                   or emails off
     POST /api/v1/chat/conversations/<id>/role/     admin promotes or demotes
     POST /api/v1/chat/conversations/<id>/rename/   admin names a phone-only member
     POST /api/v1/chat/conversations/<id>/invite/   admin invites somebody by number
@@ -546,9 +547,14 @@ class ConversationViewSet(
     def delivery(self, request, pk=None):
         """Change how this conversation reaches me.
 
-        `muted` silences it everywhere; `sms_enabled` decides whether texts are
-        one of its channels for me. Both are mine alone - an admin cannot set
-        them for somebody else, which is why this takes no participant id.
+        `muted` silences it everywhere; `sms_enabled` and `email_enabled` decide
+        whether texts and emails are channels for me at all. All three are mine
+        alone - an admin cannot set them for somebody else, which is why this
+        takes no participant id.
+
+        This is also the only door that turns email back ON. The unsubscribe
+        link printed in every group email can only ever subtract, because a
+        forwarded link must not let a stranger undo somebody's decision.
         """
         conversation = self.get_object()
         serializer = self.get_serializer(data=request.data)

@@ -42,7 +42,11 @@ _SEPARATORS = [
         re.MULTILINE,
     ),
     # Our own footer, if a client quotes it back rather than the whole body.
+    # The real defence is that the footer opens with `-- ` (RFC 3676), which
+    # _SIGNATURE below already cuts at; these catch a client that reflowed it
+    # and lost the marker.
     re.compile(r'^\s*Reply to this email to respond to the group\.\s*$', re.MULTILINE),
+    re.compile(r'^\s*You are getting this because you are in .{0,200}$', re.MULTILINE),
 ]
 
 # `-- ` on its own line, the one convention that IS standard (RFC 3676 §4.3).
@@ -61,6 +65,10 @@ _QUOTE_LINE = re.compile(
     r'|_{10,}\s*'
     r'|(?:From|Sent|To|Cc|Date|Subject):\s*.*'
     r'|Reply to this email to respond to the group\.\s*'
+    r'|You are getting this because you are in .*'
+    r'|To stop emails from this group,.*'
+    r'|Or use this link:.*'
+    r'|Other groups are not affected\.\s*'
     r')$',
     re.IGNORECASE,
 )

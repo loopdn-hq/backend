@@ -47,9 +47,12 @@ import logging
 
 from django.db import transaction
 
+from django.db import transaction as db_transaction
+
 from chat import membership
 from chat.models import Message, Participant, PostingNotAllowed
 from chat.services import create_message
+from mail import commands
 from mail.quoting import strip_quoted_reply
 from mail.tokens import participant_id_from
 
@@ -117,6 +120,20 @@ def handle_inbound(to_address, from_address, body):
         # serializer forbids empty messages, so this path has to agree.
         return InboundResult(action='ignored_empty', participant=participant)
 
+    # AFTER the quote-stripping, and the order is not incidental. Every group
+    # email prints the keyword in its footer, so most replies carry it in the
+    # thread underneath; asking first would read our own instructions back as a
+    # command. The footer is introduced by `-- `, which `mail/quoting.py` cuts
+    # at, so by here it is gone.
+    #
+    # And after the identity checks above, unlike SMS's STOP - which
+    # `sms/inbound.py` answers first and unconditionally because a carrier
+    # audits it from numbers that are not members. There is no such mandate
+    # here, nothing to do for a sender we cannot identify, and answering one
+    # would confirm the address is live.
+    if commands.is_stop_emails(text):
+        return _stop_emails(participant)
+
     try:
         message = create_message(
             conversation=participant.conversation,
@@ -166,3 +183,26 @@ def _address_only(value):
 
     _, address = parseaddr(value or '')
     return address.strip().lower()
+
+
+def _stop_emails(participant):
+    """A member replied STOP EMAILS. Stop this group, and say so.
+
+    One group, never the account: they may be in eight and only tired of one,
+    and a product that makes somebody leave all eight to quieten one loses a
+    channel it was allowed to use. That distinction is the whole reason the
+    keyword is two words and is not the word "unsubscribe".
+
+    The confirmation is scheduled for after the commit, so nothing is sent
+    about a preference that then rolls back - and it is the one path that gets
+    an email back, because this is the one where the person cannot see a page.
+    See mail/optout.py.
+    """
+    changed = membership.decline_email(participant)
+
+    if changed:
+        from mail.optout import send_confirmation
+
+        db_transaction.on_commit(lambda: send_confirmation(participant))
+
+    return InboundResult(action='email_declined', participant=participant)
