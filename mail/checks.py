@@ -33,6 +33,41 @@ def check_mail_configuration(app_configs, **kwargs):
             )
         )
 
+    # Replies post into groups AS the member the From address names, and the
+    # only thing that makes a From address hard to forge is the receiving
+    # server's SPF/DKIM/DMARC verdict. With the requirement off, anybody who
+    # learns a reply address - it is in the headers of every email we have
+    # ever sent - can post to that group as that member.
+    if inbound_on and not getattr(
+        settings, 'MAIL_INBOUND_REQUIRE_AUTHENTICATION', True
+    ):
+        problems.append(
+            Error(
+                'MAIL_REPLY_DOMAIN is set but MAIL_INBOUND_REQUIRE_AUTHENTICATION '
+                'is off, so a reply is trusted on its From address alone and '
+                'anyone holding a reply address can post as that member.',
+                hint='Remove MAIL_INBOUND_REQUIRE_AUTHENTICATION or set it to '
+                     'True. Turn it off only on a laptop feeding the webhook '
+                     'by hand.',
+                id='mail.E003',
+            )
+        )
+
+    # The inbound event is metadata; the reply itself is a second call to the
+    # provider that needs the API key. Without the key every reply is fetched,
+    # fails, is answered 500 and retried by the provider for a day - and no
+    # reply is ever posted, with nothing saying why but a log line per retry.
+    if inbound_on and not settings.RESEND_API_KEY:
+        problems.append(
+            Error(
+                'MAIL_REPLY_DOMAIN is set but RESEND_API_KEY is empty, so the '
+                'content of a reply can never be fetched and no reply will post.',
+                hint='Set RESEND_API_KEY, or leave MAIL_REPLY_DOMAIN empty so '
+                     'replies are off deliberately.',
+                id='mail.E004',
+            )
+        )
+
     # Sending with no provider is not an error - it is the documented
     # log-instead-of-send mode every other backend here uses - but on a real
     # deployment it means nobody is receiving anything and nothing says so.

@@ -287,14 +287,38 @@ def _is_configured():
     return bool(settings.RESEND_API_KEY)
 
 
+def fetch_json(url, *, failure_message):
+    """GET a JSON resource from Resend and return the decoded body.
+
+    The one read in a module that otherwise only sends: an inbound reply's
+    content, which the webhook event does not carry - see mail/provider.py.
+    There is no log-instead-of-fetch mode to fall back on, because there is
+    nothing to fetch from, so an unconfigured key is an error here rather than
+    the quiet no-op `send_email` gives.
+    """
+    if not _is_configured():
+        logger.error('RESEND_API_KEY is empty; cannot fetch %s', url)
+        raise EmailError(failure_message)
+    return _request('GET', url, failure_message=failure_message)
+
+
 def _post(url, payload, *, failure_message, idempotency_key=None):
     """POST JSON to Resend and return the decoded body."""
+    return _request(
+        'POST', url, payload=payload,
+        failure_message=failure_message, idempotency_key=idempotency_key,
+    )
+
+
+def _request(method, url, *, failure_message, payload=None, idempotency_key=None):
+    """One HTTP exchange with Resend, with its errors turned into EmailError."""
     headers = {
         'Authorization': f'Bearer {settings.RESEND_API_KEY}',
-        'Content-Type': 'application/json',
         # Not optional - see USER_AGENT above.
         'User-Agent': USER_AGENT,
     }
+    if payload is not None:
+        headers['Content-Type'] = 'application/json'
 
     # Resend honours this for 24 hours, so a retry of a request that actually
     # landed does not mail the same code twice.
@@ -303,9 +327,9 @@ def _post(url, payload, *, failure_message, idempotency_key=None):
 
     request = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode(),
+        data=json.dumps(payload).encode() if payload is not None else None,
         headers=headers,
-        method='POST',
+        method=method,
     )
 
     try:

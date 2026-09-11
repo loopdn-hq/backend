@@ -16,20 +16,18 @@ So the token says WHO to check and the checks below decide whether to accept:
     the token resolves to a membership   -> otherwise silence
     that membership is still ACTIVE      -> a member who left cannot post
     the account is not banned
+    the receiving server vouches for the FROM address
     the FROM address is that member's own verified address
     the group takes messages at all
 
-The fourth is meant to be the one doing the real work. Whoever holds the
-address can send mail to it; only the person who owns the mailbox can send mail
-FROM it that survives SPF and DKIM - which are checked upstream, by the inbound
-provider, and are the whole reason the from address is worth anything.
-
-    NOT YET ENFORCED. `mail/webhooks.py:_extract` discards the headers, so
-    nothing here reads the provider's verdict and the guarantee above rests on
-    the provider refusing to forward unauthenticated mail at all. Until the
-    verdict is read and acted on, inbound email must stay switched off:
-    otherwise anybody who learns a reply address can post to that group as that
-    member. See the known gaps in docs/multi_channel_integration_plan.md.
+The fourth and fifth do the real work, and only together. Whoever holds the
+address can send mail TO it; only the person who owns the mailbox can send mail
+FROM it that the receiving server marks as authenticated. That verdict - SPF,
+DKIM, DMARC - is read off the message headers by `mail/authentication.py` and
+asked here immediately before the From address is compared, because a From
+address nobody has vouched for is a string anybody can type.
+`MAIL_INBOUND_REQUIRE_AUTHENTICATION` switches the question off for a laptop
+feeding the webhook by hand, and mail/checks.py refuses to deploy that.
 
 MUTE AND ARCHIVE DO NOT APPLY HERE
 ----------------------------------
@@ -45,14 +43,13 @@ to an automated sender is a loop that neither end stops.
 """
 import logging
 
+from django.conf import settings
 from django.db import transaction
-
-from django.db import transaction as db_transaction
 
 from chat import membership
 from chat.models import Message, Participant, PostingNotAllowed
 from chat.services import create_message
-from mail import commands
+from mail import authentication, commands
 from mail.quoting import strip_quoted_reply
 from mail.tokens import participant_id_from
 
@@ -88,8 +85,14 @@ def resolve_recipient(to_address):
 
 
 @transaction.atomic
-def handle_inbound(to_address, from_address, body):
-    """Act on one inbound email. Returns an InboundResult."""
+def handle_inbound(to_address, from_address, body, *, headers):
+    """Act on one inbound email. Returns an InboundResult.
+
+    `headers` is the message's headers, keyed lower-case, and is required
+    rather than defaulted for the reason `sms/outbound.py:still_eligible` gives:
+    a default would let a caller skip the authentication check by forgetting,
+    and "did we check?" must never be answerable by reading a call site.
+    """
     participant = resolve_recipient(to_address)
 
     if participant is None:
@@ -105,6 +108,13 @@ def handle_inbound(to_address, from_address, body):
     # at all and the next thing that resolves it hands back a fresh row.
     if not membership.account_is_usable(participant):
         return InboundResult(action='ignored_banned_account', participant=participant)
+
+    if not _from_is_authenticated(headers, from_address):
+        logger.warning(
+            'Inbound email for participant %s failed sender authentication',
+            participant.pk,
+        )
+        return InboundResult(action='ignored_unauthenticated', participant=participant)
 
     if not _sender_is_the_member(participant, from_address):
         logger.warning(
@@ -148,6 +158,20 @@ def handle_inbound(to_address, from_address, body):
         return InboundResult(action='refused_broadcast', participant=participant)
 
     return InboundResult(action='posted', participant=participant, message=message)
+
+
+def _from_is_authenticated(headers, from_address):
+    """Whether the receiving server vouched for the From address.
+
+    Asked BEFORE the address is compared with the member's, not after: the
+    comparison only means something for an address somebody has authenticated,
+    and the other order would log an "address mismatch" for what is really a
+    forgery. The rule itself is mail/authentication.py's; this only decides
+    whether to ask it.
+    """
+    if not settings.MAIL_INBOUND_REQUIRE_AUTHENTICATION:
+        return True
+    return authentication.from_is_trusted(headers, from_address)
 
 
 def _sender_is_the_member(participant, from_address):
@@ -203,6 +227,6 @@ def _stop_emails(participant):
     if changed:
         from mail.optout import send_confirmation
 
-        db_transaction.on_commit(lambda: send_confirmation(participant))
+        transaction.on_commit(lambda: send_confirmation(participant))
 
     return InboundResult(action='email_declined', participant=participant)

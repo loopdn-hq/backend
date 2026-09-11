@@ -382,6 +382,16 @@ MAIL_REPLY_DOMAIN = os.environ.get('MAIL_REPLY_DOMAIN', '').strip().lower()
 # and mail/checks.py raises an error if a reply domain is configured without it.
 RESEND_WEBHOOK_SECRET = os.environ.get('RESEND_WEBHOOK_SECRET', '')
 
+# Whether an inbound reply must carry the receiving server's passing SPF, DKIM
+# or DMARC verdict for the domain it claims to be from. The From address is
+# what lets a reply post as a member, and without this it is a string anybody
+# can type. On by default; False is for a laptop feeding the webhook by hand,
+# and mail/checks.py refuses a deploy that has replies on and this off. See
+# mail/authentication.py for the rule.
+MAIL_INBOUND_REQUIRE_AUTHENTICATION = os.environ.get(
+    'MAIL_INBOUND_REQUIRE_AUTHENTICATION', 'True'
+).lower() in ('1', 'true', 'yes')
+
 # How far out of date a webhook signature may be. Same reasoning as
 # SMS_WEBHOOK_TOLERANCE_SECONDS: long enough to survive clock drift, short
 # enough that a captured request cannot be replayed tomorrow.

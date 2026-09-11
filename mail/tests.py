@@ -34,7 +34,7 @@ from chat.models import (
     Participant,
 )
 from chat.services import create_message
-from mail import commands, inbound, outbound
+from mail import authentication, commands, inbound, outbound, provider
 from mail.models import EmailDelivery, EmailWebhookEvent
 from mail.quoting import strip_quoted_reply
 from mail.tokens import (
@@ -44,6 +44,7 @@ from mail.tokens import (
     unsubscribe_token_for,
     unsubscribe_url,
 )
+from utils.mail import EmailError
 
 REPLY_DOMAIN = 'reply.loopdn.com'
 API_URL = 'https://api.loopdn.com'
@@ -58,6 +59,17 @@ def make_user(username, *, verified=True):
     profile.email_verified = verified
     profile.save(update_fields=['email_verified'])
     return user
+
+
+def authenticated(domain='example.com'):
+    """Headers as the receiving server writes them for a genuine reply from `domain`."""
+    return {
+        'authentication-results': (
+            f'mx.resend.com; dkim=pass header.d={domain}; '
+            f'spf=pass smtp.mailfrom=bounce.{domain}; '
+            f'dmarc=pass header.from={domain}'
+        ),
+    }
 
 
 @contextmanager
@@ -554,8 +566,12 @@ class EmailReplyTests(TestCase):
         )
         self.address = reply_address(self.bob_row)
 
-    def reply(self, body="I'll be there.", sender='bob@example.com', to=None):
-        return inbound.handle_inbound(to or self.address, sender, body)
+    def reply(self, body="I'll be there.", sender='bob@example.com', to=None,
+              headers=None):
+        return inbound.handle_inbound(
+            to or self.address, sender, body,
+            headers=authenticated() if headers is None else headers,
+        )
 
     def test_a_reply_becomes_a_message_in_the_group(self):
         result = self.reply()
@@ -595,6 +611,46 @@ class EmailReplyTests(TestCase):
 
         self.assertEqual(result.action, 'ignored_address_mismatch')
         self.assertEqual(self.group.messages.count(), 0)
+
+    def test_a_reply_the_server_did_not_authenticate_is_dropped(self):
+        # The From address is only worth comparing once somebody has vouched
+        # for it. Without that, it is a string anybody can type.
+        result = self.reply(headers={
+            'authentication-results': (
+                'mx.resend.com; dkim=fail header.d=example.com; '
+                'spf=fail smtp.mailfrom=example.com; dmarc=fail header.from=example.com'
+            ),
+        })
+
+        self.assertEqual(result.action, 'ignored_unauthenticated')
+        self.assertEqual(self.group.messages.count(), 0)
+
+    def test_a_reply_with_no_verdict_at_all_is_dropped(self):
+        # Fail closed. Absent must not mean trusted, or stripping one header
+        # is the way in - and whether the provider writes it at all is exactly
+        # what a live account has to confirm before replies go on.
+        result = self.reply(headers={})
+
+        self.assertEqual(result.action, 'ignored_unauthenticated')
+
+    def test_a_passing_signature_for_somebody_elses_domain_does_not_count(self):
+        # mallory.net validly signs a message whose From claims example.com.
+        result = self.reply(headers=authenticated('mallory.net'))
+
+        self.assertEqual(result.action, 'ignored_unauthenticated')
+
+    def test_authentication_is_asked_before_the_address_is_compared(self):
+        # A forgery is logged as a forgery, not as a mismatch.
+        result = self.reply(sender='mallory@example.com', headers={})
+
+        self.assertEqual(result.action, 'ignored_unauthenticated')
+
+    @override_settings(MAIL_INBOUND_REQUIRE_AUTHENTICATION=False)
+    def test_with_the_requirement_off_the_address_alone_is_trusted(self):
+        # A laptop feeding the webhook by hand. mail.E003 refuses to deploy it.
+        result = self.reply(headers={})
+
+        self.assertEqual(result.action, 'posted')
 
     def test_a_reply_from_somebody_who_left_is_dropped(self):
         # The address outlives the membership - it is in the headers of every
@@ -682,14 +738,36 @@ class InboundWebhookTests(APITestCase):
         )
         self.url = reverse('mail:inbound-webhook')
 
-    def payload(self, body="I'll be there.", event_id='evt-1'):
+        # The event carries no body. What the fetch returns is set up here and
+        # varied per test; which ids were fetched is recorded.
+        self.content = {'text': "I'll be there.", 'html': '', 'headers': authenticated()}
+        self.fetched = []
+        patcher = mock.patch('mail.provider.fetch_received', side_effect=self.fetch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fetch(self, email_id):
+        self.fetched.append(email_id)
+        return provider.ReceivedEmail(
+            email_id=email_id,
+            from_address='bob@example.com',
+            to_address=reply_address(self.bob_row),
+            text=self.content['text'],
+            html=self.content['html'],
+            headers=self.content['headers'],
+        )
+
+    def payload(self, body=None, event_id='evt-1', to=None):
+        """One `email.received` event, as Resend posts it: metadata only."""
+        if body is not None:
+            self.content['text'] = body
         return {
             'type': 'email.received',
             'data': {
-                'id': event_id,
-                'to': [reply_address(self.bob_row)],
+                'email_id': event_id,
+                'to': to or [reply_address(self.bob_row)],
                 'from': 'bob@example.com',
-                'text': body,
+                'subject': 'Re: Family',
             },
         }
 
@@ -704,6 +782,45 @@ class InboundWebhookTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(self.group.messages.count(), 1)
+        # The event was a notice; the words came from the second call.
+        self.assertEqual(self.fetched, ['evt-1'])
+
+    def test_nothing_is_fetched_for_an_address_we_did_not_issue(self):
+        # Junk sent at the reply domain must not cost an API call each.
+        response = self.post(self.payload(to=[f'someone@{REPLY_DOMAIN}']))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.fetched, [])
+        self.assertEqual(self.group.messages.count(), 0)
+
+    def test_a_reply_all_that_puts_us_second_still_finds_us(self):
+        response = self.post(self.payload(
+            to=['friend@example.com', reply_address(self.bob_row)]
+        ))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.group.messages.count(), 1)
+
+    def test_a_fetch_failure_asks_for_a_retry_and_frees_the_event(self):
+        with mock.patch('mail.provider.fetch_received',
+                        side_effect=EmailError('provider down')):
+            response = self.post(self.payload())
+
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(
+            EmailWebhookEvent.objects.filter(provider_event_id='evt-1').exists()
+        )
+
+    def test_an_unauthenticated_reply_is_accepted_and_dropped(self):
+        # 200, because the provider will not change its mind about the
+        # headers on retry; and nothing posted, because nobody vouched for
+        # the From address.
+        self.content['headers'] = {}
+
+        response = self.post(self.payload())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.group.messages.count(), 0)
 
     def test_it_is_logged_as_inbound(self):
         self.post(self.payload())
@@ -753,11 +870,9 @@ class InboundWebhookTests(APITestCase):
         )
 
     def test_an_html_only_reply_still_posts(self):
-        payload = self.payload()
-        payload['data'].pop('text')
-        payload['data']['html'] = '<p>On my way</p>'
+        self.content.update(text='', html='<p>On my way</p>')
 
-        self.post(payload)
+        self.post(self.payload())
 
         self.assertEqual(self.group.messages.first().text, 'On my way')
 
@@ -1334,7 +1449,8 @@ class EmailKeywordTests(TestCase):
     def reply(self, body, participant=None):
         row = participant or self.bob_family
         return inbound.handle_inbound(
-            reply_address(row), 'bob@example.com', body
+            reply_address(row), 'bob@example.com', body,
+            headers=authenticated(),
         )
 
     def email_consent(self, participant):
@@ -1402,7 +1518,8 @@ class EmailKeywordTests(TestCase):
 
     def test_the_keyword_from_the_wrong_address_does_nothing(self):
         result = inbound.handle_inbound(
-            reply_address(self.bob_family), 'mallory@example.com', 'STOP EMAILS'
+            reply_address(self.bob_family), 'mallory@example.com', 'STOP EMAILS',
+            headers=authenticated(),
         )
 
         self.assertEqual(result.action, 'ignored_address_mismatch')
@@ -1452,7 +1569,8 @@ class UnsubscribeConfirmationTests(TransactionTestCase):
         # the next thing they do is press Report spam.
         with capture_sent() as sent:
             inbound.handle_inbound(
-                reply_address(self.bob_row), 'bob@example.com', 'STOP EMAILS'
+                reply_address(self.bob_row), 'bob@example.com', 'STOP EMAILS',
+                headers=authenticated(),
             )
 
         self.assertEqual(len(sent), 1)
@@ -1463,7 +1581,8 @@ class UnsubscribeConfirmationTests(TransactionTestCase):
     def test_and_it_does_not_offer_to_unsubscribe_again(self):
         with capture_sent() as sent:
             inbound.handle_inbound(
-                reply_address(self.bob_row), 'bob@example.com', 'STOP EMAILS'
+                reply_address(self.bob_row), 'bob@example.com', 'STOP EMAILS',
+                headers=authenticated(),
             )
 
         self.assertNotIn('List-Unsubscribe', sent[0]['headers'])
@@ -1478,3 +1597,208 @@ class UnsubscribeConfirmationTests(TransactionTestCase):
             self.client.post(reverse('mail-unsubscribe', args=[token]))
 
         self.assertEqual(sent, [])
+
+
+class AuthenticationResultsTests(TestCase):
+    """Reading the receiving server's verdict - RFC 8601 - and the trust rule."""
+
+    def verdict(self, value):
+        return authentication.verdict_from({'authentication-results': value})
+
+    def test_a_full_pass_is_trusted(self):
+        self.assertTrue(
+            authentication.from_is_trusted(authenticated(), 'Bob <bob@example.com>')
+        )
+
+    def test_comments_are_ignored_however_deeply_nested(self):
+        verdict = self.verdict(
+            'mx.google.com; spf=pass (google.com: domain of bounce@example.com '
+            'designates 1.2.3.4 as permitted sender) smtp.mailfrom=bounce@example.com; '
+            'dkim=pass (nested (deep) comment) header.i=@example.com'
+        )
+
+        self.assertEqual(
+            (verdict.spf, verdict.spf_domain, verdict.dkim, verdict.dkim_domain),
+            ('pass', 'example.com', 'pass', 'example.com'),
+        )
+
+    def test_dmarc_pass_alone_is_enough(self):
+        # DMARC is alignment by definition.
+        self.assertTrue(
+            self.verdict('mx; dmarc=pass header.from=example.com').trusts('bob@example.com')
+        )
+
+    def test_dkim_pass_must_be_for_the_from_domain(self):
+        self.assertFalse(
+            self.verdict('mx; dkim=pass header.d=mallory.net').trusts('bob@example.com')
+        )
+
+    def test_a_subdomain_is_aligned_either_way_round(self):
+        self.assertTrue(
+            self.verdict('mx; spf=pass smtp.mailfrom=bounce.example.com')
+            .trusts('bob@example.com')
+        )
+        self.assertTrue(
+            self.verdict('mx; dkim=pass header.d=example.com')
+            .trusts('bob@mail.example.com')
+        )
+
+    def test_a_lookalike_is_not(self):
+        self.assertFalse(
+            self.verdict('mx; dkim=pass header.d=example.com.evil.net')
+            .trusts('bob@example.com')
+        )
+
+    def test_anything_short_of_pass_is_not_trusted(self):
+        for value in (
+            'mx; dkim=fail header.d=example.com; spf=softfail '
+            'smtp.mailfrom=example.com; dmarc=fail header.from=example.com',
+            'mx; dkim=neutral header.d=example.com',
+            'mx; none',
+            '',
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self.verdict(value).trusts('bob@example.com'))
+
+    def test_no_header_is_not_trusted(self):
+        # Fail closed - see the module docstring for why absent is not a pass.
+        self.assertFalse(authentication.from_is_trusted({}, 'bob@example.com'))
+        self.assertFalse(authentication.from_is_trusted(None, 'bob@example.com'))
+
+    def test_only_the_newest_header_is_read(self):
+        # The sender's own forged header sits UNDER the receiving server's.
+        headers = {'authentication-results': [
+            'mx.resend.com; dkim=fail header.d=example.com',
+            'forged; dkim=pass header.d=example.com; dmarc=pass header.from=example.com',
+        ]}
+
+        self.assertFalse(authentication.from_is_trusted(headers, 'bob@example.com'))
+
+    def test_one_valid_signature_among_broken_ones_counts(self):
+        verdict = self.verdict(
+            'mx; dkim=fail header.d=example.com; dkim=pass header.d=example.com'
+        )
+
+        self.assertEqual(verdict.dkim, 'pass')
+
+    def test_an_address_with_no_domain_is_never_trusted(self):
+        self.assertFalse(self.verdict('mx; dmarc=pass').trusts(''))
+        self.assertFalse(self.verdict('mx; dmarc=pass').trusts('not-an-address'))
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN)
+class InboundProviderTests(TestCase):
+    """The two Resend shapes - the event and the fetched content - read into one."""
+
+    def event(self, **data):
+        return provider.event_summary({'type': 'email.received', 'data': data})
+
+    def test_the_event_is_only_a_notice(self):
+        summary = self.event(
+            email_id='abc', to=[f'reply+1.x@{REPLY_DOMAIN}'],
+            **{'from': 'bob@example.com'}, subject='Re: Family',
+        )
+
+        self.assertEqual(summary, ('abc', f'reply+1.x@{REPLY_DOMAIN}', 'bob@example.com'))
+
+    def test_anything_but_an_inbound_message_is_nothing_to_do(self):
+        for kind in ('email.delivered', 'email.bounced', 'email.complained', ''):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    provider.event_summary({'type': kind, 'data': {'email_id': 'abc'}}),
+                    ('', '', ''),
+                )
+
+    def test_our_address_is_found_wherever_it_sits(self):
+        ours = f'reply+1.x@{REPLY_DOMAIN}'
+
+        self.assertEqual(
+            self.event(email_id='a', to=['friend@example.com'], received_for=[ours])[1],
+            ours,
+        )
+        self.assertEqual(
+            self.event(email_id='a', to=[{'address': 'friend@example.com'}, ours])[1],
+            ours,
+        )
+        # And when none is ours, the first To - so "not ours" has a name.
+        self.assertEqual(
+            self.event(email_id='a', to=['friend@example.com'])[1], 'friend@example.com'
+        )
+
+    def test_fetching_reads_the_content_and_lower_cases_the_headers(self):
+        with mock.patch('mail.provider.fetch_json', return_value={
+            'id': 'abc',
+            'from': 'Bob <bob@example.com>',
+            'to': [f'reply+1.x@{REPLY_DOMAIN}'],
+            'text': None,
+            'html': '<p>On my way</p>',
+            'headers': {
+                'Authentication-Results': 'mx; dmarc=pass header.from=example.com',
+                'From': 'Bob <bob@example.com>',
+            },
+        }) as fetch:
+            received = provider.fetch_received('abc/../evil')
+
+        # The id goes into a URL path, so it is escaped rather than trusted.
+        self.assertIn('/emails/receiving/abc%2F..%2Fevil', fetch.call_args.args[0])
+        self.assertEqual(received.body, 'On my way')
+        self.assertEqual(
+            received.headers['authentication-results'],
+            'mx; dmarc=pass header.from=example.com',
+        )
+        self.assertEqual(received.from_address, 'Bob <bob@example.com>')
+
+    def test_text_wins_over_html(self):
+        received = provider.ReceivedEmail(
+            email_id='e', from_address='b', to_address='x',
+            text='plain', html='<b>rich</b>',
+        )
+
+        self.assertEqual(received.body, 'plain')
+
+    def test_an_unconfigured_key_is_an_error_not_a_quiet_nothing(self):
+        # Sending logs instead of sending when unconfigured. Fetching has
+        # nothing to fall back on, so it says so.
+        with mock.patch('utils.mail._is_configured', return_value=False):
+            with self.assertRaises(EmailError):
+                provider.fetch_received('abc')
+
+
+class MailChecksTests(TestCase):
+    """The deploy checks that stop a quietly wrong inbound configuration."""
+
+    def problem_ids(self):
+        from mail.checks import check_mail_configuration
+
+        return {problem.id for problem in check_mail_configuration(None)}
+
+    @override_settings(
+        MAIL_REPLY_DOMAIN=REPLY_DOMAIN, RESEND_WEBHOOK_SECRET='whsec_x',
+        RESEND_API_KEY='re_x', MAIL_INBOUND_REQUIRE_AUTHENTICATION=True,
+    )
+    def test_a_complete_inbound_configuration_is_clean(self):
+        self.assertFalse(
+            {'mail.E001', 'mail.E003', 'mail.E004'} & self.problem_ids()
+        )
+
+    @override_settings(
+        MAIL_REPLY_DOMAIN=REPLY_DOMAIN, RESEND_WEBHOOK_SECRET='whsec_x',
+        RESEND_API_KEY='re_x', MAIL_INBOUND_REQUIRE_AUTHENTICATION=False,
+    )
+    def test_replies_on_with_authentication_off_blocks_the_deploy(self):
+        self.assertIn('mail.E003', self.problem_ids())
+
+    @override_settings(
+        MAIL_REPLY_DOMAIN=REPLY_DOMAIN, RESEND_WEBHOOK_SECRET='whsec_x',
+        RESEND_API_KEY='', MAIL_INBOUND_REQUIRE_AUTHENTICATION=True,
+    )
+    def test_replies_on_with_no_api_key_blocks_the_deploy(self):
+        # The event has no body; without the key nothing can ever be fetched.
+        self.assertIn('mail.E004', self.problem_ids())
+
+    @override_settings(
+        MAIL_REPLY_DOMAIN='', RESEND_API_KEY='',
+        MAIL_INBOUND_REQUIRE_AUTHENTICATION=False,
+    )
+    def test_with_replies_off_neither_applies(self):
+        self.assertFalse({'mail.E003', 'mail.E004'} & self.problem_ids())

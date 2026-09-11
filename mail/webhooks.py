@@ -6,20 +6,21 @@ codes at length. In short: 200 for every outcome we understand and will not
 change our minds about, 4xx for a bad signature and nothing else, 5xx only when
 a retry might genuinely help.
 
-WHAT IS NOT VERIFIED HERE
--------------------------
-That the sending domain authorised this mail. SPF, DKIM and DMARC are checked
-by the inbound provider before it ever calls this, which is the entire reason
-`mail/inbound.py` is allowed to trust the From address - and the reason an
-inbound provider is worth having rather than running an SMTP listener.
+WHAT IS VERIFIED, AND WHERE
+---------------------------
+That the request came from the provider: the signature, here, before the body
+is parsed. That the mail came from who it says: the receiving server's SPF,
+DKIM and DMARC verdict, read off the message headers by `mail/authentication.py`
+and enforced by `mail/inbound.py` beside the check that the From address is the
+member's own. Neither is any use without the other - a forged request could
+carry a passing verdict, and a genuine request can carry a forged From.
 
-THE PAYLOAD SHAPE IS THE PROVIDER'S
------------------------------------
-`_extract` is the only function here that knows what an inbound event looks
-like, so a change of provider is a change to one function. It reads
-defensively, because it has been written against documentation rather than
-against a live account: an event that does not carry what it needs is answered
-200 and dropped, not retried forever.
+THE EVENT IS ONLY A NOTICE
+--------------------------
+Resend's inbound event says who wrote to whom and nothing else - no body, no
+headers. The content is a second call, made here and only once the address has
+passed the one check that needs no network: that it is a reply address we
+issued. Everything that knows the provider's shape is in `mail/provider.py`.
 """
 import json
 import logging
@@ -32,9 +33,10 @@ from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from mail import inbound, signature
+from mail import inbound, provider, signature
 from mail.models import EmailWebhookEvent
 from mail.outbound import record_inbound
+from mail.tokens import participant_id_from
 
 logger = logging.getLogger(__name__)
 
@@ -108,11 +110,27 @@ class InboundEmailWebhook(APIView):
         return Response({'ok': True}, status=status.HTTP_200_OK)
 
     def _handle(self, payload):
-        to_address, from_address, body = _extract(payload)
-        if not to_address:
+        email_id, to_address, from_address = provider.event_summary(payload)
+        if not email_id or not to_address:
             return
 
-        result = inbound.handle_inbound(to_address, from_address, body)
+        if participant_id_from(to_address) is None:
+            # Not an address we issued - mail to a guessed or mistyped name on
+            # the reply domain. Decided from the signature inside the address,
+            # before the fetch, so junk sent at the domain costs no API call.
+            return
+
+        # A network call inside the request, on purpose. If it fails the
+        # exception reaches `post`, which frees the claim and answers 500, and
+        # the provider brings the same event back under the same id.
+        received = provider.fetch_received(email_id)
+
+        result = inbound.handle_inbound(
+            to_address,
+            received.from_address or from_address,
+            received.body,
+            headers=received.headers,
+        )
         if result.participant is None:
             # Nothing to log against. A row keyed to no membership would be a
             # record of an address that mailed us and nothing more.
@@ -122,7 +140,7 @@ class InboundEmailWebhook(APIView):
             result.participant.conversation,
             result.participant,
             result.message,
-            from_address,
+            received.from_address or from_address,
             provider='resend',
         )
 
@@ -137,53 +155,6 @@ def _event_id(request, payload):
     if header:
         return header[:128]
     data = payload.get('data') or {}
-    return str(data.get('id') or payload.get('id') or '')[:128]
-
-
-def _extract(payload):
-    """(to, from, text) out of one provider event. The only provider-shaped code.
-
-    Returns an empty `to` for anything that is not an inbound message - a
-    delivery receipt, a bounce, an event type added after this was written -
-    which the caller treats as nothing to do.
-    """
-    if (payload.get('type') or '') not in ('email.received', 'inbound.email', ''):
-        return '', '', ''
-
-    data = payload.get('data') or payload
-    to_address = _first(data.get('to'))
-    from_address = _first(data.get('from'))
-    text = data.get('text') or ''
-
-    if not text and data.get('html'):
-        # Some clients send HTML only. Better a rough plain-text rendering than
-        # posting markup into a group, and better still than dropping it.
-        text = _strip_html(data['html'])
-
-    return to_address, from_address, text
-
-
-def _first(value):
-    """One address out of a field that may be a string or a list of them."""
-    if isinstance(value, (list, tuple)):
-        value = value[0] if value else ''
-    if isinstance(value, dict):
-        # Some providers wrap each address as {'address': ..., 'name': ...}.
-        value = value.get('address') or value.get('email') or ''
-    return str(value or '').strip()
-
-
-def _strip_html(html):
-    """A crude plain-text rendering of an HTML-only reply.
-
-    Crude on purpose. The alternative is an HTML parser deciding what a group
-    message says, and the text alternative is present on the overwhelming
-    majority of real mail - this is the fallback, not the path.
-    """
-    import re
-    from html import unescape
-
-    text = re.sub(r'(?is)<(script|style).*?</\1>', ' ', html)
-    text = re.sub(r'(?i)<br\s*/?>|</p>|</div>|</tr>', '\n', text)
-    text = re.sub(r'(?s)<[^>]+>', '', text)
-    return unescape(text).strip()
+    return str(
+        data.get('email_id') or data.get('id') or payload.get('id') or ''
+    )[:128]
