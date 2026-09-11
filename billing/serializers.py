@@ -63,9 +63,14 @@ class WalletSerializer(serializers.ModelSerializer):
 
 
 class PlanCheckoutRequestSerializer(serializers.Serializer):
-    plan_code = serializers.ChoiceField(choices=Plan.Code.choices)
+    plan_code = serializers.CharField()
     success_url = serializers.URLField(validators=[_validate_redirect_url])
     cancel_url = serializers.URLField(validators=[_validate_redirect_url])
+
+    def validate_plan_code(self, value):
+        if not Plan.objects.filter(code=value, active=True).exists():
+            raise serializers.ValidationError('This plan is not available for checkout.')
+        return value
 
 
 class CreditCheckoutRequestSerializer(serializers.Serializer):

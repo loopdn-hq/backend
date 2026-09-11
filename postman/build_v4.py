@@ -658,6 +658,19 @@ BILLING = [
             'missing row, so a client never has to special-case "no '
             'subscription yet".'
         )),
+    req('Billing analytics', 'GET', '/api/v1/billing/analytics/',
+        desc=(
+            'Analytics access is feature-gated by the caller\'s current plan.\n\n'
+            'If the plan has **Basic Analytics** (or **Advanced Analytics**), '
+            'the response includes the `basic` section: conversation counts '
+            'and 30-day message activity.\n\n'
+            'If the plan has **Advanced Analytics**, `advanced` is included '
+            'with group-admin and group-size signals. Otherwise `advanced` is '
+            '`null`.\n\n'
+            'The endpoint also returns `suggestions`, tailored by access '
+            'level (`none`, `basic`, `advanced`) so clients can guide upgrades '
+            'or improvements.'
+        )),
     req('Checkout: subscribe to a plan', 'POST', '/api/v1/billing/checkout/plan/',
         body={'plan_code': 'premium',
               'success_url': 'https://loopdn.com/billing/success',

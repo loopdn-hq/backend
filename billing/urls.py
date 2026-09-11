@@ -2,6 +2,7 @@
 from django.urls import path
 
 from billing.viewsets.v1.billing import (
+    BillingAnalyticsView,
     BillingPortalSessionView,
     BillingSummaryView,
     CreditCheckoutSessionView,
@@ -19,6 +20,7 @@ urlpatterns = [
     path('plans/', PlanListView.as_view(), name='plans'),
     path('credit-packages/', CreditPackageListView.as_view(), name='credit-packages'),
     path('summary/', BillingSummaryView.as_view(), name='summary'),
+    path('analytics/', BillingAnalyticsView.as_view(), name='analytics'),
     path('checkout/plan/', PlanCheckoutSessionView.as_view(), name='checkout-plan'),
     path('checkout/credits/', CreditCheckoutSessionView.as_view(), name='checkout-credits'),
     path('portal/', BillingPortalSessionView.as_view(), name='portal'),
