@@ -40,7 +40,8 @@ def send_to_group(group, payload):
 
 @transaction.atomic
 def create_message(conversation, sender=None, text='', uploads=None, *,
-                   source=Message.Source.APP, participant=None, client_id=''):
+                   source=Message.Source.APP, participant=None, client_id='',
+                   reply_to=None, forwarded_from=None, copy_attachments=None):
     """Store a message with its attachments and touch the conversation.
 
     `sender` is the account that sent it, or None when the sender has no
@@ -98,6 +99,16 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
                 sender_participant=participant,
                 source=source,
                 text=text or '',
+                # Callers are responsible for proving the parent belongs to
+                # this conversation - MessageCreateSerializer.validate_reply_to
+                # and the consumer both do. Left unvalidated here so the single
+                # write path does not grow a second copy of that query.
+                reply_to=reply_to,
+                # Provenance only. The API exposes a bare "forwarded" flag and
+                # never who from: a forward crosses conversations, so naming
+                # the original sender would tell the new room about somebody
+                # in a room they cannot see.
+                forwarded_from=forwarded_from,
             )
     except IntegrityError:
         duplicate = (
@@ -115,6 +126,25 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     for upload in uploads or []:
         Attachment.objects.create(
             message=message, file=upload, **describe_upload(upload)
+        )
+
+    # A forward carries its files. New ROWS pointing at the same stored object
+    # rather than a re-upload: the bytes are identical, and copying them would
+    # double the storage bill every time somebody passes a photo along.
+    #
+    # Safe because nothing in this app deletes the underlying file - removing
+    # an Attachment row leaves the object in place - so the copy cannot be
+    # hollowed out by someone tidying the original.
+    for original in copy_attachments or []:
+        Attachment.objects.create(
+            message=message,
+            file=original.file.name,
+            kind=original.kind,
+            original_name=original.original_name,
+            content_type=original.content_type,
+            size=original.size,
+            width=original.width,
+            height=original.height,
         )
 
     # Moves the conversation to the top of everyone's list. auto_now fills
@@ -201,6 +231,24 @@ def broadcast_message(message):
     send_to_group(
         conversation_group(message.conversation_id),
         {'type': 'message.new', 'message': serialize_message(message)},
+    )
+
+
+def broadcast_message_updated(message):
+    """An existing message changed - edited, deleted, or reacted to.
+
+    ONE event for all three, carrying the whole message rather than a diff.
+    Clients already know how to read a message and swap it into the thread by
+    id, so three narrower events would be three more shapes to learn and three
+    more consumer methods to forget - and a missing consumer method drops the
+    frame in silence, which presents as "works after a refresh, never live".
+
+    Deliberately not `message.new`: a client that treats this as new appends a
+    duplicate instead of replacing the one it already has.
+    """
+    send_to_group(
+        conversation_group(message.conversation_id),
+        {'type': 'message.updated', 'message': serialize_message(message)},
     )
 
 

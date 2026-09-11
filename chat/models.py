@@ -186,6 +186,23 @@ class Conversation(models.Model):
     # has to identify which group they mean.
     join_code = models.CharField(max_length=12, unique=True, null=True, blank=True)
 
+    # The one message pinned to the top of this conversation.
+    #
+    # A column, not a join table, because the product pins ONE thing - the
+    # address, the plan, the rule everyone keeps asking about. Many-pins needs
+    # a table and an ordering, and neither has been asked for.
+    #
+    # It also means pinning reuses the existing `conversation.updated`
+    # broadcast, so there is no new socket event and no new consumer method to
+    # forget - and a forgotten handler drops frames silently.
+    pinned_message = models.ForeignKey(
+        'Message',
+        on_delete=models.SET_NULL,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
+
     # Who may add/invite new members.
     add_member_permission = models.CharField(
         max_length=8,
@@ -541,6 +558,20 @@ class Conversation(models.Model):
             user=user, role=Participant.Role.ADMIN
         ).exists()
 
+    def may_pin(self, user):
+        """Whether this person may pin or unpin a message here.
+
+        A pin is the one thing every member sees above the thread, so in a
+        group it is an admin's call - the same standing as renaming it. There
+        is no moderator role to give it to, and no setting has been asked for.
+
+        A one-to-one has no admins at all, so either person may pin: refusing
+        both would make the feature unreachable in half the app.
+        """
+        if self.kind == self.Kind.DIRECT:
+            return self.has_participant(user)
+        return self.is_admin(user)
+
 
 class Participant(models.Model):
     """One person's membership of one conversation.
@@ -884,8 +915,64 @@ class Message(models.Model):
         max_length=64, blank=True, default='', db_default=''
     )
 
+    # The message this one answers, when it answers one.
+    #
+    # A self-FK rather than a table: a reply IS a message and has exactly one
+    # parent, so the relationship is one-to-many and belongs on the row.
+    #
+    # SET_NULL, never CASCADE. Deleting a message must not delete the replies
+    # to it - those are their own messages that other people wrote, and losing
+    # them is losing a conversation nobody asked to remove.
+    #
+    # related_name='+' because nothing needs `message.replies`. Offering it
+    # would invite an unpaginated reverse query on the hottest path in the app.
+    reply_to = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
+
+    # When the text was last changed, and null when it never was.
+    #
+    # NOT `updated_at`, which is auto_now on a row nothing re-saves - it equals
+    # created_at forever and cannot be read as "edited". This is written only
+    # by an actual edit, so "edited" is exactly `edited_at is not None`.
+    edited_at = models.DateTimeField(null=True, blank=True)
+
+    # Soft delete. The row stays so the thread does not renumber around a hole
+    # and so replies quoting it keep their excerpt honest; the serializer
+    # withholds the text.
+    #
+    # An SMS or email copy has already been delivered and cannot be recalled,
+    # so this removes a message from the APP and says nothing about the phone
+    # it already reached.
+    deleted_at = models.DateTimeField(null=True, blank=True)
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
+
+    # Where a forwarded message came from, for provenance only. SET_NULL so
+    # deleting the original leaves the forward standing.
+    forwarded_from = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def is_deleted(self):
+        return self.deleted_at is not None
 
     class Meta:
         ordering = ['-created_at']
@@ -918,6 +1005,75 @@ class Message(models.Model):
         if self.sender_participant_id is not None:
             return self.sender_participant.display_label
         return 'Unknown'
+
+
+# The emoji a reaction is allowed to be.
+#
+# An allow-list, not a free CharField, because the value is rendered in
+# everyone else's thread: without it any member can put 32 arbitrary characters
+# under a message and every other member has to look at them. Six is also what
+# the quick-reaction bar can show without becoming a picker.
+#
+# The frontend mirrors this in `lib/chat/reactions.ts`; this copy is the
+# authority, and the serializer refuses anything not in it.
+REACTION_EMOJI = (
+    '\U0001F44D',  # thumbs up
+    '\u2764\uFE0F',  # red heart
+    '\U0001F602',  # tears of joy
+    '\U0001F62E',  # open mouth
+    '\U0001F622',  # crying
+    '\U0001F64F',  # folded hands
+)
+
+
+class MessageReaction(models.Model):
+    """One person's one emoji on one message.
+
+    A ROW PER REACTION, not a JSON blob of counts on Message, for three
+    reasons that all bite in a group chat:
+
+    1. Updating JSON is read-modify-write, so two people reacting at the same
+       instant lose one of the two. An INSERT is serialised by the database.
+    2. The unique constraint IS the toggle, and it is what stops a double-click
+       leaving two thumbs from one person.
+    3. "Did I already react?" is an indexed lookup instead of a scan of a blob.
+
+    Keyed on USER, not Participant: only account-holders can react - a phone
+    reply has nowhere to put one - and `_claim_phone_participant` deletes
+    participant rows when folding a phone number into an account, which would
+    silently take the reactions with them.
+
+    Reactions are app-only. Nothing here goes near `create_message`, so no
+    reaction ever bills an SMS segment or sends an email.
+    """
+
+    message = models.ForeignKey(
+        Message, on_delete=models.CASCADE, related_name='reactions'
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='+'
+    )
+    emoji = models.CharField(max_length=32)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['message', 'user', 'emoji'],
+                name='one_reaction_per_person_per_emoji',
+            ),
+        ]
+        # Oldest first, so the pills under a message stay in the order the
+        # emoji were first used instead of shuffling between page loads.
+        ordering = ['id']
+        indexes = [
+            # The read path: every reaction on a page of messages, fetched in
+            # one prefetch rather than a query per bubble.
+            models.Index(fields=['message']),
+        ]
+
+    def __str__(self):
+        return f'{self.user.username} {self.emoji} #{self.message_id}'
 
 
 class Attachment(models.Model):

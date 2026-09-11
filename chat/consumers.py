@@ -25,6 +25,7 @@ from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from chat.models import (
     BlockedFromConversation,
     Conversation,
+    Message,
     Participant,
     PostingNotAllowed,
 )
@@ -128,9 +129,27 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         # so a client that does not send one behaves exactly as before.
         client_id = str(content.get('client_id') or '')[:64]
 
+        # Same guard as the REST path, and for the same reason: a parent from
+        # another conversation would come straight back inside the reply
+        # excerpt, turning "send a message" into a way to read a group this
+        # sender is not in. Resolved here rather than trusted.
+        reply_to = await self.resolve_reply_to(
+            conversation, content.get('reply_to')
+        )
+        if reply_to is False:
+            await self.send_json(
+                {
+                    'type': 'error',
+                    'detail': 'You can only reply to a message in this conversation.',
+                }
+            )
+            return
+
         # create_message broadcasts to the conversation group, which this
         # socket is part of - so the sender's own echo arrives that way too.
-        await self.store_message(conversation, text, client_id=client_id)
+        await self.store_message(
+            conversation, text, client_id=client_id, reply_to=reply_to
+        )
 
     async def handle_typing(self, content):
         conversation = await self.get_conversation(content.get('conversation_id'))
@@ -185,6 +204,16 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
     async def message_new(self, event):
         await self.send_json({'type': 'message.new', 'message': event['message']})
+
+    async def message_updated(self, event):
+        """A message already in the thread changed - edit, delete, reaction.
+
+        The whole message is sent, and the client replaces the one it holds
+        with the same id. It must NOT append: this is not a new message.
+        """
+        await self.send_json(
+            {'type': 'message.updated', 'message': event['message']}
+        )
 
     async def conversation_request(self, event):
         """Somebody is waiting to be let into a group this socket administers."""
@@ -316,9 +345,28 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         ).first()
 
     @database_sync_to_async
-    def store_message(self, conversation, text, client_id=''):
+    def resolve_reply_to(self, conversation, message_id):
+        """The parent for a reply: None when none, False when refused.
+
+        Three-valued on purpose - "not replying" and "replying to something you
+        may not see" are different answers, and only the second is an error.
+        """
+        if message_id in (None, ''):
+            return None
+
+        parent = Message.objects.filter(
+            pk=message_id, conversation=conversation
+        ).first()
+        return parent if parent is not None else False
+
+    @database_sync_to_async
+    def store_message(self, conversation, text, client_id='', reply_to=None):
         return serialize_message(
             create_message(
-                conversation, self.user, text=text, client_id=client_id
+                conversation,
+                self.user,
+                text=text,
+                client_id=client_id,
+                reply_to=reply_to,
             )
         )
