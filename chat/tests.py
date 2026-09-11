@@ -15,23 +15,48 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TransactionTestCase, override_settings
 from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase, APITransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from chat import membership
+from chat import delivery, membership
 from sms import inbound
 from chat.models import (
+    ChannelConsent,
     Attachment,
     BlockedFromConversation,
     Conversation,
     Message,
+    MessageReaction,
     Notification,
     Participant,
+    REACTION_EMOJI,
 )
-from chat.serializers import ConversationSerializer
-from chat.services import create_message
+from chat.serializers import ConversationSerializer, MessageSerializer
+from chat.services import broadcast_message_updated, create_message
 from user.tests import EnvelopeAssertions, make_image_upload
+
+def grant_sms(participant, status):
+    """Set a member's SMS consent, the way production does.
+
+    Through membership.set_channel_consent rather than by writing the row, so
+    a test sets consent by the same route the app does and cannot drift from
+    it - which is the whole reason that entry point exists.
+    """
+    from chat import membership
+
+    return membership.set_channel_consent(
+        participant, ChannelConsent.Channel.SMS, status
+    )
+
+
+def sms_consent_of(participant):
+    """A member's SMS consent status, or None if there is no record."""
+    from chat import membership
+
+    return membership.consent_status(participant, ChannelConsent.Channel.SMS)
+
 
 MEDIA_ROOT = tempfile.mkdtemp(prefix='loopd-chat-media-')
 
@@ -835,6 +860,43 @@ class ChatWebsocketTests(TransactionTestCase):
         frame = await communicator.receive_json_from(timeout=3)
         self.assertEqual(frame['type'], 'notification.new')
         self.assertEqual(frame['notification']['type'], 'role.granted')
+
+        await communicator.disconnect()
+
+    async def test_an_edited_message_reaches_the_socket(self):
+        """The same dropped-frame trap, for `message.updated`.
+
+        A reaction, an edit and a delete all change a message that is already
+        in everyone's thread, and all three ride this one event. Without
+        `message_updated` on the consumer, Channels drops every frame in
+        silence - the row is written, so it presents as "works after a refresh,
+        never live", which is exactly how the notification bug hid.
+        """
+        communicator = self.connect_as(self.bob)
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        message = await database_sync_to_async(create_message)(
+            self.conversation, self.alice, text='dinner at 6'
+        )
+        # The send itself, which this socket is subscribed to.
+        first = await communicator.receive_json_from(timeout=3)
+        self.assertEqual(first['type'], 'message.new')
+
+        @database_sync_to_async
+        def edit():
+            message.text = 'dinner at 7'
+            message.edited_at = timezone.now()
+            message.save(update_fields=['text', 'edited_at'])
+            broadcast_message_updated(message)
+
+        await edit()
+
+        frame = await communicator.receive_json_from(timeout=3)
+        self.assertEqual(frame['type'], 'message.updated')
+        self.assertEqual(frame['message']['id'], message.pk)
+        self.assertEqual(frame['message']['text'], 'dinner at 7')
+        self.assertIsNotNone(frame['message']['edited_at'])
 
         await communicator.disconnect()
 
@@ -2266,7 +2328,7 @@ class BroadcastModeTests(EnvelopeAssertions, APITestCase):
     def test_a_member_still_cannot_post_over_the_websocket(self):
         # The check is at the write path, so every entry point inherits it.
         from chat.models import PostingNotAllowed
-        from chat.services import create_message
+        from chat.services import broadcast_message_updated, create_message
 
         with self.assertRaises(PostingNotAllowed):
             create_message(conversation=self.group, sender=self.bob, text='sneaking in')
@@ -2591,7 +2653,7 @@ class GroupCreationWithSettingsTests(EnvelopeAssertions, APITestCase):
             conversation_id=data['id'], phone_number='+639171111111'
         )
         self.assertEqual(mom.status, Participant.Status.ACTIVE)
-        self.assertEqual(mom.sms_consent, Participant.Consent.PENDING)
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.PENDING)
 
     def test_an_unreachable_invite_does_not_lose_the_group(self):
         # The group and its real members are already committed; losing them
@@ -3766,3 +3828,1464 @@ class JoinRequestNotificationTests(EnvelopeAssertions, APITestCase):
         )['results']
         asking = [r for r in rows if r['type'] == 'join.requested'][0]
         self.assertEqual(asking['request_status'], 'active')
+
+
+class DeliveryEngineTests(EnvelopeAssertions, APITestCase):
+    """The one ladder every channel asks before sending anything.
+
+    Written against the engine rather than through SMS, because the whole
+    reason it exists is that email and voice will ask it too - and a rule only
+    the SMS tests cover is a rule the next channel can quietly get wrong.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.bob_row = Participant.objects.get(
+            conversation=self.group, user=self.bob
+        )
+
+    def post(self):
+        return create_message(self.group, self.alice, text='Dinner at 7')
+
+    def refusal(self):
+        return delivery.refusal_reason(
+            self.bob_row, ChannelConsent.Channel.SMS
+        )
+
+    # --- what stops delivery ------------------------------------------------
+
+    def test_a_member_who_left_is_refused(self):
+        self.bob_row.status = Participant.Status.LEFT
+        self.bob_row.save(update_fields=['status'])
+
+        self.assertEqual(self.refusal(), 'not an active member')
+
+    def test_a_muted_member_is_refused(self):
+        membership.set_muted(self.bob_row, True)
+
+        self.assertEqual(self.refusal(), 'muted')
+
+    def test_a_member_who_declined_is_refused(self):
+        membership.set_channel_consent(
+            self.bob_row,
+            ChannelConsent.Channel.SMS,
+            ChannelConsent.Status.DECLINED,
+        )
+
+        self.assertEqual(self.refusal(), 'declined this group')
+
+    def test_a_member_who_opted_out_is_refused(self):
+        membership.set_channel_consent(
+            self.bob_row,
+            ChannelConsent.Channel.SMS,
+            ChannelConsent.Status.OPTED_OUT,
+        )
+
+        self.assertEqual(self.refusal(), 'opted out')
+
+    def test_a_channel_switched_off_for_this_group_is_refused(self):
+        self.bob_row.sms_enabled = False
+        self.bob_row.save(update_fields=['sms_enabled'])
+
+        self.assertEqual(self.refusal(), 'sms disabled for this group')
+
+    # --- what does NOT stop delivery ----------------------------------------
+
+    def test_archiving_does_not_stop_delivery(self):
+        # The rule most easily got wrong, and the reason it is stated here
+        # rather than left to each channel: archive hides a conversation from
+        # a list. Muting is how somebody asks for silence.
+        membership.set_archived(self.bob_row, True)
+
+        self.assertIsNone(self.refusal())
+
+    def test_an_ordinary_member_is_eligible(self):
+        self.assertIsNone(self.refusal())
+
+    # --- the audience -------------------------------------------------------
+
+    def test_the_sender_is_never_in_their_own_audience(self):
+        message = self.post()
+
+        send_to, _ = delivery.eligible_for(
+            message, ChannelConsent.Channel.SMS
+        )
+
+        self.assertNotIn(
+            message.sender_participant_id, [row.pk for row in send_to]
+        )
+
+    def test_every_omission_carries_its_reason(self):
+        membership.set_muted(self.bob_row, True)
+
+        send_to, skipped = delivery.eligible_for(
+            self.post(), ChannelConsent.Channel.SMS
+        )
+
+        self.assertEqual(send_to, [])
+        self.assertEqual([reason for _, reason in skipped], ['muted'])
+
+    def test_declining_one_channel_leaves_the_other_alone(self):
+        # The whole reason the ladder is shared is that email and voice ask it
+        # too - so the thing it could quietly get wrong is answering for the
+        # wrong channel.
+        membership.set_channel_consent(
+            self.bob_row,
+            ChannelConsent.Channel.EMAIL,
+            ChannelConsent.Status.DECLINED,
+        )
+
+        self.assertEqual(
+            delivery.refusal_reason(self.bob_row, ChannelConsent.Channel.EMAIL),
+            'declined this group',
+        )
+        self.assertIsNone(self.refusal())
+
+    def test_a_new_member_has_an_answer_on_record(self):
+        # A missing row reads as a refusal, so a membership created by any
+        # route without one would silently stop receiving anything.
+        carol = make_user('carol')
+        self.group.add_participant(carol)
+        row = Participant.objects.get(conversation=self.group, user=carol)
+
+        self.assertIsNotNone(
+            membership.consent_status(row, ChannelConsent.Channel.SMS)
+        )
+
+
+class GroupEmailPreferenceTests(EnvelopeAssertions, APITestCase):
+    """The member's own switch for one group's email.
+
+    The only door that turns email back ON. The unsubscribe link printed in
+    every group email can only ever subtract, because a forwarded link must not
+    let a stranger undo somebody's decision - so this is where the other half
+    of that lives.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.family = Conversation.start_group(self.alice, name='Family')
+        self.work = Conversation.start_group(self.alice, name='Work')
+        self.family.add_participant(self.bob)
+        self.work.add_participant(self.bob)
+        self.bob_family = Participant.objects.get(
+            conversation=self.family, user=self.bob
+        )
+        self.bob_work = Participant.objects.get(
+            conversation=self.work, user=self.bob
+        )
+        self.client.force_authenticate(self.bob)
+
+    def delivery(self, payload, conversation=None):
+        return self.client.post(
+            reverse(
+                'chat:conversation-delivery',
+                args=[(conversation or self.family).id],
+            ),
+            payload,
+            format='json',
+        )
+
+    def email_consent(self, participant):
+        return membership.consent_status(
+            participant, ChannelConsent.Channel.EMAIL
+        )
+
+    def test_turning_email_off_declines_that_group(self):
+        data = self.assertSuccess(self.delivery({'email_enabled': False}))
+
+        self.assertFalse(data['email_enabled'])
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+    def test_and_leaves_every_other_group_alone(self):
+        self.delivery({'email_enabled': False})
+
+        self.assertEqual(
+            self.email_consent(self.bob_work), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_turning_it_back_on_opts_in_again(self):
+        self.delivery({'email_enabled': False})
+
+        data = self.assertSuccess(self.delivery({'email_enabled': True}))
+
+        self.assertTrue(data['email_enabled'])
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_it_will_not_clear_a_provider_level_opt_out(self):
+        # OPTED_OUT is the provider's verdict - a spam complaint the mailbox
+        # provider already acted on - and an app toggle must not overturn it,
+        # exactly as only START clears an SMS stop.
+        membership.set_channel_consent(
+            self.bob_family,
+            ChannelConsent.Channel.EMAIL,
+            ChannelConsent.Status.OPTED_OUT,
+        )
+
+        self.delivery({'email_enabled': True})
+
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.OPTED_OUT
+        )
+
+    def test_it_is_mine_alone(self):
+        self.delivery({'email_enabled': False})
+
+        alice_row = Participant.objects.get(
+            conversation=self.family, user=self.alice
+        )
+        self.assertEqual(
+            self.email_consent(alice_row), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_it_does_not_disturb_the_other_two_switches(self):
+        membership.set_muted(self.bob_family, True)
+
+        self.delivery({'email_enabled': False})
+
+        self.bob_family.refresh_from_db()
+        self.assertTrue(self.bob_family.muted)
+        self.assertTrue(self.bob_family.sms_enabled)
+
+    def test_it_leaves_sms_consent_alone(self):
+        self.delivery({'email_enabled': False})
+
+        self.assertEqual(
+            membership.consent_status(
+                self.bob_family, ChannelConsent.Channel.SMS
+            ),
+            ChannelConsent.Status.OPTED_IN,
+        )
+
+    def test_all_three_switches_can_travel_together(self):
+        self.assertSuccess(
+            self.delivery(
+                {'muted': True, 'sms_enabled': False, 'email_enabled': False}
+            )
+        )
+
+        self.bob_family.refresh_from_db()
+        self.assertTrue(self.bob_family.muted)
+        self.assertFalse(self.bob_family.sms_enabled)
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
+
+    def test_an_empty_body_is_still_refused(self):
+        self.assertFailure(self.delivery({}))
+
+    def test_a_non_member_gets_a_404(self):
+        self.client.force_authenticate(make_user('mallory'))
+
+        response = self.delivery({'email_enabled': False})
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+import chat.models as chat_models
+
+
+class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
+    """A block stops direct contact and touches nothing else.
+
+    Two halves, and the line between them is the feature. Direct contact really
+    stops. A shared group really does not change - both stay members, both keep
+    seeing each other's messages - and what stops there is only the external
+    notification, which `BlockedGroupDeliveryTests` holds.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        # invite_by_email resolves through find_user, which only matches a
+        # VERIFIED address - so without this the invite tests would exercise
+        # the unclaimed-invitation branch instead of the one they name.
+        for account in (self.alice, self.bob):
+            account.profile.email_verified = True
+            account.profile.save(update_fields=['email_verified'])
+        self.client.force_authenticate(self.alice)
+
+    def block(self, blocker, username):
+        from user import blocks
+
+        blocks.block(blocker, user=User.objects.get(username=username))
+
+    def start_direct(self, identifier):
+        return self.client.post(
+            reverse('chat:conversation-direct'),
+            {'identifier': identifier},
+            format='json',
+        )
+
+    # --- starting one -------------------------------------------------------
+
+    def test_the_blocker_cannot_start_a_direct_conversation(self):
+        self.block(self.alice, 'bob')
+
+        self.assertFailure(self.start_direct('bob'))
+
+    def test_and_neither_can_the_blocked_person(self):
+        self.block(self.alice, 'bob')
+        self.client.force_authenticate(self.bob)
+
+        self.assertFailure(self.start_direct('alice'))
+
+    def test_the_blocker_is_told_plainly(self):
+        # The one place the two sides of a block are deliberately treated
+        # differently. A already knows they blocked B, so hiding it buys no
+        # privacy and leaves them at a dead end that looks like a bug.
+        self.block(self.alice, 'bob')
+
+        refusal = self.assertFailure(self.start_direct('bob'))
+
+        self.assertIn('You blocked this user', refusal['message'])
+
+    def test_but_the_blocked_person_is_told_nothing(self):
+        # For B the answer must be the one a stranger's typo gets, or the
+        # refusal itself announces the block. Compared character for character
+        # against a name that was never taken.
+        self.block(self.alice, 'bob')
+        self.client.force_authenticate(self.bob)
+
+        blocked = self.assertFailure(self.start_direct('alice'))
+        missing = self.assertFailure(self.start_direct('nobody-by-that-name'))
+
+        self.assertEqual(blocked['message'], missing['message'])
+        self.assertNotIn('block', blocked['message'].lower())
+
+    def test_the_blocker_sees_the_flag_on_a_shared_member_list(self):
+        # What lets a client render "Blocked" beside the name, and the Unblock
+        # action on the profile behind it.
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+
+        listed = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-participants', args=[group.id])
+            )
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        by_name = {
+            (r['user'] or {}).get('username'): r['user'] for r in rows if r['user']
+        }
+        self.assertTrue(by_name['bob']['blocked_by_me'])
+        self.assertFalse(by_name['alice']['blocked_by_me'])
+
+    def test_and_the_blocked_person_sees_no_such_flag(self):
+        # It is never true because somebody blocked YOU - that would announce
+        # the block to the person it was made against.
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+        self.client.force_authenticate(self.bob)
+
+        listed = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-participants', args=[group.id])
+            )
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        by_name = {
+            (r['user'] or {}).get('username'): r['user'] for r in rows if r['user']
+        }
+        self.assertFalse(by_name['alice']['blocked_by_me'])
+
+    def test_an_unrelated_person_is_unaffected(self):
+        make_user('carol')
+        self.block(self.alice, 'bob')
+
+        self.assertSuccess(self.start_direct('carol'))
+
+    # --- an existing one goes read-only -------------------------------------
+
+    def test_an_existing_direct_conversation_stops_taking_messages(self):
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        create_message(conversation, self.alice, text='before')
+
+        self.block(self.alice, 'bob')
+
+        with self.assertRaises(chat_models.PostingNotAllowed):
+            create_message(conversation, self.alice, text='after')
+
+    def test_from_either_side(self):
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        self.block(self.alice, 'bob')
+
+        with self.assertRaises(chat_models.PostingNotAllowed):
+            create_message(conversation, self.bob, text='after')
+
+    def test_but_the_history_is_still_there(self):
+        # Read-only, not gone. Deleting somebody's own record of a conversation
+        # they had is more than either person asked for.
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        create_message(conversation, self.alice, text='before')
+
+        self.block(self.alice, 'bob')
+
+        self.assertEqual(conversation.messages.count(), 1)
+        listed = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        self.assertIn(conversation.pk, [row['id'] for row in rows])
+
+    def test_unblocking_makes_it_writable_again(self):
+        from user import blocks
+
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        self.block(self.alice, 'bob')
+        blocks.unblock(self.alice, user=self.bob)
+
+        message = create_message(conversation, self.alice, text='after')
+        self.assertIsNotNone(message.pk)
+
+    # --- invitations --------------------------------------------------------
+
+    def test_a_blocked_person_cannot_add_me_to_a_group(self):
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.bob, name='Bobs Group')
+
+        with self.assertRaises(membership.JoinRefused):
+            membership.invite_by_email(group, 'alice@example.com', self.bob)
+
+    def test_nor_i_them(self):
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.alice, name='Alices Group')
+
+        with self.assertRaises(membership.JoinRefused):
+            membership.invite_by_email(group, 'bob@example.com', self.alice)
+
+    def test_a_blocked_number_cannot_be_invited(self):
+        from user import blocks
+
+        blocks.block(self.alice, phone_number='+639171234567')
+        group = Conversation.start_group(self.alice, name='Family')
+
+        with self.assertRaises(membership.JoinRefused):
+            membership.invite_by_phone(
+                group, '+639171234567', 'Mom', self.alice
+            )
+
+    def test_an_unverified_address_is_not_a_way_round_the_invite_refusal(self):
+        # The bypass this nearly shipped with. A block is keyed on an account
+        # or a number, never a bare address - and an UNVERIFIED address
+        # resolves to nobody on purpose, so `invite_by_email` cannot match a
+        # block and creates an unclaimed row instead. The refusal has to happen
+        # at the moment that row would become real.
+        carol = make_user('carol')
+        self.block(self.alice, 'carol')
+        group = Conversation.start_group(self.alice, name='Family')
+
+        # Alice invites Carol by an address Carol has never verified.
+        membership.invite_by_email(group, 'carol@example.com', self.alice)
+        self.assertTrue(
+            Participant.objects.filter(
+                conversation=group, email='carol@example.com'
+            ).exists()
+        )
+
+        # Carol verifies it. The invitation must not turn into membership.
+        carol.profile.email_verified = True
+        carol.profile.save(update_fields=['email_verified'])
+
+        self.assertEqual(membership.claim_email_invitations(carol), 0)
+        self.assertFalse(
+            Participant.objects.filter(
+                conversation=group, user=carol,
+                status=Participant.Status.ACTIVE,
+            ).exists()
+        )
+
+    def test_but_an_ordinary_invitation_still_claims(self):
+        # The guard must not swallow the case the claim path exists for.
+        carol = make_user('carol')
+        group = Conversation.start_group(self.alice, name='Family')
+        membership.invite_by_email(group, 'carol@example.com', self.alice)
+
+        carol.profile.email_verified = True
+        carol.profile.save(update_fields=['email_verified'])
+
+        self.assertEqual(membership.claim_email_invitations(carol), 1)
+
+    def test_adding_me_to_a_group_by_username_is_refused_too(self):
+        # The route the app actually uses, and the one that was open: the
+        # email and bare-number invites checked the block while
+        # POST /conversations/<id>/members/ went straight to add_participant,
+        # which knows only about the admin-imposed block.
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.bob, name='Bobs Group')
+        self.client.force_authenticate(self.bob)
+
+        response = self.client.post(
+            reverse('chat:conversation-members', args=[group.id]),
+            {'members': ['alice']},
+            format='json',
+        )
+
+        self.assertFailure(response)
+        self.assertFalse(
+            Participant.objects.filter(
+                conversation=group, user=self.alice,
+                status=Participant.Status.ACTIVE,
+            ).exists()
+        )
+
+    def test_and_adding_somebody_unrelated_still_works(self):
+        make_user('carol')
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.bob, name='Bobs Group')
+        self.client.force_authenticate(self.bob)
+
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-members', args=[group.id]),
+                {'members': ['carol']},
+                format='json',
+            )
+        )
+
+    def test_inviting_a_blocked_accounts_own_number_is_refused(self):
+        # One person, two identities. A block recorded against the account had
+        # to also stop an invitation addressed to that account's verified
+        # number, or naming the other identity was a way straight back in.
+        self.alice.profile.phone_number = '+639171230001'
+        self.alice.profile.phone_no_verified = True
+        self.alice.profile.save()
+        self.block(self.alice, 'bob')
+        group = Conversation.start_group(self.bob, name='Bobs Group')
+
+        with self.assertRaises(membership.JoinRefused):
+            membership.invite_by_phone(
+                group, '+639171230001', 'A', self.bob
+            )
+
+    def test_but_an_unverified_number_is_not_taken_as_proof(self):
+        # The mirror of the rule everywhere else: an unverified number is a
+        # string somebody typed into their own profile, so honouring it would
+        # let a squatter make themselves unaddressable with a stranger's.
+        carol = make_user('carol')
+        carol.profile.phone_number = '+639171230002'
+        carol.profile.save()
+        from user import blocks
+
+        blocks.block(self.alice, user=carol)
+        group = Conversation.start_group(self.alice, name='Family')
+
+        row = membership.invite_by_phone(
+            group, '+639171230002', 'C', self.alice
+        )
+        self.assertIsNotNone(row.pk)
+
+    def test_a_blocked_direct_thread_does_not_leak_typing(self):
+        # The one signal that would still have crossed a read-only thread:
+        # each would watch the other start and stop typing in a conversation
+        # neither can send into.
+        from asgiref.sync import async_to_sync
+        from chat.consumers import ChatConsumer
+
+        conversation, _ = Conversation.start_direct(self.alice, self.bob)
+        consumer = ChatConsumer()
+        consumer.user = self.alice
+
+        self.assertFalse(
+            async_to_sync(consumer.direct_contact_is_blocked)(conversation)
+        )
+
+        self.block(self.alice, 'bob')
+
+        self.assertTrue(
+            async_to_sync(consumer.direct_contact_is_blocked)(conversation)
+        )
+
+    def test_and_a_group_never_suppresses_typing(self):
+        from asgiref.sync import async_to_sync
+        from chat.consumers import ChatConsumer
+
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+
+        consumer = ChatConsumer()
+        consumer.user = self.alice
+        self.assertFalse(
+            async_to_sync(consumer.direct_contact_is_blocked)(group)
+        )
+
+    def test_an_unverified_number_is_not_a_way_round_the_invite_refusal(self):
+        # The phone twin of the email hole. An invitation addressed to an
+        # UNVERIFIED number cannot be checked against a block when it is sent,
+        # because an unverified number resolves to nobody on purpose. So the
+        # refusal has to happen when the row would become real.
+        carol = make_user('carol')
+        self.block(self.alice, 'carol')
+        group = Conversation.start_group(self.alice, name='Family')
+
+        # Alice invites a number Carol has not verified yet.
+        membership.invite_by_phone(group, '+639171230009', 'C', self.alice)
+        self.assertTrue(
+            Participant.objects.filter(
+                conversation=group, phone_number='+639171230009'
+            ).exists()
+        )
+
+        # Carol verifies it and the row would fold into her account.
+        carol.profile.phone_number = '+639171230009'
+        carol.profile.phone_no_verified = True
+        carol.profile.save()
+
+        self.assertIsNone(group._claim_phone_participant(carol))
+        self.assertFalse(
+            Participant.objects.filter(
+                conversation=group, user=carol,
+                status=Participant.Status.ACTIVE,
+            ).exists()
+        )
+
+    def test_but_an_ordinary_phone_invitation_still_claims(self):
+        carol = make_user('carol')
+        group = Conversation.start_group(self.alice, name='Family')
+        membership.invite_by_phone(group, '+639171230010', 'C', self.alice)
+
+        carol.profile.phone_number = '+639171230010'
+        carol.profile.phone_no_verified = True
+        carol.profile.save()
+
+        claimed = group._claim_phone_participant(carol)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.user_id, carol.pk)
+
+    # --- and the group is untouched -----------------------------------------
+
+    def test_a_shared_group_is_not_changed_at_all(self):
+        # Both stay members and both still see each other. A block suppresses
+        # the notification, never the membership - that distinction is the
+        # whole shape of the feature.
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+
+        self.block(self.alice, 'bob')
+
+        rows = Participant.objects.filter(conversation=group)
+        self.assertEqual(rows.count(), 2)
+        self.assertTrue(
+            all(r.status == Participant.Status.ACTIVE for r in rows)
+        )
+
+    def test_and_they_can_still_post_there(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+
+        message = create_message(group, self.bob, text='Dinner at 7')
+
+        self.assertIsNotNone(message.pk)
+        self.assertEqual(group.messages.count(), 1)
+
+    def test_the_ladder_itself_still_says_yes(self):
+        # The membership half is untouched, and has to stay untouched: a block
+        # is not a membership change. The pair question is asked NEXT to this
+        # ladder, not inside it - which is why this still returns None.
+        from chat import delivery
+
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        alice_row = Participant.objects.get(conversation=group, user=self.alice)
+        self.block(self.alice, 'bob')
+
+        self.assertIsNone(
+            delivery.refusal_reason(alice_row, ChannelConsent.Channel.SMS)
+        )
+
+    def test_but_the_audience_does_not(self):
+        # The half that used to be missing. Bob posts; Alice blocked him; the
+        # message is stored and visible, and only the notification stops.
+        from chat import delivery
+
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        alice_row = Participant.objects.get(conversation=group, user=self.alice)
+        self.block(self.alice, 'bob')
+
+        message = create_message(group, self.bob, text='Dinner at 7')
+        send_to, skipped = delivery.eligible_for(
+            message, ChannelConsent.Channel.SMS
+        )
+
+        self.assertEqual(send_to, [])
+        self.assertEqual(
+            dict((row.pk, why) for row, why in skipped)[alice_row.pk],
+            delivery.BLOCKED_REASON,
+        )
+
+    def test_and_they_still_see_each_other_in_the_member_list(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        self.block(self.alice, 'bob')
+
+        listed = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-participants', args=[group.id])
+            )
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        usernames = [
+            (r['user'] or {}).get('username') for r in rows
+        ]
+        self.assertIn('bob', usernames)
+
+
+class BlockedGroupDeliveryTests(EnvelopeAssertions, APITestCase):
+    """No notification caused by somebody you blocked, inside a shared group.
+
+    §17 gate 4 and §19 step 4 of the blocking spec. The message itself is
+    untouched - it is stored, it is broadcast, and both people still read it in
+    the app. What stops is the text, the email, and later the push and the
+    voice alert.
+
+    This is the half seven of the spec's eleven acceptance rows reduce to, so
+    the rules it holds are the rules mentions, replies, reactions and push will
+    inherit rather than each re-implement.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.carol = make_user('carol', '+639170000003')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        for account in (self.bob, self.carol):
+            self.group.add_participant(account)
+        self.rows = {
+            account.username: Participant.objects.get(
+                conversation=self.group, user=account
+            )
+            for account in (self.alice, self.bob, self.carol)
+        }
+
+    def block(self, blocker, blocked):
+        from user import blocks
+
+        blocks.block(blocker, user=blocked)
+
+    def audience(self, sender, channel=ChannelConsent.Channel.SMS):
+        """Who would be notified about a message from `sender`, and why not."""
+        from chat import delivery
+
+        message = create_message(self.group, sender, text='Dinner at 7')
+        send_to, skipped = delivery.eligible_for(message, channel)
+        return (
+            sorted(row.user.username for row in send_to),
+            dict((row.user.username, why) for row, why in skipped if row.user_id),
+        )
+
+    # --- the rule -----------------------------------------------------------
+
+    def test_a_blocked_senders_message_does_not_notify_the_blocker(self):
+        from chat import delivery
+
+        self.block(self.alice, self.bob)
+
+        send_to, skipped = self.audience(self.bob)
+
+        self.assertNotIn('alice', send_to)
+        self.assertEqual(skipped['alice'], delivery.BLOCKED_REASON)
+
+    def test_and_blocking_one_person_does_not_silence_the_group(self):
+        # §14. A blocked member must not turn off notifications from everybody
+        # else - which is the failure a whole-conversation suppression would
+        # produce, and nothing pinned it before.
+        self.block(self.alice, self.bob)
+
+        send_to, _ = self.audience(self.carol)
+
+        self.assertEqual(send_to, ['alice', 'bob'])
+
+    def test_it_holds_whichever_side_did_the_blocking(self):
+        # §16. One-way would be detectable: Bob would notice his own messages
+        # behaving differently from everybody else's.
+        self.block(self.bob, self.alice)
+
+        send_to, _ = self.audience(self.bob)
+
+        self.assertNotIn('alice', send_to)
+
+    def test_the_blocked_person_is_not_notified_either(self):
+        self.block(self.alice, self.bob)
+
+        send_to, _ = self.audience(self.alice)
+
+        self.assertNotIn('bob', send_to)
+        self.assertIn('carol', send_to)
+
+    def test_everybody_else_is_untouched(self):
+        self.block(self.alice, self.bob)
+
+        send_to, _ = self.audience(self.bob)
+
+        self.assertEqual(send_to, ['carol'])
+
+    def test_it_applies_to_email_as_well_as_sms(self):
+        # Both channels ask the same door, so neither needed its own change.
+        for account in (self.alice, self.bob, self.carol):
+            account.profile.email_verified = True
+            account.profile.save(update_fields=['email_verified'])
+        self.block(self.alice, self.bob)
+
+        send_to, _ = self.audience(self.bob, ChannelConsent.Channel.EMAIL)
+
+        self.assertEqual(send_to, ['carol'])
+
+    # --- a sender with no account, which is §6's own example ----------------
+
+    def test_a_bare_number_can_be_the_sender(self):
+        # `Message.sender` is NULL when somebody with no account texts in, so
+        # a block keyed on an account cannot name them. This is the scenario
+        # §6 uses to illustrate the feature, and the spec's own pseudocode
+        # quietly does nothing for it.
+        from chat import delivery
+        from user import blocks
+
+        mom = self.group.add_phone_participant('+639171230077', 'Mom')
+        membership.set_channel_consent(
+            mom, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
+        )
+        blocks.block(self.alice, phone_number='+639171230077')
+
+        message = create_message(
+            self.group, None, text='Dinner at 7', participant=mom
+        )
+        send_to, skipped = delivery.eligible_for(
+            message, ChannelConsent.Channel.SMS
+        )
+
+        by_name = dict(
+            (row.user.username, why) for row, why in skipped if row.user_id
+        )
+        self.assertEqual(by_name['alice'], delivery.BLOCKED_REASON)
+        self.assertIn('bob', [row.user.username for row in send_to if row.user_id])
+
+    # --- and the message itself is untouched --------------------------------
+
+    def test_the_message_is_still_stored_and_still_readable(self):
+        self.block(self.alice, self.bob)
+
+        create_message(self.group, self.bob, text='Dinner at 7')
+
+        self.assertEqual(self.group.messages.count(), 1)
+        self.client.force_authenticate(self.alice)
+        listed = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-messages', args=[self.group.id])
+            )
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        self.assertEqual([row['text'] for row in rows], ['Dinner at 7'])
+
+    def test_and_both_are_still_members(self):
+        self.block(self.alice, self.bob)
+
+        self.assertEqual(
+            Participant.objects.filter(
+                conversation=self.group, status=Participant.Status.ACTIVE
+            ).count(),
+            3,
+        )
+
+    # --- the cost -----------------------------------------------------------
+
+    def test_the_screen_is_one_query_however_big_the_group(self):
+        # Asked per recipient this is one round trip each - two hundred for a
+        # two-hundred-member group, and two hundred again when email fans out
+        # the same message. There is no other query-count guard in the suite.
+        from chat import delivery
+
+        for n in range(7):
+            self.group.add_participant(make_user(f'extra{n}'))
+        self.block(self.alice, self.bob)
+        message = create_message(self.group, self.bob, text='Dinner at 7')
+
+        # Two for the audience (participants + the consent prefetch), one for
+        # the screen. Not one per member.
+        with self.assertNumQueries(3):
+            delivery.eligible_for(message, ChannelConsent.Channel.SMS)
+
+class ReplyToMessageTests(EnvelopeAssertions, APITestCase):
+    """Answering one message with another.
+
+    A reply is an ordinary message that happens to name a parent, so it needs
+    no new event and no new table - just a nullable self-FK and one guard.
+
+    That guard is the whole security story: without it the id of a message in a
+    group you are not in can be passed as a parent, and its text comes straight
+    back inside the reply excerpt. "Send a message" would become a way to read
+    private conversations.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.parent = create_message(
+            self.group, self.alice, text='why is my name not showing?'
+        )
+        self.client.force_authenticate(self.bob)
+        self.url = reverse('chat:conversation-messages', args=[self.group.pk])
+
+    def send(self, text, reply_to=None):
+        payload = {'text': text}
+        if reply_to is not None:
+            payload['reply_to'] = reply_to
+        return self.client.post(self.url, payload, format='json')
+
+    # --- the happy path -------------------------------------------------
+
+    def test_a_reply_names_its_parent(self):
+        data = self.assertSuccess(
+            self.send('yes it is', reply_to=self.parent.pk),
+            status.HTTP_201_CREATED,
+        )
+
+        self.assertEqual(data['reply_to']['id'], self.parent.pk)
+        self.assertEqual(data['reply_to']['sender'], 'alice')
+        self.assertEqual(
+            data['reply_to']['text'], 'why is my name not showing?'
+        )
+        self.assertEqual(
+            Message.objects.get(pk=data['id']).reply_to_id, self.parent.pk
+        )
+
+    def test_an_ordinary_message_replies_to_nothing(self):
+        data = self.assertSuccess(
+            self.send('just talking'), status.HTTP_201_CREATED
+        )
+        self.assertIsNone(data['reply_to'])
+
+    def test_a_long_parent_is_excerpted(self):
+        long_parent = create_message(self.group, self.alice, text='x' * 400)
+        data = self.assertSuccess(
+            self.send('short answer', reply_to=long_parent.pk),
+            status.HTTP_201_CREATED,
+        )
+
+        excerpt = data['reply_to']['text']
+        self.assertLess(len(excerpt), 400)
+        self.assertTrue(excerpt.endswith('\u2026'))
+
+    # --- the guard ------------------------------------------------------
+
+    def test_a_parent_from_another_conversation_is_refused(self):
+        """The one that matters. Otherwise this endpoint reads private groups."""
+        elsewhere = Conversation.start_group(self.alice, name='Secret')
+        secret = create_message(
+            elsewhere, self.alice, text='the door code is 1234'
+        )
+
+        response = self.send('nice try', reply_to=secret.pk)
+
+        self.assertFailure(response)
+        self.assertFalse(
+            Message.objects.filter(conversation=self.group, text='nice try')
+            .exists()
+        )
+
+    def test_a_parent_that_does_not_exist_is_refused_the_same_way(self):
+        # Word for word the same refusal as the cross-conversation case: a
+        # distinguishable "no such message" would confirm which ids are real.
+        missing = self.send('to nothing', reply_to=999999)
+        other = self.send(
+            'to elsewhere',
+            reply_to=create_message(
+                Conversation.start_group(self.alice, name='Other'),
+                self.alice,
+                text='hi',
+            ).pk,
+        )
+
+        self.assertEqual(self.assertFailure(missing), self.assertFailure(other))
+
+    # --- the parent going away -------------------------------------------
+
+    def test_a_reply_outlives_its_parent(self):
+        """SET_NULL, not CASCADE. Deleting a message must not delete answers."""
+        reply = create_message(
+            self.group, self.bob, text='yes it is', reply_to=self.parent
+        )
+
+        self.parent.delete()
+
+        reply.refresh_from_db()
+        self.assertIsNone(reply.reply_to_id)
+        self.assertTrue(Message.objects.filter(pk=reply.pk).exists())
+
+    def test_the_excerpt_is_dropped_when_the_parent_is_gone(self):
+        reply = create_message(
+            self.group, self.bob, text='yes it is', reply_to=self.parent
+        )
+        self.parent.delete()
+        reply.refresh_from_db()
+
+        self.assertIsNone(MessageSerializer(reply).data['reply_to'])
+
+    def test_a_phone_only_parent_is_credited_by_its_membership(self):
+        # sender_label falls back to the participant row, so a reply to an
+        # inbound SMS still names somebody.
+        mom = self.group.add_phone_participant('+639171111111', display_name='Mom')
+        texted = create_message(
+            self.group,
+            None,
+            text='dinner at 7',
+            participant=mom,
+            source=Message.Source.SMS,
+        )
+
+        data = self.assertSuccess(
+            self.send('ok', reply_to=texted.pk), status.HTTP_201_CREATED
+        )
+        self.assertEqual(data['reply_to']['sender'], 'Mom')
+
+
+
+THUMBS_UP, HEART = REACTION_EMOJI[0], REACTION_EMOJI[1]
+
+
+class MessageActionRouteMixin:
+    """URL helpers for the per-message routes.
+
+    They hang off the conversation rather than off a top-level /messages/<id>/,
+    so every one of them carries the conversation id - and that is what proves
+    membership before the message is even looked up.
+    """
+
+    def message_url(self, message, suffix=''):
+        return (
+            reverse('chat:conversation-detail', args=[message.conversation_id])
+            + f'messages/{message.pk}/'
+            + suffix
+        )
+
+
+class ReactToMessageTests(
+    MessageActionRouteMixin, EnvelopeAssertions, APITestCase
+):
+    """A thumbs up, and everything it must NOT do.
+
+    The load-bearing rule is that a reaction is app-only: it never goes through
+    create_message, so it cannot fan out to a phone. A thumbs up that billed an
+    SMS segment to every member of a two-hundred-person group would be an
+    expensive way to say nothing.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.message = create_message(self.group, self.alice, text='dinner at 7')
+        self.client.force_authenticate(self.bob)
+        self.url = self.message_url(self.message, 'reactions/')
+
+    def react(self, emoji=THUMBS_UP):
+        return self.client.post(self.url, {'emoji': emoji}, format='json')
+
+    def unreact(self, emoji=THUMBS_UP):
+        return self.client.delete(f'{self.url}?emoji={emoji}')
+
+    # --- the happy path ---------------------------------------------------
+
+    def test_a_reaction_comes_back_grouped_with_who_left_it(self):
+        data = self.assertSuccess(self.react())
+
+        self.assertEqual(
+            data['reactions'],
+            [{'emoji': THUMBS_UP, 'count': 1, 'usernames': ['bob']}],
+        )
+
+    def test_usernames_are_what_tells_a_client_it_already_reacted(self):
+        # Not a `reacted` boolean: this same payload is broadcast, and a
+        # broadcast has no request to compute "me" against.
+        self.react()
+        self.client.force_authenticate(self.alice)
+        data = self.assertSuccess(self.react())
+
+        self.assertEqual(data['reactions'][0]['count'], 2)
+        self.assertCountEqual(
+            data['reactions'][0]['usernames'], ['alice', 'bob']
+        )
+
+    def test_different_emoji_are_separate_pills(self):
+        self.react(THUMBS_UP)
+        data = self.assertSuccess(self.react(HEART))
+
+        self.assertEqual([r['emoji'] for r in data['reactions']],
+                         [THUMBS_UP, HEART])
+
+    def test_taking_it_back_removes_it(self):
+        self.react()
+        data = self.assertSuccess(self.unreact())
+
+        self.assertEqual(data['reactions'], [])
+        self.assertFalse(MessageReaction.objects.exists())
+
+    # --- idempotence ------------------------------------------------------
+
+    def test_reacting_twice_leaves_one_reaction(self):
+        self.react()
+        data = self.assertSuccess(self.react())
+
+        self.assertEqual(data['reactions'][0]['count'], 1)
+        self.assertEqual(MessageReaction.objects.count(), 1)
+
+    def test_taking_back_a_reaction_that_is_not_there_is_not_an_error(self):
+        # A retry after a dropped response must not be an error the UI has to
+        # explain, and must not flip the state back.
+        self.assertSuccess(self.unreact())
+
+    # --- the rule that costs money ---------------------------------------
+
+    def test_a_reaction_never_fans_out(self):
+        with mock.patch('chat.services._schedule_delivery') as fan_out:
+            self.react()
+
+        fan_out.assert_not_called()
+
+    def test_a_reaction_is_not_a_message(self):
+        before = Message.objects.count()
+        self.react()
+
+        self.assertEqual(Message.objects.count(), before)
+
+    # --- what may be reacted to ------------------------------------------
+
+    def test_only_the_listed_emoji_are_accepted(self):
+        # Free text here would let any member put 32 arbitrary characters
+        # under a message for the whole group to look at.
+        self.assertFailure(
+            self.client.post(self.url, {'emoji': 'not an emoji'}, format='json')
+        )
+
+    def test_a_message_in_another_group_cannot_be_reacted_to(self):
+        elsewhere = Conversation.start_group(self.alice, name='Secret')
+        secret = create_message(elsewhere, self.alice, text='the address is')
+
+        response = self.client.post(
+            self.message_url(secret, 'reactions/'),
+            {'emoji': THUMBS_UP},
+            format='json',
+        )
+
+        self.assertFailure(response, status.HTTP_404_NOT_FOUND)
+
+    def test_a_deleted_message_cannot_be_reacted_to(self):
+        self.message.deleted_at = timezone.now()
+        self.message.save(update_fields=['deleted_at'])
+
+        self.assertFailure(self.react())
+
+
+class EditMessageTests(MessageActionRouteMixin, EnvelopeAssertions, APITestCase):
+    """Fixing your own words.
+
+    In-app only. The copy already texted or emailed out cannot be recalled, so
+    this changes what the app shows and makes no claim about the handset that
+    already has the original.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.message = create_message(self.group, self.bob, text='dinner at 6')
+        self.client.force_authenticate(self.bob)
+        self.url = self.message_url(self.message)
+
+    def edit(self, text='dinner at 7'):
+        return self.client.patch(self.url, {'text': text}, format='json')
+
+    def test_an_edit_replaces_the_words_and_says_it_was_edited(self):
+        data = self.assertSuccess(self.edit())
+
+        self.assertEqual(data['text'], 'dinner at 7')
+        self.assertIsNotNone(data['edited_at'])
+
+    def test_an_unedited_message_says_so(self):
+        data = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-messages', args=[self.group.pk])
+            )
+        )
+
+        self.assertIsNone(data['results'][0]['edited_at'])
+
+    def test_nobody_edits_somebody_elses_words(self):
+        # Not even an admin: rewriting a message under its author's name would
+        # put words in their mouth. An admin who objects can delete it, which
+        # is visible for what it is.
+        self.client.force_authenticate(self.alice)
+
+        self.assertFailure(self.edit(), status.HTTP_403_FORBIDDEN)
+
+    def test_an_empty_edit_is_refused(self):
+        self.assertFailure(self.edit('   '))
+
+    def test_a_texted_in_message_cannot_be_edited(self):
+        # It is a copy of something that really was sent from a handset;
+        # editing the copy would make the thread disagree with what arrived.
+        texted = create_message(
+            self.group, None, text='on my way', source=Message.Source.SMS
+        )
+        texted.sender = self.bob
+        texted.save(update_fields=['sender'])
+
+        self.assertFailure(self.client.patch(
+            self.message_url(texted), {'text': 'nope'}, format='json'
+        ))
+
+
+class DeleteMessageTests(
+    MessageActionRouteMixin, EnvelopeAssertions, APITestCase
+):
+    """Taking a message out of the thread, for everyone.
+
+    SOFT, always. The row survives so replies quoting it keep a parent and so
+    read pointers do not dangle; the serializer is what withholds the content.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.message = create_message(self.group, self.bob, text='ignore this')
+        self.client.force_authenticate(self.bob)
+
+    def delete(self, message=None):
+        return self.client.delete(self.message_url(message or self.message))
+
+    def test_the_row_survives_but_the_words_do_not(self):
+        data = self.assertSuccess(self.delete())
+
+        self.assertEqual(data['text'], '')
+        self.assertIsNotNone(data['deleted_at'])
+        self.assertTrue(Message.objects.filter(pk=self.message.pk).exists())
+
+    def test_an_admin_may_delete_anybody_s_message(self):
+        self.client.force_authenticate(self.alice)
+
+        self.assertSuccess(self.delete())
+
+    def test_an_ordinary_member_may_not_delete_somebody_else_s(self):
+        hers = create_message(self.group, self.alice, text='mine')
+
+        self.assertFailure(self.delete(hers), status.HTTP_403_FORBIDDEN)
+
+    def test_deleting_twice_is_not_an_error(self):
+        self.delete()
+
+        self.assertSuccess(self.delete())
+
+    def test_attachments_go_with_it(self):
+        Attachment.objects.create(
+            message=self.message,
+            file=SimpleUploadedFile('secret.txt', b'x'),
+            original_name='secret.txt',
+        )
+
+        self.assertEqual(self.assertSuccess(self.delete())['attachments'], [])
+
+    def test_a_reply_keeps_its_place_but_not_the_quote(self):
+        reply = create_message(
+            self.group, self.alice, text='why?', reply_to=self.message
+        )
+        self.delete()
+
+        quoted = MessageSerializer(Message.objects.get(pk=reply.pk)).data
+        self.assertEqual(quoted['reply_to']['text'], 'This message was deleted')
+
+    def test_deleting_the_pinned_message_clears_the_pin(self):
+        self.client.force_authenticate(self.alice)
+        self.client.post(self.message_url(self.message, 'pin/'))
+
+        self.delete()
+
+        self.group.refresh_from_db()
+        self.assertIsNone(self.group.pinned_message_id)
+
+
+class PinMessageTests(MessageActionRouteMixin, EnvelopeAssertions, APITestCase):
+    """Holding one message above the thread.
+
+    One pin, stored as a column on the conversation, so the change rides the
+    `conversation.updated` broadcast every client already handles rather than
+    needing a socket event of its own.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.message = create_message(self.group, self.alice, text='the code is 4821')
+        self.client.force_authenticate(self.alice)
+        self.url = self.message_url(self.message, 'pin/')
+
+    def test_pinning_puts_it_on_the_conversation(self):
+        data = self.assertSuccess(self.client.post(self.url))
+
+        self.assertEqual(data['pinned_message']['id'], self.message.pk)
+
+    def test_pinning_a_second_message_replaces_the_first(self):
+        self.client.post(self.url)
+        newer = create_message(self.group, self.alice, text='no, 1234')
+
+        data = self.assertSuccess(
+            self.client.post(self.message_url(newer, 'pin/'))
+        )
+
+        self.assertEqual(data['pinned_message']['id'], newer.pk)
+
+    def test_unpinning_clears_it(self):
+        self.client.post(self.url)
+
+        data = self.assertSuccess(self.client.delete(self.url))
+
+        self.assertIsNone(data['pinned_message'])
+
+    def test_unpinning_a_message_that_is_not_the_pinned_one_leaves_it_alone(self):
+        # Two admins unpinning at once must not have the second clear a pin the
+        # first already replaced.
+        self.client.post(self.url)
+        other = create_message(self.group, self.alice, text='unrelated')
+
+        self.client.delete(self.message_url(other, 'pin/'))
+
+        self.group.refresh_from_db()
+        self.assertEqual(self.group.pinned_message_id, self.message.pk)
+
+    def test_an_ordinary_member_cannot_pin(self):
+        self.client.force_authenticate(self.bob)
+
+        self.assertFailure(
+            self.client.post(self.url), status.HTTP_403_FORBIDDEN
+        )
+
+    def test_either_person_can_pin_in_a_one_to_one(self):
+        # There are no admins in a direct chat, so an admins-only rule would
+        # make the feature unreachable in half the app.
+        direct, _ = Conversation.start_direct(self.alice, self.bob)
+        message = create_message(direct, self.alice, text='my address')
+        self.client.force_authenticate(self.bob)
+
+        self.assertSuccess(self.client.post(self.message_url(message, 'pin/')))
+
+
+class ForwardMessageTests(
+    MessageActionRouteMixin, EnvelopeAssertions, APITestCase
+):
+    """Passing a message along to another conversation.
+
+    Posted to the DESTINATION, so every check that guards a normal send guards
+    a forward too. The words come from the original, never from the request.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.source = Conversation.start_group(self.alice, name='Work')
+        self.source.add_participant(self.bob)
+        self.target = Conversation.start_group(self.bob, name='Family')
+        self.original = create_message(
+            self.source, self.alice, text='the venue moved to Pier 4'
+        )
+        self.client.force_authenticate(self.bob)
+        self.url = reverse('chat:conversation-messages', args=[self.target.pk])
+
+    def forward(self, message_id=None, **extra):
+        return self.client.post(
+            self.url,
+            {'forward_from': message_id or self.original.pk, **extra},
+            format='json',
+        )
+
+    def test_a_forward_carries_the_original_words(self):
+        data = self.assertSuccess(self.forward(), status.HTTP_201_CREATED)
+
+        self.assertEqual(data['text'], 'the venue moved to Pier 4')
+        self.assertTrue(data['forwarded'])
+
+    def test_a_forward_never_names_who_it_came_from(self):
+        # It crosses conversations, so naming the original sender would tell
+        # the new room about somebody in a room they cannot see.
+        data = self.assertSuccess(self.forward(), status.HTTP_201_CREATED)
+
+        self.assertNotIn('forwarded_from', data)
+        self.assertEqual(data['sender']['username'], 'bob')
+
+    def test_the_forwarder_cannot_supply_their_own_words(self):
+        # Otherwise anybody could put words in a "Forwarded" frame that were
+        # never said.
+        data = self.assertSuccess(
+            self.forward(text='the venue moved to my house'),
+            status.HTTP_201_CREATED,
+        )
+
+        self.assertEqual(data['text'], 'the venue moved to Pier 4')
+
+    def test_files_come_along_without_being_stored_twice(self):
+        upload = SimpleUploadedFile('map.txt', b'pier 4')
+        attachment = Attachment.objects.create(
+            message=self.original, file=upload, original_name='map.txt'
+        )
+
+        data = self.assertSuccess(self.forward(), status.HTTP_201_CREATED)
+
+        self.assertEqual(data['attachments'][0]['original_name'], 'map.txt')
+        copied = Attachment.objects.get(pk=data['attachments'][0]['id'])
+        self.assertEqual(copied.file.name, attachment.file.name)
+
+    def test_a_message_from_a_conversation_you_are_not_in_cannot_be_forwarded(self):
+        # The read-across this endpoint would otherwise be: unchecked, it
+        # copies the text of any message in the database into a conversation
+        # the caller controls.
+        stranger = make_user('carol', '+639170000003')
+        theirs = Conversation.start_group(stranger, name='Private')
+        secret = create_message(theirs, stranger, text='the password is hunter2')
+
+        self.assertFailure(self.forward(secret.pk))
+
+    def test_a_message_from_a_group_you_left_cannot_be_forwarded(self):
+        self.source.participants.filter(user=self.bob).update(
+            status=Participant.Status.LEFT
+        )
+
+        self.assertFailure(self.forward())
+
+    def test_a_deleted_message_cannot_be_forwarded(self):
+        self.original.deleted_at = timezone.now()
+        self.original.save(update_fields=['deleted_at'])
+
+        self.assertFailure(self.forward())
+
+    def test_a_forward_is_delivered_like_any_other_message(self):
+        # It is a real message in the destination, so the people there who take
+        # this group by text get it by text. Anything else would silently drop
+        # it for the members who are not in the app.
+        with mock.patch('chat.services._schedule_delivery') as fan_out:
+            self.forward()
+
+        fan_out.assert_called_once()

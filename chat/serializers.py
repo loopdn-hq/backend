@@ -5,19 +5,24 @@ from django.conf import settings
 from django.db import transaction
 from rest_framework import serializers
 
+from chat import membership
 from chat.models import (
     Notification,
     Attachment,
     BlockedFromConversation,
+    ChannelConsent,
     Conversation,
     Message,
+    MessageReaction,
     Participant,
+    REACTION_EMOJI,
 )
 from chat.services import (
     announce_added_to_conversation,
     broadcast_conversation_updated,
     create_message,
 )
+from user.blocks import has_blocked
 from user.lookups import find_user
 from user.models import phone_number_validator
 from user.serializers import PublicUserSerializer
@@ -49,9 +54,50 @@ class AttachmentSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(obj.file.url) if request else obj.file.url
 
 
+# Long enough to recognise the message being answered, short enough that a
+# reply to a wall of text does not carry the wall of text with it.
+REPLY_EXCERPT_CHARS = 120
+
+# Everything MessageSerializer reads beyond the message row itself.
+#
+# Declared HERE, next to the serializer, and not spelled out at each call site:
+# a nested field added to the serializer without the join that feeds it is an
+# N+1 on the hottest page in the app, and nothing about the serializer shows it.
+# Callers spread these instead, so adding a field fixes every queryset at once.
+MESSAGE_SELECT_RELATED = (
+    'sender__profile',
+    # Messages that arrived by SMS have no `sender`, and the serializer falls
+    # back to the membership row for the name.
+    'sender_participant__user__profile',
+    # The quoted parent, and whoever wrote it. `sender_label` reads the sender
+    # OR the membership row, so both sides need joining.
+    'reply_to__sender',
+    'reply_to__sender_participant__user__profile',
+)
+MESSAGE_PREFETCH_RELATED = ('attachments', 'reactions__user')
+
+
+# What a deleted message says in its place. One string in one place, so the
+# thread, the reply excerpt and the conversation preview cannot drift apart.
+DELETED_PLACEHOLDER = 'This message was deleted'
+
+
 class MessageSerializer(serializers.ModelSerializer):
+    """One message, as every client reads it.
+
+    A DELETED message still appears - the row survives so the thread does not
+    renumber around a hole and so replies quoting it keep their place - but its
+    text and its files are withheld HERE rather than at each call site. This is
+    the only way a message reaches a client, so withholding here is what makes
+    "deleted" mean deleted.
+    """
+
     sender = serializers.SerializerMethodField()
-    attachments = AttachmentSerializer(many=True, read_only=True)
+    text = serializers.SerializerMethodField()
+    attachments = serializers.SerializerMethodField()
+    reply_to = serializers.SerializerMethodField()
+    reactions = serializers.SerializerMethodField()
+    forwarded = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
@@ -66,9 +112,93 @@ class MessageSerializer(serializers.ModelSerializer):
             # anything the client did not key - inbound SMS, older clients.
             'client_id',
             'attachments',
+            # An EXCERPT of the message being answered, never the message
+            # itself: nesting the real object recurses through a chain of
+            # replies and carries its attachments with it.
+            'reply_to',
+            # One entry per emoji used, with who used it - not raw rows. A
+            # busy message is a handful of pills, and sending the rows would
+            # make every client group them itself, differently.
+            'reactions',
+            # A bare flag, never who it came from. See create_message.
+            'forwarded',
+            # Null until somebody edits it, so "edited" is exactly
+            # `edited_at is not None`. `updated_at` cannot answer this: it is
+            # auto_now on a row nothing re-saves, so it equals created_at
+            # forever.
+            'edited_at',
+            'deleted_at',
             'created_at',
         ]
         read_only_fields = fields
+
+    def get_text(self, obj):
+        return '' if obj.is_deleted else obj.text
+
+    def get_attachments(self, obj):
+        if obj.is_deleted:
+            return []
+        return AttachmentSerializer(
+            obj.attachments.all(), many=True, context=self.context
+        ).data
+
+    def get_forwarded(self, obj):
+        return obj.forwarded_from_id is not None
+
+    def get_reactions(self, obj):
+        """Who reacted with what, grouped by emoji.
+
+        USERNAMES rather than a `reacted` boolean, because this payload is also
+        what the broadcast carries and a broadcast has no request - there is no
+        "me" to compute it against. Each client compares the list with its own
+        username, which it already holds, and the same payload then serves the
+        REST reader, the socket, and a future "who reacted" tooltip.
+
+        Reads the prefetch. Without `prefetch_related('reactions__user')` on
+        the queryset this is two queries per message on the history page.
+        """
+        if obj.is_deleted:
+            return []
+
+        grouped = {}
+        for reaction in obj.reactions.all():
+            grouped.setdefault(reaction.emoji, []).append(reaction.user.username)
+
+        return [
+            {'emoji': emoji, 'count': len(usernames), 'usernames': usernames}
+            for emoji, usernames in grouped.items()
+        ]
+
+    def get_reply_to(self, obj):
+        """The message this one answers, as much of it as a quote needs.
+
+        None when it answers nothing, and also when the parent has since been
+        deleted - `reply_to` is SET_NULL, so a reply outlives its parent and
+        simply stops quoting it rather than disappearing itself.
+        """
+        parent = obj.reply_to
+        if parent is None:
+            return None
+
+        if parent.is_deleted:
+            # The quote goes when the original goes. Leaving the excerpt would
+            # keep a copy of a deleted message visible under every reply to it.
+            return {
+                'id': parent.pk,
+                'sender': parent.sender_label,
+                'text': DELETED_PLACEHOLDER,
+            }
+
+        text = parent.text or ''
+        return {
+            'id': parent.pk,
+            'sender': parent.sender_label,
+            'text': (
+                text
+                if len(text) <= REPLY_EXCERPT_CHARS
+                else text[:REPLY_EXCERPT_CHARS].rstrip() + '\u2026'
+            ),
+        }
 
     def get_sender(self, obj):
         """Who sent it - always the same shape, account or not.
@@ -112,6 +242,85 @@ class MessageCreateSerializer(serializers.Serializer):
         required=False,
         write_only=True,
     )
+    # The message being answered. Validated against THIS conversation - see
+    # validate_reply_to, which is the security-relevant half of the feature.
+    reply_to = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True
+    )
+    # Pass a message along to THIS conversation. Posted to the destination, not
+    # to the source, so every check that already guards a normal send - the
+    # queryset that proves membership, the broadcast-mode rule, the block list
+    # - guards a forward too, with no second copy to keep in step.
+    forward_from = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True
+    )
+
+    def validate_reply_to(self, value):
+        """Refuse a parent from any other conversation.
+
+        Without this the id of a message in a group the sender is not in can be
+        passed here, and its text comes straight back in the reply excerpt -
+        turning "send a message" into a read primitive for private
+        conversations. The conversation is taken from context rather than from
+        the request, so a caller cannot widen it.
+        """
+        if value is None:
+            return None
+
+        conversation = self.context.get('conversation')
+        if conversation is None:
+            raise serializers.ValidationError(
+                'Cannot resolve which conversation this reply belongs to.'
+            )
+
+        parent = Message.objects.filter(
+            pk=value, conversation=conversation
+        ).first()
+        if parent is None:
+            # Deliberately not "no such message": distinguishing "does not
+            # exist" from "exists somewhere you cannot see" is the oracle this
+            # guard exists to close.
+            raise serializers.ValidationError(
+                'You can only reply to a message in this conversation.'
+            )
+        return parent
+
+    def validate_forward_from(self, value):
+        """Refuse anything the forwarder cannot already see.
+
+        Read-across is the whole risk here: unchecked, this endpoint copies the
+        text of any message in the database into a conversation the caller
+        controls. So the source must be a message in a conversation they are an
+        ACTIVE participant of - not merely one they were once in, and not one
+        they are waiting to be approved for.
+        """
+        if value is None:
+            return None
+
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is None or not user.is_authenticated:
+            raise serializers.ValidationError('Sign in to forward a message.')
+
+        original = (
+            Message.objects.filter(
+                pk=value,
+                conversation__participants__user=user,
+                conversation__participants__status=Participant.Status.ACTIVE,
+            )
+            .prefetch_related('attachments')
+            .first()
+        )
+        if original is None:
+            # Same refusal whether it does not exist or exists out of reach.
+            raise serializers.ValidationError(
+                'You can only forward a message you can see.'
+            )
+        if original.is_deleted:
+            raise serializers.ValidationError(
+                'That message was deleted and cannot be forwarded.'
+            )
+        return original
 
     def validate_attachments(self, files):
         if len(files) > settings.MAX_ATTACHMENTS_PER_MESSAGE:
@@ -128,6 +337,10 @@ class MessageCreateSerializer(serializers.Serializer):
         return files
 
     def validate(self, attrs):
+        # A forward carries the original's words, so it satisfies the
+        # something-to-send rule by itself.
+        if attrs.get('forward_from') is not None:
+            return attrs
         if not (attrs.get('text') or '').strip() and not attrs.get('attachments'):
             raise serializers.ValidationError(
                 'Send some text or at least one attachment.'
@@ -135,13 +348,49 @@ class MessageCreateSerializer(serializers.Serializer):
         return attrs
 
     def create(self, validated_data):
+        original = validated_data.get('forward_from')
+
         return create_message(
             conversation=validated_data['conversation'],
             sender=validated_data['sender'],
-            text=validated_data.get('text', ''),
+            # The forwarded words are taken from the original, never from the
+            # request: a client that could supply its own text here would be
+            # able to put words in a "Forwarded" frame that were never said.
+            text=(
+                original.text
+                if original is not None
+                else validated_data.get('text', '')
+            ),
             uploads=validated_data.get('attachments'),
             client_id=validated_data.get('client_id', ''),
+            reply_to=validated_data.get('reply_to'),
+            forwarded_from=original,
+            copy_attachments=(
+                original.attachments.all() if original is not None else None
+            ),
         )
+
+
+class MessageEditSerializer(serializers.Serializer):
+    """New words for a message you already sent.
+
+    Text only. Editing the files would mean a message whose attachments no
+    longer match the copy already texted or emailed out, and there is no way to
+    correct those.
+    """
+
+    text = serializers.CharField(allow_blank=False, trim_whitespace=True)
+
+
+class MessageReactionSerializer(serializers.Serializer):
+    """One emoji, from the fixed set.
+
+    A ChoiceField rather than a free string: the value is rendered in everyone
+    else's thread, so an open field would let any member put 32 arbitrary
+    characters under a message for the whole group to look at.
+    """
+
+    emoji = serializers.ChoiceField(choices=[(e, e) for e in REACTION_EMOJI])
 
 
 class ParticipantSerializer(serializers.ModelSerializer):
@@ -150,6 +399,7 @@ class ParticipantSerializer(serializers.ModelSerializer):
     user = PublicUserSerializer(read_only=True)
     display_label = serializers.CharField(read_only=True)
     is_phone_only = serializers.BooleanField(read_only=True)
+    email_enabled = serializers.SerializerMethodField()
 
     class Meta:
         model = Participant
@@ -162,6 +412,7 @@ class ParticipantSerializer(serializers.ModelSerializer):
             'status',
             'muted',
             'sms_enabled',
+            'email_enabled',
             # How far this member has read, so a client can show a sender
             # whether their message has been seen. Null for anybody who has
             # read nothing - and permanently null for a phone-only member,
@@ -171,6 +422,22 @@ class ParticipantSerializer(serializers.ModelSerializer):
             'joined_at',
         ]
         read_only_fields = fields
+
+    def get_email_enabled(self, obj):
+        """Whether this member currently takes this group by email.
+
+        Derived rather than stored. Email's answer is a ChannelConsent row and
+        not a column, because consent is per channel and a column per channel
+        would mean a migration every time one is added. A client toggling it
+        posts to `delivery/` exactly as it does for the other two switches, so
+        the asymmetry stops here rather than reaching the API.
+
+        Reads the prefetch when there is one - the same reader the fan-out uses.
+        """
+        from chat.delivery import consent_for
+
+        consent = consent_for(obj, ChannelConsent.Channel.EMAIL)
+        return bool(consent and consent.allows_delivery)
 
 
 class GroupSettingsFieldsSerializer(serializers.Serializer):
@@ -273,6 +540,7 @@ class ConversationSerializer(serializers.ModelSerializer):
     muted = serializers.SerializerMethodField()
     archived = serializers.SerializerMethodField()
     cleared = serializers.SerializerMethodField()
+    pinned_message = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
@@ -293,6 +561,10 @@ class ConversationSerializer(serializers.ModelSerializer):
             'admin_details',
             'sms_number',
             'last_message',
+            # The one message held above the thread, or null. On the
+            # conversation rather than on a message so pinning reuses the
+            # `conversation.updated` broadcast every client already handles.
+            'pinned_message',
             'unread_count',
             'muted',
             'archived',
@@ -448,6 +720,18 @@ class ConversationSerializer(serializers.ModelSerializer):
         if prefetched is None:
             message = obj.messages.first()
         if message is None:
+            return None
+        return MessageSerializer(message, context=self.context).data
+
+    def get_pinned_message(self, obj):
+        """The pinned message in full, or null.
+
+        A deleted message stops being pinned rather than showing a tombstone at
+        the top of the thread - the pin is a place to keep something useful, and
+        a placeholder there is just clutter nobody can clear but an admin.
+        """
+        message = obj.pinned_message
+        if message is None or message.is_deleted:
             return None
         return MessageSerializer(message, context=self.context).data
 
@@ -740,15 +1024,38 @@ class DirectConversationSerializer(serializers.Serializer):
         help_text='A username, or a phone number in +E.164 form.'
     )
 
+    #: What the blocker is told. Only ever shown to the person who made the
+    #: block - see `validate_identifier`.
+    BLOCKED_BY_ME = 'You blocked this user. Unblock to message them.'
+
+    #: What everybody else is told, blocked or simply mistyped.
+    NOT_FOUND = 'No user found with that username or number.'
+
     def validate_identifier(self, value):
         viewer = self.context['request'].user
         other = find_user(value, exclude=viewer)
-        if other is None:
-            # Deliberately vague: confirming "no such user" for arbitrary
-            # input turns this into a directory oracle.
-            raise serializers.ValidationError('No user found with that username or number.')
-        self.other = other
-        return value
+        if other is not None:
+            self.other = other
+            return value
+
+        # Nobody resolved. Either the name is wrong, or `find_user` filtered
+        # out somebody in a block relationship with the viewer - and those two
+        # people must be told different things.
+        #
+        # THE BLOCKER IS TOLD PLAINLY. They already know they blocked somebody,
+        # so hiding it buys no privacy and only leaves them at a dead end that
+        # looks like a bug. THE BLOCKED PERSON IS TOLD NOTHING: for them the
+        # answer must be the one a stranger's typo gets, or the refusal itself
+        # announces the block.
+        #
+        # Which is why this asks `has_blocked` - one direction - rather than
+        # `blocks_between`. It is the only place in the product where the two
+        # sides of a block are deliberately treated differently.
+        candidate = find_user(value, exclude=viewer, apply_blocks=False)
+        if candidate is not None and has_blocked(viewer, candidate):
+            raise serializers.ValidationError(self.BLOCKED_BY_ME)
+
+        raise serializers.ValidationError(self.NOT_FOUND)
 
     def create(self, validated_data):
         conversation, created = Conversation.start_direct(
@@ -992,7 +1299,25 @@ class AddMembersSerializer(serializers.Serializer):
     members = serializers.ListField(child=serializers.CharField(), allow_empty=False)
 
     def validate_members(self, values):
-        return resolve_members(values, exclude=None)
+        # `exclude=None`, so `find_user` does NOT drop a blocked pair here.
+        # That is on purpose and it is not the same shortcut the sibling
+        # serializer takes: an admin adding several people needs each name to
+        # resolve or fail on its own merits, and a lookup that silently found
+        # nobody would be reported as "no such user" rather than as a refusal.
+        # The block is enforced below instead, where it can actually refuse.
+        resolved = resolve_members(values, exclude=None)
+
+        # §11 of the blocking spec, on the route people actually use. This was
+        # enforced on invite-by-email and invite-by-number while the ordinary
+        # "add members" endpoint - the one the app calls - went straight to
+        # `add_participant`, which knows only about the admin-imposed block and
+        # nothing about one person blocking another.
+        request = self.context.get('request')
+        adder = getattr(request, 'user', None)
+        for user in resolved:
+            membership._refuse_blocked_invite(adder, user)
+
+        return resolved
 
     @transaction.atomic
     def save(self, **kwargs):
@@ -1164,23 +1489,28 @@ class MarkReadSerializer(serializers.Serializer):
 class DeliveryPreferenceSerializer(serializers.Serializer):
     """How one member wants one group delivered to them.
 
-    Two separate switches, because they answer different questions:
+    Three separate switches, because they answer different questions:
 
-      muted        silence this group entirely, on every channel. The member's
-                   own act, and what texting MUTE sets.
-      sms_enabled  whether SMS is one of this group's channels for them at all.
-                   On by default; off means app-only.
+      muted         silence this group entirely, on every channel. The member's
+                    own act, and what texting MUTE sets.
+      sms_enabled   whether SMS is one of this group's channels for them at all.
+                    On by default; off means app-only.
+      email_enabled the same question for email. Off is what the unsubscribe
+                    link in every group email writes - and this endpoint is the
+                    only thing that can turn it back ON, because nothing
+                    reachable from an emailed token may add.
 
-    Both optional, so a client changing one does not have to know the other.
+    All optional, so a client changing one does not have to know the others.
     """
 
     muted = serializers.BooleanField(required=False)
     sms_enabled = serializers.BooleanField(required=False)
+    email_enabled = serializers.BooleanField(required=False)
 
     def validate(self, attrs):
         if not attrs:
             raise serializers.ValidationError(
-                'Set muted, sms_enabled, or both.'
+                'Set muted, sms_enabled, email_enabled, or any combination.'
             )
         return attrs
 

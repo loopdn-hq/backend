@@ -18,7 +18,6 @@ class ParticipantInline(admin.TabularInline):
         'display_name',
         'role',
         'sms_enabled',
-        'sms_consent',
         'joined_at',
     ]
     readonly_fields = ['joined_at']

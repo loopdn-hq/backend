@@ -11,6 +11,7 @@ from django.test import TestCase
 import sms.client
 import sms.verification
 from chat.models import (
+    ChannelConsent,
     BlockedFromConversation,
     Conversation,
     Message,
@@ -20,6 +21,27 @@ import base64
 import time
 import urllib.parse
 from unittest import mock
+
+def grant_sms(participant, status):
+    """Set a member's SMS consent, the way production does.
+
+    Through membership.set_channel_consent rather than by writing the row, so
+    a test sets consent by the same route the app does and cannot drift from
+    it - which is the whole reason that entry point exists.
+    """
+    from chat import membership
+
+    return membership.set_channel_consent(
+        participant, ChannelConsent.Channel.SMS, status
+    )
+
+
+def sms_consent_of(participant):
+    """A member's SMS consent status, or None if there is no record."""
+    from chat import membership
+
+    return membership.consent_status(participant, ChannelConsent.Channel.SMS)
+
 
 from django.urls import reverse
 from rest_framework import status
@@ -90,7 +112,14 @@ class CommandParsingTests(TestCase):
             ('CANCEL', commands.STOP),
             ('QUIT', commands.STOP),
             ('START', commands.START),
-            ('YES', commands.START),
+            ('UNSTOP', commands.START),
+            # YES and NO answer a GROUP's invitation. They are deliberately
+            # not START and STOP, which are the carrier's words for the whole
+            # of LoopD'n - somebody declining one group keeps the others.
+            ('YES', commands.YES),
+            ('yes', commands.YES),
+            ('NO', commands.NO),
+            ('no', commands.NO),
             ('HELP', commands.HELP),
             ('info', commands.HELP),
             ('MUTE', commands.MUTE),
@@ -108,8 +137,15 @@ class CommandParsingTests(TestCase):
             'can you help me with dinner',
             'I will leave at 6',
             'Please start the laundry',
-            'no',
+            'no thanks I am busy',
             'yes please bring milk',
+            # Not answers, whatever they look like. A pending member who sends
+            # one of these has not consented, and reading agreement into them
+            # is how somebody who never answered starts getting texted.
+            'Y',
+            'N',
+            'Okay',
+            'Sure',
         ]:
             with self.subTest(body=body):
                 self.assertCommand(body, None)
@@ -155,7 +191,7 @@ class InboundSmsTests(TestCase):
         self.assertEqual(result.action, 'joined')
         self.assertTrue(self.group.has_phone_participant(self.number))
         # They texted us first, so consent is not in doubt.
-        self.assertEqual(result.participant.sms_consent, Participant.Consent.GRANTED)
+        self.assertEqual(sms_consent_of(result.participant), ChannelConsent.Status.OPTED_IN)
         self.assertTrue(result.participant.sms_enabled)
 
     def test_join_on_an_approval_group_waits_for_an_admin(self):
@@ -250,7 +286,7 @@ class InboundSmsTests(TestCase):
 
         row = self.group.participants.get(phone_number=self.number)
         self.assertFalse(row.sms_enabled)
-        self.assertEqual(row.sms_consent, Participant.Consent.STOPPED)
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.OPTED_OUT)
         # STOP is about texts, not membership.
         self.assertEqual(row.status, Participant.Status.ACTIVE)
 
@@ -267,7 +303,7 @@ class InboundSmsTests(TestCase):
         self.assertEqual(result.action, 'opted_in')
         row = self.group.participants.get(phone_number=self.number)
         self.assertTrue(row.sms_enabled)
-        self.assertEqual(row.sms_consent, Participant.Consent.GRANTED)
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.OPTED_IN)
 
     def test_help_answers_in_one_gsm7_segment(self):
         self.join()
@@ -361,7 +397,7 @@ class FanOutTests(TestCase):
 
     def add_phone_member(self, number, name='Mom', **kwargs):
         row = self.group.add_phone_participant(number, display_name=name)
-        row.sms_consent = Participant.Consent.GRANTED
+        grant_sms(row, ChannelConsent.Status.OPTED_IN)
         for field, value in kwargs.items():
             setattr(row, field, value)
         row.save()
@@ -408,8 +444,10 @@ class FanOutTests(TestCase):
         muted = self.add_phone_member('+639171111111', name='Muted', muted=True)
         off = self.add_phone_member('+639172222222', name='Off', sms_enabled=False)
         stopped = self.add_phone_member('+639173333333', name='Stopped')
-        stopped.sms_consent = Participant.Consent.STOPPED
-        stopped.save(update_fields=['sms_consent'])
+        grant_sms(
+            stopped,
+            ChannelConsent.Status.OPTED_OUT,
+        )
 
         rows = {r.participant_id: r for r in outbound.fan_out(self.post())}
 
@@ -681,7 +719,7 @@ class WiredFanOutTests(TransactionTestCase):
             status=GroupNumber.Status.ACTIVE,
         )
         self.mom = self.group.add_phone_participant('+639171111111', display_name='Mom')
-        self.mom.sms_consent = Participant.Consent.GRANTED
+        grant_sms(self.mom, ChannelConsent.Status.OPTED_IN)
         self.mom.save()
         self.sender = Participant.objects.get(
             conversation=self.group, user=self.alice
@@ -766,7 +804,7 @@ class KillSwitchAndDispatchTests(TestCase):
             status=GroupNumber.Status.ACTIVE,
         )
         self.mom = self.group.add_phone_participant('+639171111111', display_name='Mom')
-        self.mom.sms_consent = Participant.Consent.GRANTED
+        grant_sms(self.mom, ChannelConsent.Status.OPTED_IN)
         self.mom.save()
         self.sender = Participant.objects.get(conversation=self.group, user=self.alice)
 
@@ -1770,8 +1808,10 @@ class SpendCapsTests(TestCase):
             row = self.group.add_phone_participant(
                 f'+63917000000{i}', display_name=f'M{i}'
             )
-            row.sms_consent = Participant.Consent.GRANTED
-            row.save(update_fields=['sms_consent'])
+            grant_sms(
+                row,
+                ChannelConsent.Status.OPTED_IN,
+            )
 
         message = create_message(
             conversation=self.group, sender=self.alice, text='hi',
@@ -1844,7 +1884,7 @@ class InviteAndNotifyTests(TransactionTestCase):
         row = membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
 
         self.assertEqual(row.display_label, 'Mom')
-        self.assertEqual(row.sms_consent, Participant.Consent.PENDING)
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.PENDING)
         self.assertTrue(row.consent_text)
 
     def test_the_invitation_is_texted_and_logged(self):
@@ -1872,7 +1912,7 @@ class InviteAndNotifyTests(TransactionTestCase):
         row = membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
         inbound.handle_inbound(self.group, self.number, 'YES')
         row.refresh_from_db()
-        self.assertEqual(row.sms_consent, Participant.Consent.GRANTED)
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.OPTED_IN)
 
     def test_a_blocked_number_cannot_be_invited_back(self):
         row = membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
@@ -1891,7 +1931,64 @@ class InviteAndNotifyTests(TransactionTestCase):
         inbound.handle_inbound(self.group, self.number, 'YES')
 
         row = membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
-        self.assertEqual(row.sms_consent, Participant.Consent.GRANTED)
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.OPTED_IN)
+
+    # --- an answer is an answer ---------------------------------------------
+    #
+    # Re-inviting used to reset anything but OPTED_IN back to PENDING, which
+    # turned "no" into "not yet" and handed anybody who could add a member a
+    # way to clear a decline - or a STOP - and text the number again.
+
+    def test_re_inviting_somebody_who_declined_does_not_ask_again(self):
+        membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+        inbound.handle_inbound(self.group, self.number, 'NO')
+
+        row = membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.DECLINED)
+
+    def test_and_does_not_text_them_again(self):
+        membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+        inbound.handle_inbound(self.group, self.number, 'NO')
+        before = len(self.sent())
+
+        membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+
+        self.assertEqual(len(self.sent()), before)
+
+    def test_re_inviting_a_number_that_replied_stop_does_not_ask_again(self):
+        # The carrier-mandated one. An admin re-adding somebody must not be
+        # able to undo a provider-level opt-out.
+        membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+        inbound.handle_inbound(self.group, self.number, 'STOP')
+        before = len(self.sent())
+
+        row = membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.OPTED_OUT)
+        self.assertEqual(len(self.sent()), before)
+
+    def test_but_an_unanswered_invitation_can_be_sent_again(self):
+        # The recovery path for one that never arrived. PENDING is the only
+        # state that is re-asked, because it is the only open question.
+        membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+        before = len(self.sent())
+
+        row = membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.PENDING)
+        self.assertEqual(len(self.sent()), before + 1)
+
+    def test_a_declined_member_can_still_turn_the_group_back_on(self):
+        # Sticky, not permanent. The member holds the switch; the admin does
+        # not, which is the whole distinction.
+        membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+        inbound.handle_inbound(self.group, self.number, 'NO')
+        row = membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)
+
+        inbound.handle_inbound(self.group, self.number, 'YES')
+
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.OPTED_IN)
 
     # --- being told what happened -------------------------------------------
 
@@ -1967,8 +2064,10 @@ class LosingThingsSilentlyTests(TransactionTestCase):
 
     def add_member(self, number, name):
         row = self.group.add_phone_participant(number, display_name=name)
-        row.sms_consent = Participant.Consent.GRANTED
-        row.save(update_fields=['sms_consent'])
+        grant_sms(
+            row,
+            ChannelConsent.Status.OPTED_IN,
+        )
         return row
 
     # --- 1. a failed release used to destroy the record --------------------
@@ -2101,8 +2200,10 @@ class MaintenanceTests(TransactionTestCase):
             status=GroupNumber.Status.ACTIVE,
         )
         self.mom = self.group.add_phone_participant('+639171111111', display_name='Mom')
-        self.mom.sms_consent = Participant.Consent.GRANTED
-        self.mom.save(update_fields=['sms_consent'])
+        grant_sms(
+            self.mom,
+            ChannelConsent.Status.OPTED_IN,
+        )
         self.sender = Participant.objects.get(
             conversation=self.group, user=self.alice
         )
@@ -2149,6 +2250,89 @@ class MaintenanceTests(TransactionTestCase):
     def test_a_permanent_reason_is_never_retried(self):
         self.a_failed_delivery(reason='no verified number')
         self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+    def test_a_retry_is_dropped_if_they_said_stop_meanwhile(self):
+        # The window between a failure and its retry is up to six hours, and
+        # PERMANENT_REASONS cannot help: it excludes rows that were ALREADY a
+        # policy refusal, not ones that became one afterwards.
+        row = self.a_failed_delivery()
+        inbound.handle_inbound(self.group, '+639171111111', 'STOP')
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, SmsDelivery.Status.SKIPPED)
+        # The switch, not the consent row, because §23's ladder asks "channel
+        # disabled?" before "no consent?" and STOP sets both.
+        self.assertEqual(row.reason, 'sms disabled for this group')
+
+    def test_and_that_ends_it_rather_than_coming_round_again(self):
+        # SKIPPED is not just accurate, it is self-limiting: the sweep never
+        # picks a SKIPPED row up.
+        self.a_failed_delivery()
+        inbound.handle_inbound(self.group, '+639171111111', 'STOP')
+        maintenance.retry_failed_deliveries()
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+    def test_a_retry_is_dropped_if_they_muted_meanwhile(self):
+        row = self.a_failed_delivery()
+        membership.set_muted(self.mom, True)
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.reason, 'muted')
+
+    def test_a_retry_is_dropped_if_they_left_meanwhile(self):
+        row = self.a_failed_delivery()
+        self.mom.status = Participant.Status.LEFT
+        self.mom.save(update_fields=['status'])
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.reason, 'not an active member')
+
+    def test_but_an_ordinary_failure_is_still_retried(self):
+        # The guard must not swallow the case the retry exists for.
+        row = self.a_failed_delivery()
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 1)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, SmsDelivery.Status.SENT)
+
+    def test_a_retry_is_dropped_if_they_blocked_the_sender_meanwhile(self):
+        # The retry window is up to six hours, and a block can happen inside
+        # it. A rule living only in the fan-out would be bypassed here - which
+        # is exactly the defect the STOP-after-failure fix closed, in the same
+        # function, for a different reason.
+        from chat import delivery
+        from user import blocks
+
+        bob = User.objects.create_user(username='bob', password='x')
+        bob.profile.phone_number = '+639172220002'
+        bob.profile.phone_no_verified = True
+        bob.profile.save()
+        self.group.add_participant(bob)
+        bob_row = Participant.objects.get(conversation=self.group, user=bob)
+
+        message = create_message(
+            conversation=self.group, sender=self.alice, text='Dinner at 7',
+            participant=self.sender,
+        )
+        row = SmsDelivery.objects.get(message=message, participant=bob_row)
+        row.status, row.reason = SmsDelivery.Status.FAILED, 'carrier hiccup'
+        row.save(update_fields=['status', 'reason'])
+
+        blocks.block(bob, user=self.alice)
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, SmsDelivery.Status.SKIPPED)
+        self.assertEqual(row.reason, delivery.BLOCKED_REASON)
 
     def test_an_old_failure_is_left_alone(self):
         # Nobody wants yesterday's "dinner at 7".
@@ -2259,8 +2443,10 @@ class GroupSmsSettingsTests(TransactionTestCase):
             status=GroupNumber.Status.ACTIVE,
         )
         self.mom = self.group.add_phone_participant('+639171111111', display_name='Mom')
-        self.mom.sms_consent = Participant.Consent.GRANTED
-        self.mom.save(update_fields=['sms_consent'])
+        grant_sms(
+            self.mom,
+            ChannelConsent.Status.OPTED_IN,
+        )
         self.sender = Participant.objects.get(
             conversation=self.group, user=self.alice
         )
@@ -2323,3 +2509,294 @@ class GroupSmsSettingsTests(TransactionTestCase):
             inbound.handle_inbound(self.group, '+639171111111', 'ok').action,
             'refused_replies_off',
         )
+
+
+class GroupConsentTests(TestCase):
+    """YES and NO answer one group. START and STOP answer for all of LoopD'n.
+
+    The distinction is the point. Somebody tired of one noisy group should not
+    have to leave every group to quieten it, and a product that makes them do
+    that loses a channel it was allowed to use. It also has to hold in the
+    other direction: STOP is carrier-mandated and must silence everything,
+    whatever any single group has been told.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = User.objects.create_user(username='alice', password='x')
+        self.family = Conversation.start_group(self.alice, name='Family')
+        self.work = Conversation.start_group(self.alice, name='Work')
+        self.number = '+639171111111'
+
+    def invite_to(self, conversation):
+        """Add the number to a group the way an admin does, and return the row."""
+        return membership.invite_by_phone(
+            conversation, self.number, 'Mom', self.alice
+        )
+
+    def send(self, conversation, body):
+        return inbound.handle_inbound(conversation, self.number, body)
+
+    # --- answering the invitation -------------------------------------------
+
+    def test_an_invitation_leaves_consent_pending(self):
+        mom = self.invite_to(self.family)
+
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.PENDING)
+
+    def test_yes_opts_into_that_group(self):
+        mom = self.invite_to(self.family)
+
+        result = self.send(self.family, 'YES')
+
+        self.assertEqual(result.action, 'group_opted_in')
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.OPTED_IN)
+
+    def test_no_declines_that_group(self):
+        mom = self.invite_to(self.family)
+
+        result = self.send(self.family, 'NO')
+
+        self.assertEqual(result.action, 'group_declined')
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.DECLINED)
+
+    def test_no_does_not_post_the_word_no_into_the_group(self):
+        # The bug this replaces: NO was not a command, so declining an
+        # invitation published "NO" to everybody in the group.
+        self.invite_to(self.family)
+
+        self.send(self.family, 'NO')
+
+        self.assertEqual(self.family.messages.count(), 0)
+
+    def test_yes_turns_a_declined_group_back_on(self):
+        mom = self.invite_to(self.family)
+        self.send(self.family, 'NO')
+
+        self.send(self.family, 'YES')
+
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.OPTED_IN)
+
+    # --- the scoping rule ---------------------------------------------------
+
+    def test_declining_one_group_leaves_the_others_alone(self):
+        family_row = self.invite_to(self.family)
+        work_row = self.invite_to(self.work)
+        self.send(self.work, 'YES')
+
+        self.send(self.family, 'NO')
+
+        self.assertEqual(
+            sms_consent_of(family_row), ChannelConsent.Status.DECLINED
+        )
+        self.assertEqual(
+            sms_consent_of(work_row), ChannelConsent.Status.OPTED_IN
+        )
+
+    def test_stop_reaches_every_group_this_number_is_in(self):
+        # The carrier's word, and the assertion that matters. It used to read
+        # `assertFalse(work_row.user_id and ...)`, which is vacuously true for
+        # a phone-only row - the test passed while STOP was silencing Family
+        # and leaving Work free to carry on texting the same person.
+        self.invite_to(self.family)
+        work_row = self.invite_to(self.work)
+        self.send(self.work, 'YES')
+
+        self.send(self.family, 'STOP')
+
+        work_row.refresh_from_db()
+        self.assertFalse(work_row.sms_enabled)
+
+    def test_and_the_delivery_engine_agrees(self):
+        # Through the ladder rather than the column, because the column only
+        # matters if something reads it.
+        from chat import delivery
+
+        self.invite_to(self.family)
+        work_row = self.invite_to(self.work)
+        self.send(self.work, 'YES')
+
+        self.send(self.family, 'STOP')
+
+        work_row.refresh_from_db()
+        self.assertEqual(
+            delivery.refusal_reason(work_row, ChannelConsent.Channel.SMS),
+            'sms disabled for this group',
+        )
+
+    def test_start_brings_every_group_back(self):
+        self.invite_to(self.family)
+        work_row = self.invite_to(self.work)
+        self.send(self.work, 'YES')
+        self.send(self.family, 'STOP')
+
+        self.send(self.family, 'START')
+
+        work_row.refresh_from_db()
+        self.assertTrue(work_row.sms_enabled)
+
+    def test_start_does_not_resurrect_a_group_they_declined(self):
+        # STOP moved a switch, not an answer. Restoring the switch must not
+        # also overwrite "I declined Family" with "yes please".
+        family_row = self.invite_to(self.family)
+        self.send(self.family, 'NO')
+        self.send(self.family, 'STOP')
+
+        self.send(self.family, 'START')
+
+        self.assertEqual(
+            sms_consent_of(family_row), ChannelConsent.Status.OPTED_IN
+        )
+        work_row = self.invite_to(self.work)
+        self.assertEqual(sms_consent_of(work_row), ChannelConsent.Status.PENDING)
+
+    # --- YES and NO are answers, and only while a question is open ----------
+
+    def test_yes_does_not_undo_a_carrier_stop(self):
+        # YES is not a carrier opt-in word. Letting it clear an opt-out meant a
+        # number that replied STOP could be texted again on the strength of a
+        # word the carrier does not recognise for that purpose.
+        mom = self.invite_to(self.family)
+        self.send(self.family, 'STOP')
+
+        self.send(self.family, 'YES')
+
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.OPTED_OUT)
+
+    def test_only_start_undoes_a_stop(self):
+        mom = self.invite_to(self.family)
+        self.send(self.family, 'STOP')
+
+        self.send(self.family, 'START')
+
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.OPTED_IN)
+
+    def test_a_conversational_no_from_an_opted_in_member_is_a_message(self):
+        # "Are you coming?" "No" is the most ordinary exchange there is.
+        # Reading it as a command swallowed the message AND unsubscribed them.
+        mom = self.invite_to(self.family)
+        self.send(self.family, 'YES')
+
+        result = self.send(self.family, 'No')
+
+        self.assertEqual(result.action, 'posted')
+        self.assertEqual(self.family.messages.count(), 1)
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.OPTED_IN)
+
+    def test_a_conversational_yes_from_an_opted_in_member_is_a_message_too(self):
+        self.invite_to(self.family)
+        self.send(self.family, 'YES')
+
+        result = self.send(self.family, 'Yes')
+
+        self.assertEqual(result.action, 'posted')
+        self.assertEqual(self.family.messages.count(), 1)
+
+    def test_but_yes_still_answers_an_open_invitation(self):
+        mom = self.invite_to(self.family)
+
+        self.send(self.family, 'YES')
+
+        self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.OPTED_IN)
+        self.assertEqual(self.family.messages.count(), 0)
+
+    # --- STOP is about the NUMBER, not about which row answered -------------
+
+    def test_stop_from_an_account_row_silences_their_phone_only_rows(self):
+        # One human, two kinds of row, one number. The sweep used to ask which
+        # kind had answered and only sweep the matching kind, so this
+        # arrangement left Work texting a number that had just said STOP.
+        self.alice.profile.phone_number = self.number
+        self.alice.profile.phone_no_verified = True
+        self.alice.profile.save()
+        work_row = self.invite_to(self.work)
+        self.send(self.work, 'YES')
+
+        # Alice answers from her own (account) row in Family.
+        self.send(self.family, 'STOP')
+
+        work_row.refresh_from_db()
+        self.assertFalse(work_row.sms_enabled)
+
+    def test_stop_from_a_phone_only_row_silences_the_account_too(self):
+        # The mirror. The profile write used to be guarded on the answering
+        # row having an account, so a phone-only STOP never reached it - and
+        # the account's own groups are gated on the profile switch.
+        bob = User.objects.create_user(username='bob', password='x')
+        bob.profile.phone_number = self.number
+        bob.profile.phone_no_verified = True
+        bob.profile.save()
+        self.invite_to(self.family)
+
+        self.send(self.family, 'STOP')
+
+        bob.profile.refresh_from_db()
+        self.assertFalse(bob.profile.sms_enabled)
+        self.assertIsNotNone(bob.profile.sms_opt_out_at)
+
+    def test_start_brings_the_account_back_too(self):
+        bob = User.objects.create_user(username='bob', password='x')
+        bob.profile.phone_number = self.number
+        bob.profile.phone_no_verified = True
+        bob.profile.save()
+        self.invite_to(self.family)
+        self.send(self.family, 'STOP')
+
+        self.send(self.family, 'START')
+
+        bob.profile.refresh_from_db()
+        self.assertTrue(bob.profile.sms_enabled)
+
+    def test_the_delivery_engine_agrees_across_both_kinds(self):
+        # Through the ladder rather than the columns, because a column only
+        # matters if something reads it.
+        from chat import delivery
+
+        self.alice.profile.phone_number = self.number
+        self.alice.profile.phone_no_verified = True
+        self.alice.profile.save()
+        work_row = self.invite_to(self.work)
+        self.send(self.work, 'YES')
+
+        self.send(self.family, 'STOP')
+
+        work_row.refresh_from_db()
+        self.assertIsNotNone(
+            delivery.refusal_reason(work_row, ChannelConsent.Channel.SMS)
+        )
+
+    # --- silence while pending ----------------------------------------------
+
+    def test_a_pending_member_saying_anything_else_is_ignored(self):
+        self.invite_to(self.family)
+
+        for body in ['Hello', 'Okay', 'Sure', 'Y', 'Maybe']:
+            with self.subTest(body=body):
+                result = self.send(self.family, body)
+                self.assertEqual(result.action, 'ignored_pending_consent')
+
+    def test_and_none_of_it_reaches_the_group(self):
+        self.invite_to(self.family)
+
+        self.send(self.family, 'Okay')
+        self.send(self.family, 'Y')
+
+        self.assertEqual(self.family.messages.count(), 0)
+
+    def test_a_declined_member_texting_does_not_post_either(self):
+        self.invite_to(self.family)
+        self.send(self.family, 'NO')
+
+        result = self.send(self.family, 'Where are you?')
+
+        self.assertEqual(result.action, 'ignored_declined')
+        self.assertEqual(self.family.messages.count(), 0)
+
+    def test_but_an_opted_in_member_posts_normally(self):
+        self.invite_to(self.family)
+        self.send(self.family, 'YES')
+
+        self.send(self.family, 'On my way')
+
+        self.assertEqual(self.family.messages.count(), 1)
+        self.assertEqual(self.family.messages.first().text, 'On my way')

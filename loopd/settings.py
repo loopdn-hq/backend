@@ -158,6 +158,9 @@ INSTALLED_APPS = [
     'otp',
     'chat',
     'sms',
+    # `mail`, not `email`: a top-level app called `email` would shadow the
+    # standard library module for everything on the path.
+    'mail',
     'billing',
 ]
 
@@ -353,6 +356,92 @@ EMAIL_REQUEST_TIMEOUT = 10
 # Available to every email template without the caller passing them.
 EMAIL_PRODUCT_NAME = os.environ.get('EMAIL_PRODUCT_NAME', 'Loopd')
 EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMAIL)
+
+# --- group email --------------------------------------------------------
+#
+# The second delivery channel, alongside SMS. Same shape as the SMS block
+# below: keyed on the presence of configuration rather than on DEBUG, so a
+# laptop runs the whole decision path and logs instead of sending.
+
+# The master switch for outbound group email. Off by default, unlike SMS:
+# turning a channel on for every existing group is a decision somebody should
+# make on purpose, and a domain's sending reputation is not recoverable by
+# turning it off again afterwards.
+MAIL_SENDING_ENABLED = os.environ.get('MAIL_SENDING_ENABLED', 'False').lower() in (
+    '1', 'true', 'yes'
+)
+
+# The domain the inbound provider receives replies on, e.g. reply.loopdn.com.
+# It must NOT be the domain that receives ordinary mail for the company: every
+# address under it is a machine-readable reply handle. Empty means replies are
+# not accepted, and the templates then say "open Loopd to respond" instead of
+# inviting one that would land nowhere.
+MAIL_REPLY_DOMAIN = os.environ.get('MAIL_REPLY_DOMAIN', '').strip().lower()
+
+# Signs the inbound email webhook. Empty skips verification - development only,
+# and mail/checks.py raises an error if a reply domain is configured without it.
+RESEND_WEBHOOK_SECRET = os.environ.get('RESEND_WEBHOOK_SECRET', '')
+
+# Whether an inbound reply must carry the receiving server's passing SPF, DKIM
+# or DMARC verdict for the domain it claims to be from. The From address is
+# what lets a reply post as a member, and without this it is a string anybody
+# can type. On by default; False is for a laptop feeding the webhook by hand,
+# and mail/checks.py refuses a deploy that has replies on and this off. See
+# mail/authentication.py for the rule.
+MAIL_INBOUND_REQUIRE_AUTHENTICATION = os.environ.get(
+    'MAIL_INBOUND_REQUIRE_AUTHENTICATION', 'True'
+).lower() in ('1', 'true', 'yes')
+
+# How far out of date a webhook signature may be. Same reasoning as
+# SMS_WEBHOOK_TOLERANCE_SECONDS: long enough to survive clock drift, short
+# enough that a captured request cannot be replayed tomorrow.
+MAIL_WEBHOOK_TOLERANCE_SECONDS = int(
+    os.environ.get('MAIL_WEBHOOK_TOLERANCE_SECONDS', '300')
+)
+
+# Above this, the email leg stops and everybody still gets the message in the
+# app. A large group mailing every message is how a sending domain earns a
+# reputation it cannot spend its way out of.
+MAIL_MAX_RECIPIENTS_PER_MESSAGE = int(
+    os.environ.get('MAIL_MAX_RECIPIENTS_PER_MESSAGE', '100')
+)
+
+# This API's own public origin, for the links it prints INTO email. Distinct
+# from FRONTEND_URL, which is where the app lives: the unsubscribe page is
+# served by Django, because a static export on another origin cannot verify a
+# token and must not be what stands between somebody and the way out.
+#
+# There is nothing to build an absolute URL from at send time - the fan-out
+# runs on a Celery worker with no request - so this is configuration rather
+# than something to derive. mail/checks.py refuses a deploy that has group
+# email on and leaves this empty.
+API_PUBLIC_URL = os.environ.get('API_PUBLIC_URL', '').rstrip('/')
+
+# A leaked unsubscribe link must not become a write amplifier. Same cache
+# fixed-window idiom as sms/inbound.py:_join_attempt_allowed. High enough that
+# a real member clicking twice never notices; and because the operation is
+# idempotent, a caller past the cap is simply told what is already true.
+MAIL_MAX_UNSUBSCRIBE_ATTEMPTS_PER_HOUR = int(
+    os.environ.get('MAIL_MAX_UNSUBSCRIBE_ATTEMPTS_PER_HOUR', '20')
+)
+
+# The email retry sweep, with the same three bounds as SMS's: how many times
+# one row may be tried, how old a message may be and still be worth delivering,
+# and how long a row may sit in SENDING before the worker is presumed dead.
+MAIL_MAX_DELIVERY_ATTEMPTS = int(os.environ.get('MAIL_MAX_DELIVERY_ATTEMPTS', '3'))
+MAIL_RETRY_WINDOW_HOURS = int(os.environ.get('MAIL_RETRY_WINDOW_HOURS', '6'))
+MAIL_STALLED_AFTER_MINUTES = int(os.environ.get('MAIL_STALLED_AFTER_MINUTES', '15'))
+
+# A row per recipient per message, recording who is emailed about which
+# private group. Not something to keep forever.
+MAIL_RETENTION_DAYS = int(os.environ.get('MAIL_RETENTION_DAYS', '90'))
+
+# Signs the unsubscribe token. Defaults to SECRET_KEY, so leaving it unset
+# changes nothing at all - it exists so that rotating SECRET_KEY one day does
+# not have to invalidate every unsubscribe link already sitting in somebody's
+# mailbox, which is a worse failure than it sounds: unlike a reply address,
+# nothing replaces a dead unsubscribe link except the next email.
+MAIL_TOKEN_SECRET = os.environ.get('MAIL_TOKEN_SECRET', '') or SECRET_KEY
 
 # Where the frontend lives, for building links that go out in email (password
 # reset today). No trailing slash - callers append their own path.
@@ -802,6 +891,19 @@ CELERY_BEAT_SCHEDULE = {
     },
     'sms-daily-spend-report': {
         'task': 'sms.daily_spend_report',
+        'schedule': 86400.0,
+    },
+    # The same three jobs for email - see mail/maintenance.py.
+    'mail-retry-failed-deliveries': {
+        'task': 'mail.retry_failed_deliveries',
+        'schedule': 300.0,
+    },
+    'mail-requeue-stalled-deliveries': {
+        'task': 'mail.requeue_stalled_deliveries',
+        'schedule': 600.0,
+    },
+    'mail-purge-old-deliveries': {
+        'task': 'mail.purge_old_deliveries',
         'schedule': 86400.0,
     },
 }

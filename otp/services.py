@@ -209,6 +209,13 @@ def verify_phone(user, code):
     profile.phone_no_verified = True
     profile.save(update_fields=['phone_number', 'phone_no_verified', 'updated_at'])
 
+    # This is the moment a bare number becomes a person, so it is the moment
+    # any block against that number becomes a block against this account.
+    # Without it, signing up would be a way round one.
+    from user.blocks import link_number_to_account
+
+    link_number_to_account(user)
+
     return profile
 
 

@@ -24,6 +24,7 @@ from django.utils import timezone
 
 from chat.models import (
     BlockedFromConversation,
+    ChannelConsent,
     Conversation,
     Notification,
     Participant,
@@ -173,9 +174,13 @@ def request_to_join(conversation, *, user=None, phone_number=None,
         # which is the whole reason JOIN is a better front door than adding
         # somebody's number on their behalf and hoping they consent later.
         sms_enabled=True,
-        sms_consent=Participant.Consent.GRANTED,
         consent_at=timezone.now(),
         consent_text='Sent JOIN to the group number.',
+    )
+    set_channel_consent(
+        created_by_text,
+        ChannelConsent.Channel.SMS,
+        ChannelConsent.Status.OPTED_IN,
     )
     _announce_if_pending(created_by_text)
     return created_by_text
@@ -376,11 +381,17 @@ def set_role(participant, role, by):
     return participant
 
 
-def set_delivery(participant, *, muted=None, sms_enabled=None):
+def set_delivery(participant, *, muted=None, sms_enabled=None, email_enabled=None):
     """Change how one member receives one conversation.
 
     Only what was asked for is written, so a client toggling the mute switch
     cannot accidentally reset somebody's SMS preference back to the default.
+
+    The three switches do not live in the same place, and that is not an
+    inconsistency. `muted` and `sms_enabled` are columns on the membership;
+    email's answer is a ChannelConsent row, because consent is per channel and
+    a column per channel would mean a migration every time one is added. This
+    function is where that stops mattering to a caller.
     """
     if participant.status != Participant.Status.ACTIVE:
         raise NotAMember('You are not a member of that conversation.')
@@ -395,6 +406,9 @@ def set_delivery(participant, *, muted=None, sms_enabled=None):
 
     if fields:
         participant.save(update_fields=fields)
+
+    if email_enabled is not None:
+        set_group_email(participant, email_enabled)
     return participant
 
 
@@ -432,6 +446,130 @@ def clear_history(participant):
     if fields:
         participant.save(update_fields=fields)
     return participant
+
+
+def set_channel_consent(participant, channel, status, *, when=None):
+    """Record this member's answer about one channel. The only way to set it.
+
+    One entry point, for the reason the rest of this module has one: the REST
+    API, an inbound text and a Celery sweep all have to leave the same record,
+    and three copies of "and also stamp consented_at" is three chances to
+    forget one. A consent record that cannot say when somebody agreed is not
+    much of a record.
+    """
+    consent, _ = ChannelConsent.objects.get_or_create(
+        participant=participant, channel=channel
+    )
+
+    stamp = when or timezone.now()
+    consent.status = status
+    if status == ChannelConsent.Status.OPTED_IN:
+        consent.consented_at = stamp
+    elif status in (
+        ChannelConsent.Status.OPTED_OUT,
+        ChannelConsent.Status.DECLINED,
+    ):
+        # DECLINED belongs here too. It used to stamp nothing at all, which
+        # contradicts the paragraph above: when somebody said NO is exactly
+        # what a consent complaint turns on, and it is the harder of the two
+        # to reconstruct afterwards - an opt-in usually has an invitation
+        # beside it, a refusal has nothing.
+        consent.opted_out_at = stamp
+
+    consent.save(update_fields=['status', 'consented_at', 'opted_out_at', 'updated_at'])
+    return consent
+
+
+def decline_email(participant):
+    """Stop this group emailing this member. The one-way exit.
+
+    Behind the unsubscribe link, the mail client's one-click POST, and a reply
+    of STOP EMAILS - three doors into one room, so there is one place to get
+    the rule right.
+
+    Deliberately does NOT require an active membership, unlike every other
+    self-service setter here. The link is printed into an email and lives in a
+    mailbox for as long as the mail does, so it will be pressed by people who
+    have since left, been removed, or been blocked. Recording their answer is
+    correct and it survives a rejoin: `grant_email_consent_on_claim` only
+    upgrades PENDING, so it will not overwrite this.
+
+    Returns True when something actually changed, so a caller can be honest
+    about a repeat without having to compare the row itself.
+    """
+    already = consent_status(participant, ChannelConsent.Channel.EMAIL)
+    set_channel_consent(
+        participant, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.DECLINED
+    )
+    return already != ChannelConsent.Status.DECLINED
+
+
+def set_group_email(participant, enabled):
+    """The member's own switch for one group's email, from inside the app.
+
+    The only door that turns email back ON, which is why this one does require
+    an active membership and the unsubscribe link does not. Nothing reachable
+    from an emailed token may add - a forwarded link must not let a stranger
+    undo somebody's decision.
+
+    It will not clear an OPTED_OUT. That state is the provider's verdict - a
+    spam complaint the mailbox provider already acted on - and an app toggle
+    must not overturn it, for the same reason `invite_by_phone` refuses to
+    reset a STOP and only START may. Nothing writes email OPTED_OUT yet; the
+    guard goes in now because the complaint webhook is the next piece of work
+    and this is the rule the SMS side learned the hard way.
+    """
+    if participant.status != Participant.Status.ACTIVE:
+        raise NotAMember('You are not a member of that conversation.')
+
+    answer = consent_status(participant, ChannelConsent.Channel.EMAIL)
+    if answer == ChannelConsent.Status.OPTED_OUT:
+        return participant
+
+    set_channel_consent(
+        participant,
+        ChannelConsent.Channel.EMAIL,
+        ChannelConsent.Status.OPTED_IN if enabled
+        else ChannelConsent.Status.DECLINED,
+    )
+    return participant
+
+
+def grant_email_consent_on_claim(participant):
+    """A row that has just gained an account may be emailed about this group.
+
+    Called from the two paths that turn a phone-only or address-only row into a
+    real membership. Both of them mean the same thing: the person reading that
+    mailbox proved it is theirs, and being added to a group by an address you
+    have verified is agreeing to hear from it - that is what the invitation
+    said and what accepting it was.
+
+    Deliberately NOT the same treatment as SMS, and the asymmetry is the point.
+    Nobody has confirmed the phone number by text, so its answer stays PENDING
+    until they reply YES. Signing up with an email address is not a reply to a
+    question about a number.
+
+    Only PENDING is upgraded. Somebody who declined this group, or who replied
+    STOP, has answered - and verifying an address is not a way to overwrite it.
+    """
+    if participant.user_id is None:
+        return None
+
+    answer = consent_status(participant, ChannelConsent.Channel.EMAIL)
+    if answer is not None and answer != ChannelConsent.Status.PENDING:
+        return None
+
+    return set_channel_consent(
+        participant, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.OPTED_IN
+    )
+
+
+def consent_status(participant, channel):
+    """This member's answer for one channel, or None if there is no record."""
+    consent = ChannelConsent.objects.filter(
+        participant=participant, channel=channel
+    ).first()
+    return consent.status if consent else None
 
 
 def set_archived(participant, archived):
@@ -733,6 +871,61 @@ def _admin_count(conversation, lock=False):
     return queryset.count()
 
 
+def _refuse_blocked_invite(inviter, invitee=None, *, phone_number=None):
+    """Refuse an invitation between two people in a block relationship.
+
+    §11 of the blocking spec: B must not be able to put A into a group. It is
+    the last direct channel left once messages are refused, and without this
+    the block is a detour rather than a wall.
+
+    Symmetric, like every other read of the rule - if A blocked B then B cannot
+    add A, and A cannot add B either. One-way would be observable.
+
+    Raises the same JoinRefused any other unaddable person raises, with wording
+    that names nothing. A distinct message, or a distinct exception with its own
+    status code, would be exactly the reveal §11 asks us to avoid: `loopd/
+    exceptions.py` maps BlockedFromConversation to 403 and JoinRefused to 400,
+    so using the former here would announce the block by status code alone.
+
+    Group MEMBERSHIP is untouched by a block, so this refuses the invitation
+    and never the group: if the two are already in a group together they stay
+    there, and either may still join one the other is in by their own choice.
+    """
+    if inviter is None:
+        return
+
+    from user.blocks import blocks_between, blocks_number
+
+    if phone_number is not None:
+        if blocks_number(inviter, phone_number):
+            raise JoinRefused('Unable to add this person.')
+
+        # And the same number may BE an account. A block is recorded against
+        # whichever identity the blocker named, but the person is one person -
+        # so blocking the account and then being invited by number would have
+        # been a way straight back in, on the identity that was not named.
+        #
+        # Only a VERIFIED number resolves, for the reason it never resolves
+        # anywhere else: an unverified one is a string somebody typed into
+        # their own profile, and honouring it would let a squatter make
+        # themselves unaddressable by claiming a stranger's number.
+        from user.models import Profile
+
+        owner = (
+            Profile.objects.filter(
+                phone_number=phone_number, phone_no_verified=True
+            )
+            .select_related('user')
+            .first()
+        )
+        if owner is not None and blocks_between(inviter, owner.user):
+            raise JoinRefused('Unable to add this person.')
+        return
+
+    if blocks_between(inviter, invitee):
+        raise JoinRefused('Unable to add this person.')
+
+
 def _require_admin(conversation, by):
     if by is None or not conversation.is_admin(by):
         raise JoinRefused('Only a group admin can do that.')
@@ -767,8 +960,13 @@ def invite_by_email(conversation, email, by):
     if not address:
         raise JoinRefused('That is not an email address.')
 
+    # No viewer passed, deliberately - see user/lookups.py. A block must not
+    # make this return None, because None means "nobody has this address" and
+    # sends them an invitation email. The refusal is `_refuse_blocked_invite`
+    # below, where it can actually refuse.
     owner = find_user(address)
     if owner is not None:
+        _refuse_blocked_invite(by, owner)
         # A real account. add_participant carries the blocked checks and the
         # phone-row folding, so there is nothing to duplicate here.
         return conversation.add_participant(owner)
@@ -853,9 +1051,36 @@ def claim_email_invitations(user):
         user__isnull=True, email__iexact=address
     ).select_related('conversation')
 
+    from user.blocks import blocks_between
+
     claimed = 0
     for row in pending:
         if row.status == Participant.Status.BLOCKED:
+            continue
+
+        # The other half of the invite refusal, and the half that catches the
+        # case `invite_by_email` structurally cannot.
+        #
+        # A block is keyed on an account or a number, never on a bare address -
+        # and an UNVERIFIED address resolves to nobody, on purpose, because
+        # anybody can type somebody else's address into their own profile. So
+        # if B invites A by an address A has not verified yet, `find_user`
+        # returns None, no block can be matched, and a row is created.
+        #
+        # This is the moment that row would become a real membership, and it is
+        # the first moment the address has an owner at all. Refusing here rather
+        # than matching unverified addresses earlier also closes a griefing
+        # route: otherwise somebody could put a stranger's address on their own
+        # profile, block the inviter, and stop that stranger being invited.
+        #
+        # The row is left behind rather than deleted, exactly like a blocked
+        # one: it is dormant, it grants nothing, and deleting it would let a
+        # second invitation quietly create a fresh one.
+        if row.added_by_id and blocks_between(user, row.added_by):
+            logger.info(
+                'Not claiming invitation %s: blocked between %s and %s',
+                row.pk, user.pk, row.added_by_id,
+            )
             continue
 
         existing = Participant.objects.filter(
@@ -869,6 +1094,7 @@ def claim_email_invitations(user):
             row.email = None
             row.status = Participant.Status.ACTIVE
             row.save(update_fields=['user', 'email', 'status'])
+            grant_email_consent_on_claim(row)
             claimed += 1
             _announce_membership(row)
             continue
@@ -915,6 +1141,8 @@ def invite_by_phone(conversation, phone_number, display_name, by):
     if conversation.kind != Conversation.Kind.GROUP:
         raise JoinRefused('Only groups have members to invite.')
 
+    _refuse_blocked_invite(by, phone_number=phone_number)
+
     existing = _find_row(conversation, phone_number=phone_number)
     if existing is not None and existing.status == Participant.Status.BLOCKED:
         raise BlockedFromConversation('That person is blocked from this group.')
@@ -923,25 +1151,42 @@ def invite_by_phone(conversation, phone_number, display_name, by):
         phone_number, display_name=display_name, added_by=by
     )
 
-    if participant.sms_consent == Participant.Consent.GRANTED:
-        # Already agreed - they texted JOIN at some point, or accepted an
-        # earlier invitation. Re-inviting must not reset that.
+    answer = consent_status(participant, ChannelConsent.Channel.SMS)
+    if answer is not None and answer != ChannelConsent.Status.PENDING:
+        # They have already answered this group's question - YES, NO, or a
+        # carrier-level STOP - and re-inviting is not a new question. Only a
+        # PENDING invitation is sent again, because a pending one is the only
+        # kind that may simply never have arrived.
+        #
+        # Preserving OPTED_IN alone was not enough. Resetting anything else to
+        # PENDING made "no" mean "not yet": whoever added the member next
+        # cleared the decline and texted them again, and did the same to a
+        # number that had replied STOP - the one thing a carrier audit tests
+        # for, and not something an admin's word should be able to undo.
+        #
+        # Both are recoverable, by the member and only by the member: YES
+        # turns a declined group back on, START undoes a STOP.
+        logger.info(
+            'Not re-asking participant %s for SMS consent; already %s',
+            participant.pk, answer,
+        )
         return participant
 
     inviter = getattr(getattr(by, 'profile', None), 'display_label', None) or 'Somebody'
     text = (
         f'{inviter} added you to {conversation.name} on LoopD. '
-        'Reply YES to join, STOP to never hear from us.'
+        'Reply YES to receive this group by text, NO to decline. '
+        'STOP to never hear from us.'
     )
 
-    participant.sms_consent = Participant.Consent.PENDING
+    set_channel_consent(
+        participant, ChannelConsent.Channel.SMS, ChannelConsent.Status.PENDING
+    )
     participant.consent_sent_at = timezone.now()
     # The exact words they were shown. A consent complaint turns on what was
     # actually sent, and the template will have changed by the time anyone asks.
     participant.consent_text = text
-    participant.save(
-        update_fields=['sms_consent', 'consent_sent_at', 'consent_text']
-    )
+    participant.save(update_fields=['consent_sent_at', 'consent_text'])
 
     transaction.on_commit(
         lambda: send_notice(conversation, participant, text, kind='invitation')

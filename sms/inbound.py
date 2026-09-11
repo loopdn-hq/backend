@@ -40,6 +40,7 @@ from django.utils import timezone
 
 from chat import membership
 from chat.models import (
+    ChannelConsent,
     BlockedFromConversation,
     Message,
     Participant,
@@ -47,6 +48,7 @@ from chat.models import (
 )
 from chat.services import create_message
 from sms import commands
+from user.models import Profile
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +86,7 @@ def handle_inbound(conversation, phone_number, body, *, display_name=''):
         return _opt_out(participant, phone_number)
 
     if command == commands.START:
-        return _opt_in(participant)
+        return _opt_in(participant, phone_number)
 
     if command == commands.HELP:
         return InboundResult(action='help', participant=participant, reply=_help_text())
@@ -120,6 +122,53 @@ def handle_inbound(conversation, phone_number, body, *, display_name=''):
     # a member at all and the next JOIN hands them a brand new row.
     if not membership.account_is_usable(participant):
         return InboundResult(action='ignored_banned_account', participant=participant)
+
+    consent = membership.consent_status(
+        participant, ChannelConsent.Channel.SMS
+    )
+
+    # YES and NO are answers only while there is a question open. That
+    # qualifier is the whole of the rule, and leaving it out was a bug in two
+    # directions at once.
+    #
+    # A MEMBER WHO ALREADY AGREED IS TALKING, NOT ANSWERING. "Are you coming?"
+    # "No" is the most ordinary exchange there is, and reading it as a command
+    # swallowed the message AND silently unsubscribed them - the same failure
+    # `commands.py` guards against for "stop by the shop on your way home",
+    # one layer further in.
+    #
+    # AND YES IS NOT A CARRIER OPT-IN. Overwriting OPTED_OUT undid a STOP on
+    # the strength of a word the carrier does not recognise for that purpose.
+    # Only START may clear a STOP, which is exactly what a carrier audit
+    # expects and what `_opt_in` does - and it restores the delivery switches
+    # too, so consent and the switches cannot drift apart.
+    #
+    # An opted-in member who wants this group to stop texting them has MUTE,
+    # which is per-group and is advertised in the HELP text. Nothing is lost.
+    if command == commands.YES and consent in (
+        ChannelConsent.Status.PENDING,
+        ChannelConsent.Status.DECLINED,
+    ):
+        return _group_yes(conversation, participant)
+
+    if command == commands.NO and consent == ChannelConsent.Status.PENDING:
+        return _group_no(conversation, participant)
+
+    # Anything else from somebody who has not answered the invitation is
+    # NOT a message. They were asked a question and said something that is
+    # not an answer - posting "Okay" into their family group because they
+    # were unsure what to reply is the failure this prevents.
+    if consent == ChannelConsent.Status.PENDING:
+        return InboundResult(
+            action='ignored_pending_consent', participant=participant
+        )
+
+    # And a member who declined this group is not posting to it by text
+    # either. They can still read and post in the app - NO is about texts.
+    if consent == ChannelConsent.Status.DECLINED:
+        return InboundResult(
+            action='ignored_declined', participant=participant
+        )
 
     if command == commands.MUTE:
         membership.set_muted(participant, True)
@@ -241,6 +290,54 @@ def _join(conversation, phone_number, code, display_name):
     )
 
 
+def _group_yes(conversation, participant):
+    """YES answers THIS group's invitation, and only this group's.
+
+    Distinct from START, which is the carrier's word for all of LoopD'n.
+    Reached only from a PENDING or DECLINED state - see the guard in
+    `handle_inbound`. A member who declined and later changes their mind sends
+    YES again, which is what DECLINED is doing in that pair; a member who
+    replied STOP has to send START, because undoing a carrier opt-out is the
+    carrier's word to undo and not ours.
+    """
+    membership.set_channel_consent(
+        participant, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
+    )
+    return InboundResult(
+        action='group_opted_in',
+        participant=participant,
+        reply=(
+            f'You are in {conversation.name}. Text to post. '
+            'HELP for commands, NO to stop this group, STOP to leave LoopD.'
+        ),
+    )
+
+
+def _group_no(conversation, participant):
+    """NO declines THIS group's invitation. Every other group carries on.
+
+    Not STOP: that is the carrier-level opt-out and covers the whole product.
+    Somebody who wants out of one noisy group should not have to leave all of
+    them, and conflating the two is how a product loses a channel it was
+    allowed to use.
+
+    Reached only while the invitation is unanswered - see the guard in
+    `handle_inbound`. Once somebody has agreed, a bare "No" is a word in a
+    conversation and MUTE is how they ask this group to go quiet.
+    """
+    membership.set_channel_consent(
+        participant, ChannelConsent.Channel.SMS, ChannelConsent.Status.DECLINED
+    )
+    return InboundResult(
+        action='group_declined',
+        participant=participant,
+        reply=(
+            f'You will not get {conversation.name} by text. '
+            'Reply YES to turn it back on. Other groups are unaffected.'
+        ),
+    )
+
+
 def _opt_out(participant, phone_number):
     """Honour STOP from anybody, member or not.
 
@@ -250,14 +347,15 @@ def _opt_out(participant, phone_number):
     """
     if participant is not None:
         participant.sms_enabled = False
-        participant.sms_consent = Participant.Consent.STOPPED
-        participant.save(update_fields=['sms_enabled', 'sms_consent'])
-
-        profile = getattr(participant.user, 'profile', None) if participant.user_id else None
-        if profile is not None:
-            profile.sms_enabled = False
-            profile.sms_opt_out_at = timezone.now()
-            profile.save(update_fields=['sms_enabled', 'sms_opt_out_at', 'updated_at'])
+        participant.save(update_fields=['sms_enabled'])
+        membership.set_channel_consent(
+            participant,
+            ChannelConsent.Channel.SMS,
+            ChannelConsent.Status.OPTED_OUT,
+        )
+        # The number, not the row. One call now covers the membership rows,
+        # the account's profile switch, and every other group either can reach.
+        _carry_to_every_group(participant, phone_number, enabled=False)
 
         # The admins would otherwise never learn this. From their side the
         # member simply goes quiet, and every message they send from now on
@@ -279,28 +377,103 @@ def _opt_out(participant, phone_number):
     return InboundResult(action='opted_out', participant=participant)
 
 
-def _opt_in(participant):
+def _opt_in(participant, phone_number):
+    """Honour START, the carrier's word for undoing a STOP.
+
+    Takes the inbound number rather than reading it off the row: an account
+    row's own `phone_number` is None - the number lives on the profile - so
+    keying on the row meant a START sent from an account restored nothing.
+    """
     if participant is None:
         return InboundResult(action='ignored_unknown_sender')
 
     participant.sms_enabled = True
-    participant.sms_consent = Participant.Consent.GRANTED
     participant.consent_at = timezone.now()
-    participant.save(
-        update_fields=['sms_enabled', 'sms_consent', 'consent_at']
+    participant.save(update_fields=['sms_enabled', 'consent_at'])
+    membership.set_channel_consent(
+        participant, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
     )
-
-    profile = getattr(participant.user, 'profile', None) if participant.user_id else None
-    if profile is not None:
-        profile.sms_enabled = True
-        profile.sms_consent_at = timezone.now()
-        profile.save(update_fields=['sms_enabled', 'sms_consent_at', 'updated_at'])
+    _carry_to_every_group(participant, phone_number, enabled=True)
 
     return InboundResult(
         action='opted_in',
         participant=participant,
         reply='You are subscribed again. Text STOP to opt out.',
     )
+
+
+def _carry_to_every_group(participant, phone_number, *, enabled):
+    """Carry a STOP or a START to everything this NUMBER can reach.
+
+    STOP is the carrier's word. It covers all of LoopD'n, not the group whose
+    number happened to receive it, and an audit tests exactly that.
+
+    KEYED ON THE NUMBER, NOT ON THE KIND OF ROW THAT ANSWERED. One human can
+    hold an account row in Family and a phone-only row in Work under the same
+    verified number - `chat/membership.py:memberships_for` exists because of
+    precisely that. The previous version asked which kind of row had received
+    the text and swept only the matching kind, so either arrangement left the
+    other half still texting a number that had just said STOP:
+
+        account row answers   -> phone-only rows elsewhere were never swept
+        phone-only answers    -> the account's profile switch was never written
+
+    Both are the same violation from opposite ends, and each group has its own
+    sending number, so the carrier's per-number opt-out does not cover the
+    others either.
+
+    IT MOVES SWITCHES, NOT ANSWERS. `sms_enabled` on the membership and
+    `Profile.sms_enabled` on the account, never the ChannelConsent rows.
+    Overwriting every group's ANSWER would lose the difference between
+    "declined Family" and "never asked about Work", and the matching START
+    would hand all of them back as opted in. A switch is the right shape for a
+    fact about a number; an answer belongs to a person and a group.
+
+    KNOWN LIMIT: because one switch carries both meanings, a START restores
+    `sms_enabled` on rows an admin had deliberately switched off. That is the
+    narrow cost of not having a separate number-level record, and it is the
+    right way round - a STOP that under-silences is a compliance failure, a
+    START that over-restores is an annoyance.
+
+    Returns how many membership rows it moved.
+    """
+    if not phone_number:
+        return 0
+
+    moved = Participant.objects.filter(
+        phone_number=phone_number, user__isnull=True
+    ).update(sms_enabled=enabled)
+
+    stamp = timezone.now()
+
+    # The account that verified this number, if there is one. Its profile
+    # switch is what `sms/outbound.py:_address_reason` reads for every account
+    # row, so writing it covers every group they are in at once - including the
+    # ones this text did not come from.
+    profiles = list(
+        Profile.objects.filter(
+            phone_number=phone_number, phone_no_verified=True
+        )
+    )
+
+    # And the answering account itself. Normally the query above already found
+    # it, but a row can only be resolved from a verified number in the first
+    # place - this is belt and braces on the one path a carrier audits.
+    own = getattr(participant.user, 'profile', None) if participant.user_id else None
+    if own is not None and not any(p.pk == own.pk for p in profiles):
+        profiles.append(own)
+
+    for profile in profiles:
+        profile.sms_enabled = enabled
+        if enabled:
+            profile.sms_consent_at = stamp
+            fields = ['sms_enabled', 'sms_consent_at', 'updated_at']
+        else:
+            profile.sms_opt_out_at = stamp
+            fields = ['sms_enabled', 'sms_opt_out_at', 'updated_at']
+        profile.save(update_fields=fields)
+
+    return moved
 
 
 def _help_text():

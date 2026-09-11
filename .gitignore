@@ -132,3 +132,5 @@ tmp/
 
 venv
 db.sqlite3
+
+docs/

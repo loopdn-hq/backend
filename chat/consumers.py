@@ -25,6 +25,7 @@ from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from chat.models import (
     BlockedFromConversation,
     Conversation,
+    Message,
     Participant,
     PostingNotAllowed,
 )
@@ -128,13 +129,42 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         # so a client that does not send one behaves exactly as before.
         client_id = str(content.get('client_id') or '')[:64]
 
+        # Same guard as the REST path, and for the same reason: a parent from
+        # another conversation would come straight back inside the reply
+        # excerpt, turning "send a message" into a way to read a group this
+        # sender is not in. Resolved here rather than trusted.
+        reply_to = await self.resolve_reply_to(
+            conversation, content.get('reply_to')
+        )
+        if reply_to is False:
+            await self.send_json(
+                {
+                    'type': 'error',
+                    'detail': 'You can only reply to a message in this conversation.',
+                }
+            )
+            return
+
         # create_message broadcasts to the conversation group, which this
         # socket is part of - so the sender's own echo arrives that way too.
-        await self.store_message(conversation, text, client_id=client_id)
+        await self.store_message(
+            conversation, text, client_id=client_id, reply_to=reply_to
+        )
 
     async def handle_typing(self, content):
         conversation = await self.get_conversation(content.get('conversation_id'))
         if conversation is None:
+            return
+        if await self.direct_contact_is_blocked(conversation):
+            # A blocked direct thread is read-only, and a typing indicator is
+            # the one signal that would still cross it - the other person would
+            # watch them start and stop typing in a conversation neither can
+            # send into. It is person-to-person contact by any reading, so it
+            # stops with the rest.
+            #
+            # Silently, and only here: groups are untouched, and returning an
+            # error would tell the sender something the refusals are careful
+            # not to.
             return
         await self.channel_layer.group_send(
             conversation_group(conversation.pk),
@@ -145,10 +175,45 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
             },
         )
 
+    @database_sync_to_async
+    def direct_contact_is_blocked(self, conversation):
+        """Whether this is a direct thread between two people who cannot talk.
+
+        False for every group, always: a block is about direct contact and
+        changes nothing about a conversation other people are also in.
+        """
+        from chat.models import Conversation, Participant
+        from user.blocks import blocks_between
+
+        if conversation.kind != Conversation.Kind.DIRECT:
+            return False
+
+        other = (
+            Participant.objects.filter(
+                conversation=conversation, user__isnull=False
+            )
+            .exclude(user=self.user)
+            .select_related('user')
+            .first()
+        )
+        if other is None:
+            return False
+        return blocks_between(self.user, other.user)
+
     # -- outbound (channel layer event -> socket) -------------------------
 
     async def message_new(self, event):
         await self.send_json({'type': 'message.new', 'message': event['message']})
+
+    async def message_updated(self, event):
+        """A message already in the thread changed - edit, delete, reaction.
+
+        The whole message is sent, and the client replaces the one it holds
+        with the same id. It must NOT append: this is not a new message.
+        """
+        await self.send_json(
+            {'type': 'message.updated', 'message': event['message']}
+        )
 
     async def conversation_request(self, event):
         """Somebody is waiting to be let into a group this socket administers."""
@@ -280,9 +345,28 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         ).first()
 
     @database_sync_to_async
-    def store_message(self, conversation, text, client_id=''):
+    def resolve_reply_to(self, conversation, message_id):
+        """The parent for a reply: None when none, False when refused.
+
+        Three-valued on purpose - "not replying" and "replying to something you
+        may not see" are different answers, and only the second is an error.
+        """
+        if message_id in (None, ''):
+            return None
+
+        parent = Message.objects.filter(
+            pk=message_id, conversation=conversation
+        ).first()
+        return parent if parent is not None else False
+
+    @database_sync_to_async
+    def store_message(self, conversation, text, client_id='', reply_to=None):
         return serialize_message(
             create_message(
-                conversation, self.user, text=text, client_id=client_id
+                conversation,
+                self.user,
+                text=text,
+                client_id=client_id,
+                reply_to=reply_to,
             )
         )

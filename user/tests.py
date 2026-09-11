@@ -1187,3 +1187,294 @@ class EmailLookupTests(APITestCase):
         with self.assertRaises(Exception) as caught:
             resolve_members(['ghost@example.com'])
         self.assertIn('ghost@example.com', str(caught.exception))
+
+
+class EmailPreferenceTests(EnvelopeAssertions, APITestCase):
+    """The account-wide switch for group email.
+
+    Exposed, unlike its SMS sibling, and the asymmetry is the point: SMS has a
+    carrier word for this and email does not, so without an endpoint there
+    would be nowhere at all to turn group email off for every group at once.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='alice', password='a-strong-passphrase-42',
+            email='alice@example.com',
+        )
+        self.client.force_authenticate(self.user)
+
+    def url(self):
+        return reverse('user:user-me-profile')
+
+    def test_it_is_on_by_default_and_readable(self):
+        data = self.assertSuccess(self.client.get(self.url()))
+
+        self.assertTrue(data['email_enabled'])
+
+    def test_it_can_be_turned_off(self):
+        data = self.assertSuccess(
+            self.client.patch(self.url(), {'email_enabled': False})
+        )
+
+        self.assertFalse(data['email_enabled'])
+        self.user.profile.refresh_from_db()
+        self.assertFalse(self.user.profile.email_enabled)
+
+    def test_and_back_on(self):
+        self.client.patch(self.url(), {'email_enabled': False})
+
+        data = self.assertSuccess(
+            self.client.patch(self.url(), {'email_enabled': True})
+        )
+
+        self.assertTrue(data['email_enabled'])
+
+    def test_it_does_not_disturb_anything_else(self):
+        self.assertSuccess(
+            self.client.patch(self.url(), {'email_enabled': False})
+        )
+
+        self.user.profile.refresh_from_db()
+        self.assertTrue(self.user.profile.sms_enabled)
+
+    def test_the_sms_switch_is_still_not_writable(self):
+        # Its absence is deliberate: the only thing that writes it is a carrier
+        # STOP. DRF discards an unknown field rather than refusing it, so this
+        # asserts the outcome and not the status code.
+        self.client.patch(self.url(), {'sms_enabled': False})
+
+        self.user.profile.refresh_from_db()
+        self.assertTrue(self.user.profile.sms_enabled)
+
+    def test_turning_group_email_off_does_not_stop_a_verification_code(self):
+        # An account that cannot receive the code to get back into itself is an
+        # account somebody has locked themselves out of, and nobody who unticks
+        # "email updates" means that.
+        from utils.mail import VERIFICATION_CODE, send_templated_email
+
+        profile = self.user.profile
+        profile.email_enabled = False
+        profile.save(update_fields=['email_enabled'])
+
+        with mock.patch('utils.mail._is_configured', return_value=True), \
+                mock.patch('utils.mail._post', return_value={'id': 'x'}) as post:
+            send_templated_email(
+                VERIFICATION_CODE,
+                to=self.user.email,
+                context={'code': '123456', 'expires_in_minutes': 10},
+            )
+
+        self.assertEqual(post.call_count, 1)
+
+
+class UserBlockTests(EnvelopeAssertions, APITestCase):
+    """Blocking a person, and what it does and does not reach.
+
+    The rule under test is narrow on purpose: this release blocks DIRECT
+    contact only. A shared group is untouched - both people stay members, both
+    still see each other's messages there - and there is a test below that pins
+    that, because the easy mistake is to make a block quietly remove somebody.
+    """
+
+    def setUp(self):
+        self.alice = User.objects.create_user(
+            username='alice', password='a-strong-passphrase-42'
+        )
+        self.bob = User.objects.create_user(
+            username='bob', password='a-strong-passphrase-42'
+        )
+        self.client.force_authenticate(self.alice)
+
+    def block(self, **payload):
+        return self.client.post(reverse('user:user-me-block'), payload, format='json')
+
+    def blocked_rows(self):
+        from user.models import UserBlock
+
+        return UserBlock.objects.filter(blocker=self.alice)
+
+    def unblock(self, **payload):
+        return self.client.post(
+            reverse('user:user-me-unblock'), payload, format='json'
+        )
+
+    def blocked_list(self):
+        return self.assertSuccess(self.client.get(reverse('user:user-me-blocks')))
+
+    def search(self, term):
+        """Usernames the search returns. It is paginated, so unwrap it."""
+        data = self.assertSuccess(
+            self.client.get(reverse('user:user-search'), {'q': term})
+        )
+        rows = data['results'] if isinstance(data, dict) else data
+        return [row['username'] for row in rows]
+
+    # --- the record ---------------------------------------------------------
+
+    def test_blocking_records_it(self):
+        self.assertEqual(self.block(username='bob').status_code, 204)
+
+        entries = self.blocked_list()
+        self.assertEqual([e['username'] for e in entries], ['bob'])
+
+    def test_blocking_twice_is_one_row(self):
+        self.block(username='bob')
+        self.assertEqual(self.block(username='bob').status_code, 204)
+
+        self.assertEqual(len(self.blocked_list()), 1)
+
+    def test_unblocking_removes_it(self):
+        self.block(username='bob')
+
+        self.assertEqual(self.unblock(username='bob').status_code, 204)
+
+        self.assertEqual(self.blocked_list(), [])
+
+    def test_unblocking_somebody_who_was_never_blocked_is_fine(self):
+        self.assertEqual(self.unblock(username='bob').status_code, 204)
+
+    def test_a_bare_number_can_be_blocked(self):
+        # Most members of most groups have no account at all, so a block that
+        # could only name accounts could not name most people.
+        self.assertEqual(
+            self.block(phone_number='+639171234567').status_code, 204
+        )
+
+        entries = self.blocked_list()
+        self.assertEqual(entries[0]['phone_number'], '+639171234567')
+        self.assertIsNone(entries[0]['username'])
+
+    def test_you_cannot_block_yourself(self):
+        self.assertFailure(self.block(username='alice'))
+
+    def test_naming_both_or_neither_is_refused(self):
+        self.assertFailure(self.block())
+        self.assertFailure(self.block(username='bob', phone_number='+639171234567'))
+
+    def test_my_list_is_mine_alone(self):
+        # Nothing anywhere tells one person that another has blocked them.
+        self.block(username='bob')
+        self.client.force_authenticate(self.bob)
+
+        self.assertEqual(self.blocked_list(), [])
+
+    # --- a number becomes a person -------------------------------------------
+
+    def verify(self, user, number):
+        """Verify a number against an account, the way otp/services does."""
+        from user import blocks
+
+        profile = user.profile
+        profile.phone_number = number
+        profile.phone_no_verified = True
+        profile.save(update_fields=['phone_number', 'phone_no_verified'])
+        return blocks.link_number_to_account(user)
+
+    def test_a_number_block_follows_the_number_onto_its_account(self):
+        # Otherwise signing up is a clean way back in: block the number, they
+        # register, and the block names an identity nobody uses any more.
+        from user import blocks
+
+        self.block(phone_number='+639171234567')
+
+        self.assertEqual(self.verify(self.bob, '+639171234567'), 1)
+
+        self.assertTrue(blocks.blocks_between(self.alice, self.bob))
+
+    def test_and_the_row_MOVES_rather_than_being_copied(self):
+        # "The block follows the account, not future owners of the number."
+        # So nothing is left against the number for the next person to inherit.
+        from user.models import UserBlock
+
+        self.block(phone_number='+639171234567')
+        self.verify(self.bob, '+639171234567')
+
+        rows = UserBlock.objects.filter(blocker=self.alice)
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(rows.first().blocked_user_id, self.bob.pk)
+        self.assertIsNone(rows.first().blocked_phone_number)
+
+    def test_so_the_next_owner_of_that_number_is_not_blocked(self):
+        from user import blocks
+
+        self.block(phone_number='+639171234567')
+        self.verify(self.bob, '+639171234567')
+
+        # The carrier reassigns it. A stranger is not the person anybody
+        # blocked, and inheriting a handset must not inherit a block.
+        self.bob.profile.phone_number = None
+        self.bob.profile.save(update_fields=['phone_number'])
+        carol = User.objects.create_user(username='carol', password='x')
+        self.verify(carol, '+639171234567')
+
+        self.assertFalse(blocks.blocks_between(self.alice, carol))
+        self.assertTrue(blocks.blocks_between(self.alice, self.bob))
+
+    def test_blocking_my_own_number_just_goes_away(self):
+        # People do this by typo, or by blocking a number they later claim.
+        # A self-block is refused by a constraint and means nothing.
+        from user.models import UserBlock
+
+        self.block(phone_number='+639171234567')
+
+        self.verify(self.alice, '+639171234567')
+
+        self.assertFalse(UserBlock.objects.filter(blocker=self.alice).exists())
+
+    def test_a_duplicate_is_collapsed_rather_than_doubled(self):
+        # Blocking both the account and its number leaves ONE row - two would
+        # make unblocking a guess about which to delete.
+        from user.models import UserBlock
+
+        self.block(username='bob')
+        self.block(phone_number='+639171234567')
+
+        self.verify(self.bob, '+639171234567')
+
+        self.assertEqual(UserBlock.objects.filter(blocker=self.alice).count(), 1)
+
+    def test_running_it_twice_changes_nothing(self):
+        from user import blocks
+        from user.models import UserBlock
+
+        self.block(phone_number='+639171234567')
+        self.verify(self.bob, '+639171234567')
+
+        self.assertEqual(blocks.link_number_to_account(self.bob), 0)
+        self.assertEqual(UserBlock.objects.filter(blocker=self.alice).count(), 1)
+
+    def test_an_unverified_number_moves_nothing(self):
+        from user import blocks
+        from user.models import UserBlock
+
+        self.block(phone_number='+639171234567')
+        profile = self.bob.profile
+        profile.phone_number = '+639171234567'
+        profile.save(update_fields=['phone_number'])
+
+        self.assertEqual(blocks.link_number_to_account(self.bob), 0)
+        self.assertIsNotNone(
+            UserBlock.objects.get(blocker=self.alice).blocked_phone_number
+        )
+
+    # --- search -------------------------------------------------------------
+
+    def test_a_blocked_person_is_not_in_my_search(self):
+        self.block(username='bob')
+
+        self.assertNotIn('bob', self.search('bo'))
+
+    def test_and_i_am_not_in_theirs_either(self):
+        # Symmetric. A one-way block is observable: B would notice their own
+        # blocks behaving differently.
+        self.block(username='bob')
+        self.client.force_authenticate(self.bob)
+
+        self.assertNotIn('alice', self.search('al'))
+
+    def test_somebody_unrelated_is_still_found(self):
+        self.block(username='bob')
+        User.objects.create_user(username='bobby', password='x')
+
+        self.assertEqual(self.search('bob'), ['bobby'])

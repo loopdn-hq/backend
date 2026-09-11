@@ -23,22 +23,21 @@ from django.conf import settings
 from django.db.models import Count, Q, Sum
 from django.utils import timezone
 
+from chat import delivery as delivery_rules
 from chat.models import Conversation
 from sms.models import GroupNumber, SmsDelivery, SmsWebhookEvent
 
 logger = logging.getLogger(__name__)
 
 # Reasons that will fail the same way every time. Retrying these is a standing
-# charge for a message that is never going to arrive.
-PERMANENT_REASONS = (
+# charge for a message that is never going to arrive. The ladder's own
+# decisions come from chat/delivery.py; the rest are SMS's.
+PERMANENT_REASONS = delivery_rules.POLICY_REASONS + (
     'destination not allowed',
     'no verified number',
     'no number',
-    'opted out',
-    'consent not granted',
     'sms disabled for this group',
     'sms disabled account-wide',
-    'muted',
     'group is too large to text',
     'sending is switched off',
 )
@@ -67,7 +66,15 @@ def retry_failed_deliveries():
             created_at__gte=cutoff,
         )
         .exclude(reason__in=PERMANENT_REASONS)
-        .select_related('conversation', 'participant__user__profile')[:200]
+        # `message__sender_participant` is not decoration: retry_delivery reads
+        # the message to rebuild the body AND to ask whether the recipient has
+        # blocked its sender since. Without it that is two lazy queries per row,
+        # up to four hundred a sweep.
+        .select_related(
+            'conversation',
+            'participant__user__profile',
+            'message__sender_participant',
+        )[:200]
     )
 
     retried = 0

@@ -14,7 +14,8 @@
     GET  /api/v1/chat/conversations/<id>/requests/ admin: who is waiting
     POST /api/v1/chat/conversations/<id>/requests/ admin: approve or decline
     POST /api/v1/chat/conversations/<id>/remove/   admin removes or blocks
-    POST /api/v1/chat/conversations/<id>/delivery/ mute it, or turn its texts off
+    POST /api/v1/chat/conversations/<id>/delivery/ mute it, or turn its texts
+                                                   or emails off
     POST /api/v1/chat/conversations/<id>/role/     admin promotes or demotes
     POST /api/v1/chat/conversations/<id>/rename/   admin names a phone-only member
     POST /api/v1/chat/conversations/<id>/invite/   admin invites somebody by number
@@ -22,7 +23,14 @@
     GET  /api/v1/chat/conversations/<id>/join-code/ admin reads the code
     POST /api/v1/chat/conversations/<id>/join-code/ admin issues a new one
     GET  /api/v1/chat/conversations/<id>/messages/ history, newest first
-    POST /api/v1/chat/conversations/<id>/messages/ send text and/or files
+    POST /api/v1/chat/conversations/<id>/messages/ send text and/or files,
+                                                   reply to one, or forward one
+    PATCH  .../<id>/messages/<mid>/              sender edits their own words
+    DELETE .../<id>/messages/<mid>/              sender or admin deletes it
+    POST   .../<id>/messages/<mid>/reactions/    add my emoji
+    DELETE .../<id>/messages/<mid>/reactions/?emoji= remove it
+    POST   .../<id>/messages/<mid>/pin/          admin pins it above the thread
+    DELETE .../<id>/messages/<mid>/pin/          admin unpins it
     POST /api/v1/chat/conversations/<id>/read/     mark it read up to a message
     POST /api/v1/chat/conversations/<id>/archive/  tidy it out of my list
     POST /api/v1/chat/conversations/<id>/clear/    empty MY view of it
@@ -51,10 +59,14 @@ from rest_framework.response import Response
 
 from rest_framework.pagination import PageNumberPagination
 
+from django.utils import timezone
+
 from chat import membership
-from chat.models import Conversation, Message, Participant
+from chat.models import Conversation, Message, MessageReaction, Participant
 from chat.serializers import (
     ADMIN_ONLY_SETTINGS,
+    MESSAGE_PREFETCH_RELATED,
+    MESSAGE_SELECT_RELATED,
     AddMembersSerializer,
     ArchiveSerializer,
     ConversationSerializer,
@@ -67,6 +79,8 @@ from chat.serializers import (
     JoinRequestDecisionSerializer,
     MarkReadSerializer,
     MessageCreateSerializer,
+    MessageEditSerializer,
+    MessageReactionSerializer,
     MessageSerializer,
     DeliveryPreferenceSerializer,
     ParticipantRoleSerializer,
@@ -74,6 +88,7 @@ from chat.serializers import (
     ParticipantSerializer,
     RemoveMemberSerializer,
 )
+from chat.services import broadcast_conversation_updated, broadcast_message_updated
 
 
 class ParticipantPagination(PageNumberPagination):
@@ -203,8 +218,15 @@ class ConversationViewSet(
             # `created_by` is serialized on every row, and its avatar lives on
             # the profile - without both joins that is two queries per
             # conversation on the list.
-            .select_related('sms_number', 'created_by__profile')
+            .select_related(
+                'sms_number',
+                'created_by__profile',
+                # The pinned message is serialized in full on every row. One
+                # join chain for the page, not a query per conversation.
+                *(f'pinned_message__{path}' for path in MESSAGE_SELECT_RELATED),
+            )
             .prefetch_related(
+                *(f'pinned_message__{path}' for path in MESSAGE_PREFETCH_RELATED),
                 Prefetch(
                     'participants',
                     # The member list a client renders is who is *in* the
@@ -218,9 +240,9 @@ class ConversationViewSet(
                 Prefetch(
                     'messages',
                     queryset=Message.objects.select_related(
-                        'sender__profile', 'sender_participant__user__profile'
+                        *MESSAGE_SELECT_RELATED
                     )
-                    .prefetch_related('attachments')
+                    .prefetch_related(*MESSAGE_PREFETCH_RELATED)
                     .order_by('-created_at')[:1],
                     to_attr='latest_messages',
                 ),
@@ -546,9 +568,14 @@ class ConversationViewSet(
     def delivery(self, request, pk=None):
         """Change how this conversation reaches me.
 
-        `muted` silences it everywhere; `sms_enabled` decides whether texts are
-        one of its channels for me. Both are mine alone - an admin cannot set
-        them for somebody else, which is why this takes no participant id.
+        `muted` silences it everywhere; `sms_enabled` and `email_enabled` decide
+        whether texts and emails are channels for me at all. All three are mine
+        alone - an admin cannot set them for somebody else, which is why this
+        takes no participant id.
+
+        This is also the only door that turns email back ON. The unsubscribe
+        link printed in every group email can only ever subtract, because a
+        forwarded link must not let a stranger undo somebody's decision.
         """
         conversation = self.get_object()
         serializer = self.get_serializer(data=request.data)
@@ -788,16 +815,9 @@ class ConversationViewSet(
         ).first()
         cleared_before = own.cleared_before_message_id if own else None
 
-        history = (
-            conversation.messages.select_related(
-                'sender__profile',
-                # Messages that arrived by SMS have no `sender`, and the
-                # serializer falls back to the membership row for the name.
-                # Without this join that is one extra query per such message.
-                'sender_participant__user__profile',
-            )
-            .prefetch_related('attachments')
-        )
+        history = conversation.messages.select_related(
+            *MESSAGE_SELECT_RELATED
+        ).prefetch_related(*MESSAGE_PREFETCH_RELATED)
 
         if cleared_before is not None:
             history = history.filter(pk__gt=cleared_before)
@@ -822,9 +842,215 @@ class ConversationViewSet(
             return self.get_paginated_response(serializer.data)
         return Response(serializer.data)
 
+    # -- one message -------------------------------------------------------
+    #
+    # Every route below hangs off the CONVERSATION, reached through
+    # get_object(). That is deliberate: there is no top-level /messages/<id>/
+    # route to bolt a membership check onto, and adding one would put the
+    # access-control model in two places. Here the queryset has already proven
+    # the caller is an active participant before the message is even looked up.
+
+    def _message_in(self, conversation, message_id):
+        """The message, or 404 - never a message from somewhere else.
+
+        Scoped to the conversation the route resolved, so a member of group A
+        cannot act on a message in group B by putting its id in the URL.
+        """
+        message = (
+            conversation.messages.select_related(*MESSAGE_SELECT_RELATED)
+            .prefetch_related(*MESSAGE_PREFETCH_RELATED)
+            .filter(pk=message_id)
+            .first()
+        )
+        if message is None:
+            raise NotFound('No such message in this conversation.')
+        return message
+
+    def _message_response(self, message):
+        """Re-read, broadcast, and answer with the same payload.
+
+        Re-read because the instance just written still carries the prefetch
+        cache from before the change - answering from it would show the caller
+        the state they were trying to change.
+        """
+        fresh = self._message_in(message.conversation, message.pk)
+        broadcast_message_updated(fresh)
+        return Response(
+            MessageSerializer(fresh, context=self.get_serializer_context()).data
+        )
+
+    @action(
+        detail=True,
+        methods=['patch', 'delete'],
+        url_path=r'messages/(?P<message_id>[^/.]+)',
+    )
+    def message_detail(self, request, pk=None, message_id=None):
+        """Edit or delete one message.
+
+        Neither can recall a copy already delivered by SMS or email. Those went
+        to a phone and an inbox the moment the message was sent; this changes
+        what the APP shows and says nothing about what a handset already has.
+        The UI has to be honest about that rather than implying a recall.
+        """
+        conversation = self.get_object()
+        message = self._message_in(conversation, message_id)
+
+        if request.method == 'DELETE':
+            return self._delete_message(request, conversation, message)
+        return self._edit_message(request, message)
+
+    def _edit_message(self, request, message):
+        """Change the words. The sender only, and only their own words.
+
+        Not admins: an admin rewriting somebody else's message would put words
+        in their mouth under their name. An admin who objects to a message can
+        delete it, which is visible for what it is.
+        """
+        if message.sender_id != request.user.pk:
+            raise PermissionDenied('You can only edit your own messages.')
+        if message.is_deleted:
+            raise ValidationError('That message was deleted.')
+        if message.source != Message.Source.APP:
+            # A text or an email is a copy of something that was sent
+            # elsewhere. Editing the copy would make the thread disagree with
+            # the message that actually arrived.
+            raise ValidationError('Only messages sent from the app can be edited.')
+
+        serializer = MessageEditSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        message.text = serializer.validated_data['text']
+        message.edited_at = timezone.now()
+        message.save(update_fields=['text', 'edited_at', 'updated_at'])
+        return self._message_response(message)
+
+    def _delete_message(self, request, conversation, message):
+        """Take a message out of the thread, for everybody.
+
+        The sender may delete their own; a group admin may delete anybody's,
+        which is the moderation half of the feature.
+
+        SOFT, always. The row stays so the replies quoting it keep a parent to
+        point at and so `last_read_message` pointers do not dangle; the
+        serializer is what withholds the text. A hard delete would take the
+        replies' context with it and leave read receipts pointing at nothing.
+        """
+        is_sender = message.sender_id == request.user.pk
+        if not is_sender and not conversation.is_admin(request.user):
+            raise PermissionDenied(
+                'You can only delete your own messages.'
+            )
+
+        if message.is_deleted:
+            # Already gone. Answering with the message rather than an error
+            # makes a retried delete harmless.
+            return self._message_response(message)
+
+        message.deleted_at = timezone.now()
+        message.deleted_by = request.user
+        message.save(update_fields=['deleted_at', 'deleted_by', 'updated_at'])
+
+        # A pin is a place to keep something useful; a tombstone there is
+        # clutter only an admin could clear. Deleting it clears the pin.
+        if conversation.pinned_message_id == message.pk:
+            conversation.pinned_message = None
+            conversation.save(update_fields=['pinned_message'])
+            broadcast_conversation_updated(conversation)
+
+        return self._message_response(message)
+
+    @action(
+        detail=True,
+        methods=['post', 'delete'],
+        url_path=r'messages/(?P<message_id>[^/.]+)/reactions',
+    )
+    def message_reactions(self, request, pk=None, message_id=None):
+        """Add or remove your own reaction.
+
+        NEVER goes through create_message, and that is the point: a reaction is
+        app-only. Routing it through the send path would fan it out to every
+        phone in the group and bill a segment for a thumbs up.
+
+        Both verbs are idempotent - POST twice adds one reaction, DELETE twice
+        removes one - so a retry after a dropped response cannot flip the state
+        back. A toggle endpoint could not promise that.
+        """
+        conversation = self.get_object()
+        message = self._message_in(conversation, message_id)
+
+        if message.is_deleted:
+            raise ValidationError('That message was deleted.')
+
+        if request.method == 'DELETE':
+            # In the query string, not the body: a DELETE with a body is
+            # inconsistently supported by clients and proxies, and this one
+            # value fits in a parameter.
+            serializer = MessageReactionSerializer(
+                data={'emoji': request.query_params.get('emoji')}
+            )
+            serializer.is_valid(raise_exception=True)
+            MessageReaction.objects.filter(
+                message=message,
+                user=request.user,
+                emoji=serializer.validated_data['emoji'],
+            ).delete()
+            return self._message_response(message)
+
+        serializer = MessageReactionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        # get_or_create rather than create-and-catch: it takes a savepoint, so
+        # the losing side of a race is recoverable. A bare IntegrityError here
+        # marks the whole request transaction unusable and turns "you already
+        # reacted" into a 500.
+        MessageReaction.objects.get_or_create(
+            message=message,
+            user=request.user,
+            emoji=serializer.validated_data['emoji'],
+        )
+        return self._message_response(message)
+
+    @action(
+        detail=True,
+        methods=['post', 'delete'],
+        url_path=r'messages/(?P<message_id>[^/.]+)/pin',
+    )
+    def message_pin(self, request, pk=None, message_id=None):
+        """Hold one message above the thread, or let it go.
+
+        ONE pin per conversation, stored as a column. Many pins would need a
+        table and an order to show them in, and neither has been asked for.
+
+        No new socket event: the change is broadcast as `conversation.updated`,
+        which every client already handles.
+        """
+        conversation = self.get_object()
+        message = self._message_in(conversation, message_id)
+
+        if not conversation.may_pin(request.user):
+            raise PermissionDenied('Only a group admin can pin a message.')
+
+        if request.method == 'DELETE':
+            # Scoped to THIS message, so two admins unpinning at once cannot
+            # have the second one clear a pin the first already replaced.
+            if conversation.pinned_message_id != message.pk:
+                return Response(self._as_conversation(conversation))
+            conversation.pinned_message = None
+        else:
+            if message.is_deleted:
+                raise ValidationError('That message was deleted.')
+            conversation.pinned_message = message
+
+        conversation.save(update_fields=['pinned_message'])
+        broadcast_conversation_updated(conversation)
+        return Response(self._as_conversation(conversation))
+
     def _send_message(self, request, conversation):
         serializer = MessageCreateSerializer(
-            data=request.data, context=self.get_serializer_context()
+            data=request.data,
+            # The conversation goes in the CONTEXT, not the payload, so
+            # validate_reply_to checks the parent against the conversation the
+            # route already resolved and a caller cannot widen it.
+            context={**self.get_serializer_context(), 'conversation': conversation},
         )
         serializer.is_valid(raise_exception=True)
         message = serializer.save(conversation=conversation, sender=request.user)

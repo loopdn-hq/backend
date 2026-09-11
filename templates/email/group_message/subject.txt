@@ -1,0 +1,6 @@
+{% comment %}
+The same subject for every message in a group, deliberately. Mail clients
+thread on the subject when nothing better is available, so putting the message
+text here would scatter one conversation across the reader's inbox as a
+hundred unrelated emails.
+{% endcomment %}New message in {{ group_name }}

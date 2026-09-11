@@ -20,6 +20,7 @@ from django.urls import include, path, re_path
 from django.views.static import serve
 
 from loopd.health import healthz
+from mail.views import UnsubscribeView
 
 urlpatterns = [
     # No trailing slash, deliberately: APPEND_SLASH would answer /healthz with a
@@ -40,7 +41,25 @@ urlpatterns = [
     # rather than by a token - see sms/webhooks.py.
     path('api/v1/sms/', include('sms.urls')),
 
+    # The other one: replies members send to a group's reply address. Same
+    # contract - signature, not a token. See mail/webhooks.py.
+    path('api/v1/mail/', include('mail.urls')),
+
     path('api/v1/billing/', include('billing.urls')),
+
+    # Deliberately NOT under /api/v1/. This URL is printed into email and lives
+    # in a mailbox for as long as the mail does; an unsubscribe link that dies
+    # when v1 is retired is not an unsubscribe link. Keeping it short also
+    # keeps it inside the 78-column wrap that breaks URLs in text/plain bodies.
+    #
+    # The trailing slash is contractual, for the reason mail/urls.py gives:
+    # APPEND_SLASH answers a slash-less POST with a 301, which a client
+    # re-issues as a GET, and RFC 8058 one-click would silently do nothing.
+    path(
+        'mail/unsubscribe/<str:token>/',
+        UnsubscribeView.as_view(),
+        name='mail-unsubscribe',
+    ),
 ]
 
 if not settings.AWS_STORAGE_BUCKET_NAME:

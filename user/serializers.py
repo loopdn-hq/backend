@@ -26,7 +26,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from otp.models import OtpError
 from otp.services import start_email_verification, verify_email
-from user.models import Profile
+from user.lookups import active_users
+from user.models import Profile, UserBlock, phone_number_validator
 from utils.email import EmailError, send_email
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,10 @@ class ProfileSerializer(serializers.ModelSerializer):
             'phone_number',
             'phone_no_verified',
             'email_verified',
+            # The account-wide switch for group email. Writable, unlike its SMS
+            # sibling: SMS has a carrier word for this and email does not, so
+            # without an endpoint there would be nowhere at all to turn it off.
+            'email_enabled',
             'bio',
             'date_of_birth',
             'is_online',
@@ -157,11 +162,39 @@ class PublicUserSerializer(serializers.ModelSerializer):
     """Another user, as seen from a conversation."""
 
     profile = PublicProfileSerializer(read_only=True)
+    blocked_by_me = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'username', 'profile']
+        fields = ['id', 'username', 'profile', 'blocked_by_me']
         read_only_fields = fields
+
+    def get_blocked_by_me(self, obj):
+        """Whether the CALLER has blocked this person.
+
+        One direction, and only ever the caller's own decision. It is never
+        true because somebody blocked the caller - that would announce a block
+        to the person it was made against, which every refusal in this product
+        is written to avoid. So it discloses nothing that `GET /users/me/blocks/`
+        does not already tell the same caller.
+
+        This is what lets a client render §12's two affordances: the `Blocked`
+        marker beside a name in a shared member list, and the `Unblock` action
+        on a profile opened from one. Without it a client would have to fetch
+        the whole block list and join it by hand.
+
+        False whenever there is no request to ask on behalf of - a broadcast
+        payload built inside a consumer has no viewer, and a field that guessed
+        would be guessing about somebody's privacy.
+        """
+        request = self.context.get('request')
+        viewer = getattr(request, 'user', None)
+        if viewer is None or not viewer.is_authenticated:
+            return False
+
+        from user.blocks import has_blocked
+
+        return has_blocked(viewer, obj)
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -612,3 +645,74 @@ def _validate_unique_email(value, exclude_user=None):
     if taken.exists():
         raise serializers.ValidationError('An account with that email already exists.')
     return value
+
+
+class BlockSerializer(serializers.Serializer):
+    """Who to block, or unblock. Exactly one of the two.
+
+    `user` is a username, resolved the way every other name in this product is
+    resolved. `phone_number` is a bare number - most members of most groups
+    have no account, so a block keyed only on accounts could not name most of
+    the people somebody might want to be rid of.
+
+    Deliberately NOT resolved through `find_user` with a viewer: that function
+    now hides both sides of a block, so passing the viewer would make an
+    already-blocked person unresolvable and `unblock` impossible.
+    """
+
+    username = serializers.CharField(required=False, allow_blank=True)
+    phone_number = serializers.CharField(
+        required=False, allow_blank=True, max_length=16
+    )
+
+    def validate(self, attrs):
+        username = (attrs.get('username') or '').strip()
+        number = (attrs.get('phone_number') or '').strip()
+
+        if bool(username) == bool(number):
+            raise serializers.ValidationError(
+                'Name the person by exactly one of username or phone_number.'
+            )
+
+        viewer = self.context['request'].user
+
+        if number:
+            phone_number_validator(number)
+            attrs['target_user'] = None
+            attrs['target_number'] = number
+            return attrs
+
+        target = active_users().filter(username__iexact=username).first()
+        if target is None:
+            raise serializers.ValidationError('No user found with that username.')
+        if target.pk == viewer.pk:
+            raise serializers.ValidationError('You cannot block yourself.')
+
+        attrs['target_user'] = target
+        attrs['target_number'] = None
+        return attrs
+
+
+class BlockedEntrySerializer(serializers.Serializer):
+    """One row of "people I have blocked", as the blocker sees it.
+
+    Only ever rendered for the blocker themselves - nothing anywhere shows one
+    person that another has blocked them.
+    """
+
+    id = serializers.IntegerField(read_only=True)
+    username = serializers.SerializerMethodField()
+    display_label = serializers.SerializerMethodField()
+    phone_number = serializers.CharField(
+        source='blocked_phone_number', read_only=True
+    )
+    created_at = serializers.DateTimeField(read_only=True)
+
+    def get_username(self, obj):
+        return obj.blocked_user.username if obj.blocked_user_id else None
+
+    def get_display_label(self, obj):
+        if not obj.blocked_user_id:
+            return obj.blocked_phone_number
+        profile = getattr(obj.blocked_user, 'profile', None)
+        return profile.display_label if profile else obj.blocked_user.username

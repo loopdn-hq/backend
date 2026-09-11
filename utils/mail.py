@@ -73,7 +73,18 @@ class EmailError(Exception):
     has to stay usable from a management command or a Celery task, not just
     from a view. loopd/exceptions.py turns it into a 503, exactly as it does
     for SmsError.
+
+    `permanent` says whether trying again could help. A 401, 403 or 422 means a
+    key, a sending domain or the payload is wrong and will stay wrong until
+    somebody changes it; a 429, a 5xx or no answer at all means the service
+    was not there, and a later attempt may find it. The delivery log records
+    which, so the retry sweep does not spend an hour re-sending a message the
+    provider has already refused on principle.
     """
+
+    def __init__(self, message, *, permanent=False):
+        super().__init__(message)
+        self.permanent = permanent
 
 
 @dataclass(frozen=True)
@@ -118,11 +129,39 @@ GROUP_INVITATION = EmailTemplate(
     context_keys=('group_name', 'inviter_name', 'join_url'),
 )
 
+# One message posted in a group, delivered to a member who takes part by
+# email. Unlike everything else here this is not transactional mail about the
+# account - it is the conversation itself, which is why it carries a reply
+# address and why `can_reply` exists: a deployment with no inbound email must
+# not print an invitation to reply that goes nowhere.
+GROUP_MESSAGE = EmailTemplate(
+    slug='group_message',
+    # `unsubscribe_url` and `stop_keyword` are declared here on purpose, and
+    # this is the line that makes "every group email carries a way out" true in
+    # code rather than by convention: a missing context key raises below,
+    # BEFORE a byte reaches the provider. A group message with no opt-out in it
+    # is now unsendable.
+    context_keys=(
+        'group_name', 'sender_name', 'body', 'can_reply',
+        'unsubscribe_url', 'stop_keyword',
+    ),
+)
+
+# The one email somebody gets AFTER they have asked for no more. Sent only when
+# the request arrived by email, so the answer arrives the same way - see
+# mail/optout.py for why the link path deliberately gets no email at all.
+UNSUBSCRIBED = EmailTemplate(
+    slug='unsubscribed',
+    context_keys=('group_name', 'app_url'),
+)
+
 CATALOGUE = {
     template.slug: template
     for template in (
         VERIFICATION_CODE,
         GROUP_INVITATION,
+        GROUP_MESSAGE,
+        UNSUBSCRIBED,
     )
 }
 
@@ -172,12 +211,22 @@ def send_templated_email(template, to, context=None, **kwargs):
     )
 
 
-def send_email(to, subject, html, text=None, *, reply_to=None, idempotency_key=None):
+def send_email(to, subject, html, text=None, *, reply_to=None, from_email=None,
+               headers=None, idempotency_key=None):
     """Hand a finished message to Resend.
 
     Prefer `send_templated_email`. This is the transport, exposed because a
     one-off - an operational notice from a management command - should not have
     to invent a template directory to exist.
+
+    `from_email` overrides the sender for callers that need a display name -
+    `Family via Loopd <no-reply@loopdn.com>` for a group's own messages. The
+    address part still has to be on a domain Resend has verified, so this
+    changes the name in front of it and not who is really sending.
+
+    `headers` adds raw headers. Used for the ones that only mean anything to
+    another mail system rather than to a person - `Auto-Submitted`, and
+    threading - so they do not each need a parameter of their own.
 
     Returns the Resend message id, or None when running unconfigured.
     Raises EmailError if Resend refused or could not be reached.
@@ -194,6 +243,12 @@ def send_email(to, subject, html, text=None, *, reply_to=None, idempotency_key=N
         if '\n' in address or '\r' in address:
             raise EmailError('That email address is not valid.')
 
+    sender = (from_email or settings.DEFAULT_FROM_EMAIL).strip()
+    # The same rule for the From header, and it matters more here: the display
+    # name in front of the address is a GROUP NAME, which somebody typed.
+    if '\n' in sender or '\r' in sender:
+        raise EmailError('That sender address is not valid.')
+
     if not _is_configured():
         logger.info(
             'Email (not sent - Resend not configured) to %s\nSubject: %s\n%s',
@@ -204,7 +259,7 @@ def send_email(to, subject, html, text=None, *, reply_to=None, idempotency_key=N
         return None
 
     payload = {
-        'from': settings.DEFAULT_FROM_EMAIL,
+        'from': sender,
         'to': recipients,
         'subject': subject,
         'html': html,
@@ -218,6 +273,13 @@ def send_email(to, subject, html, text=None, *, reply_to=None, idempotency_key=N
         payload['text'] = text
     if reply_to:
         payload['reply_to'] = reply_to
+    if headers:
+        # Same rule as the addresses above, and for the same reason: a newline
+        # in a header value appends headers of the sender's choosing.
+        for key, value in headers.items():
+            if '\n' in str(value) or '\r' in str(value):
+                raise EmailError('That email header is not valid.')
+        payload['headers'] = {key: str(value) for key, value in headers.items()}
 
     data = _post(
         f'{RESEND_API_ROOT}/emails',
@@ -236,14 +298,38 @@ def _is_configured():
     return bool(settings.RESEND_API_KEY)
 
 
+def fetch_json(url, *, failure_message):
+    """GET a JSON resource from Resend and return the decoded body.
+
+    The one read in a module that otherwise only sends: an inbound reply's
+    content, which the webhook event does not carry - see mail/provider.py.
+    There is no log-instead-of-fetch mode to fall back on, because there is
+    nothing to fetch from, so an unconfigured key is an error here rather than
+    the quiet no-op `send_email` gives.
+    """
+    if not _is_configured():
+        logger.error('RESEND_API_KEY is empty; cannot fetch %s', url)
+        raise EmailError(failure_message)
+    return _request('GET', url, failure_message=failure_message)
+
+
 def _post(url, payload, *, failure_message, idempotency_key=None):
     """POST JSON to Resend and return the decoded body."""
+    return _request(
+        'POST', url, payload=payload,
+        failure_message=failure_message, idempotency_key=idempotency_key,
+    )
+
+
+def _request(method, url, *, failure_message, payload=None, idempotency_key=None):
+    """One HTTP exchange with Resend, with its errors turned into EmailError."""
     headers = {
         'Authorization': f'Bearer {settings.RESEND_API_KEY}',
-        'Content-Type': 'application/json',
         # Not optional - see USER_AGENT above.
         'User-Agent': USER_AGENT,
     }
+    if payload is not None:
+        headers['Content-Type'] = 'application/json'
 
     # Resend honours this for 24 hours, so a retry of a request that actually
     # landed does not mail the same code twice.
@@ -252,9 +338,9 @@ def _post(url, payload, *, failure_message, idempotency_key=None):
 
     request = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode(),
+        data=json.dumps(payload).encode() if payload is not None else None,
         headers=headers,
-        method='POST',
+        method=method,
     )
 
     try:
@@ -266,12 +352,12 @@ def _post(url, payload, *, failure_message, idempotency_key=None):
         detail = exc.read().decode(errors='replace')[:500]
         if exc.code in _TRANSIENT_STATUSES:
             logger.warning('Resend returned %s for %s: %s', exc.code, url, detail)
-        else:
-            # 401, 403, 422: a key, a sending domain or a payload is wrong, and
-            # it will stay wrong until somebody changes it. Logged loudly
-            # because retrying cannot fix it.
-            logger.error('Resend rejected %s with %s: %s', url, exc.code, detail)
-        raise EmailError(failure_message)
+            raise EmailError(failure_message)
+        # 401, 403, 422: a key, a sending domain or a payload is wrong, and it
+        # will stay wrong until somebody changes it. Logged loudly because
+        # retrying cannot fix it - and marked so the retry sweep knows too.
+        logger.error('Resend rejected %s with %s: %s', url, exc.code, detail)
+        raise EmailError(failure_message, permanent=True)
     except Exception as exc:
         # Timeout, DNS, TLS - anything meaning the request never landed.
         logger.error('Resend unreachable at %s: %s', url, exc)

@@ -40,7 +40,8 @@ def send_to_group(group, payload):
 
 @transaction.atomic
 def create_message(conversation, sender=None, text='', uploads=None, *,
-                   source=Message.Source.APP, participant=None, client_id=''):
+                   source=Message.Source.APP, participant=None, client_id='',
+                   reply_to=None, forwarded_from=None, copy_attachments=None):
     """Store a message with its attachments and touch the conversation.
 
     `sender` is the account that sent it, or None when the sender has no
@@ -53,6 +54,8 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     message whose `sender` and `sender_participant` disagree would render one
     name in the app and credit a different one in the SMS fan-out.
     """
+    _refuse_if_blocked(conversation, sender)
+
     if participant is None and sender is not None:
         # Explicit queryset, and explicitly ACTIVE: a message is credited to a
         # live membership or to none. Going through the relation would read the
@@ -96,6 +99,16 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
                 sender_participant=participant,
                 source=source,
                 text=text or '',
+                # Callers are responsible for proving the parent belongs to
+                # this conversation - MessageCreateSerializer.validate_reply_to
+                # and the consumer both do. Left unvalidated here so the single
+                # write path does not grow a second copy of that query.
+                reply_to=reply_to,
+                # Provenance only. The API exposes a bare "forwarded" flag and
+                # never who from: a forward crosses conversations, so naming
+                # the original sender would tell the new room about somebody
+                # in a room they cannot see.
+                forwarded_from=forwarded_from,
             )
     except IntegrityError:
         duplicate = (
@@ -115,6 +128,25 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
             message=message, file=upload, **describe_upload(upload)
         )
 
+    # A forward carries its files. New ROWS pointing at the same stored object
+    # rather than a re-upload: the bytes are identical, and copying them would
+    # double the storage bill every time somebody passes a photo along.
+    #
+    # Safe because nothing in this app deletes the underlying file - removing
+    # an Attachment row leaves the object in place - so the copy cannot be
+    # hollowed out by someone tidying the original.
+    for original in copy_attachments or []:
+        Attachment.objects.create(
+            message=message,
+            file=original.file.name,
+            kind=original.kind,
+            original_name=original.original_name,
+            content_type=original.content_type,
+            size=original.size,
+            width=original.width,
+            height=original.height,
+        )
+
     # Moves the conversation to the top of everyone's list. auto_now fills
     # in the value.
     conversation.save(update_fields=['updated_at'])
@@ -131,11 +163,56 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     # workers would otherwise race the transaction and fetch nothing.
     transaction.on_commit(lambda: broadcast_message(message))
 
-    # And out to anybody taking part by text. Scheduled, never run inline: this
-    # is N provider calls, and it must not happen inside the transaction that
-    # is still holding the row - see sms/outbound.py:schedule.
-    _schedule_sms_fanout(message)
+    # And out to anybody taking part on a channel outside the app. Scheduled,
+    # never run inline: each channel is N provider calls, and none of it may
+    # happen inside the transaction still holding this row - see
+    # sms/outbound.py:schedule.
+    _schedule_delivery(message)
     return message
+
+
+def _refuse_if_blocked(conversation, sender):
+    """A direct conversation between blocked people takes no new messages.
+
+    Read-only rather than gone. The thread stays in both lists, with its
+    history, because deleting somebody's own record of a conversation they had
+    is a bigger thing than either person asked for - and because a thread that
+    vanished from BOTH sides would tell the blocked person exactly what had
+    happened.
+
+    Checked here because this is the single write path for every route - REST,
+    websocket, inbound SMS, inbound email - so there is one place to get it
+    right rather than four. Groups are not consulted at all: a block is about
+    direct contact, and both people stay full members of everything they share.
+
+    The copy differs by who is asking and that is the whole point. The blocker
+    is told plainly, because they already know. The blocked person is told
+    something indistinguishable from any other refusal, because §2 of the spec
+    forbids revealing that a block exists - and both come back as the same 403,
+    so the status code cannot be read as an answer either.
+    """
+    if conversation.kind != Conversation.Kind.DIRECT or sender is None:
+        return
+
+    other = (
+        Participant.objects.filter(conversation=conversation, user__isnull=False)
+        .exclude(user=sender)
+        .select_related('user')
+        .first()
+    )
+    if other is None:
+        return
+
+    from user.blocks import blocks_between, has_blocked
+
+    if not blocks_between(sender, other.user):
+        return
+
+    if has_blocked(sender, other.user):
+        raise PostingNotAllowed(
+            'You blocked this person. Unblock them to send a message.'
+        )
+    raise PostingNotAllowed('Unable to send message.')
 
 
 def serialize_message(message):
@@ -154,6 +231,24 @@ def broadcast_message(message):
     send_to_group(
         conversation_group(message.conversation_id),
         {'type': 'message.new', 'message': serialize_message(message)},
+    )
+
+
+def broadcast_message_updated(message):
+    """An existing message changed - edited, deleted, or reacted to.
+
+    ONE event for all three, carrying the whole message rather than a diff.
+    Clients already know how to read a message and swap it into the thread by
+    id, so three narrower events would be three more shapes to learn and three
+    more consumer methods to forget - and a missing consumer method drops the
+    frame in silence, which presents as "works after a refresh, never live".
+
+    Deliberately not `message.new`: a client that treats this as new appends a
+    duplicate instead of replacing the one it already has.
+    """
+    send_to_group(
+        conversation_group(message.conversation_id),
+        {'type': 'message.updated', 'message': serialize_message(message)},
     )
 
 
@@ -293,18 +388,21 @@ def broadcast_removed_from_conversation(conversation, users):
         )
 
 
-def _schedule_sms_fanout(message):
-    """Hand a new message to the SMS fan-out, if the app is installed.
+def _schedule_delivery(message):
+    """Hand a new message to every delivery channel that is installed.
+
+    This used to name `sms.outbound.schedule` directly. It does not any more,
+    because the second channel would have added a second import and a second
+    call here - and the third a third, on the single code path every message in
+    the product goes through. Channels register themselves instead; see
+    `chat/delivery.py:register_channel`.
 
     A function-local import, which is the house style for the one direction
-    `chat` must not depend on at module level: `sms` imports `chat`, so the
-    reverse at import time would be a cycle.
+    `chat` must not depend on at module level.
     """
-    try:
-        from sms.outbound import schedule
-    except ImportError:  # pragma: no cover - sms is always installed today
-        return
-    schedule(message)
+    from chat import delivery
+
+    delivery.schedule_all(message)
 
 
 def broadcast_join_request(conversation, participant):

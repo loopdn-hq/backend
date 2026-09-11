@@ -28,7 +28,8 @@ from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 
-from chat.models import Participant
+from chat import delivery, membership
+from chat.models import ChannelConsent, Participant
 from sms import segments
 from sms.client import SmsError, is_allowed_destination, send_text
 from sms.models import GroupNumber, SmsDelivery, SmsSettings
@@ -70,37 +71,30 @@ def recipients_for(message):
     Returns (send_to, skipped) where `skipped` carries a reason per person, so
     the delivery log can answer for its own omissions.
     """
-    conversation = message.conversation
-    rows = (
-        Participant.objects.filter(
-            conversation=conversation, status=Participant.Status.ACTIVE
-        )
-        .exclude(pk=message.sender_participant_id)
-        .select_related('user__profile')
+    send_to, skipped = delivery.eligible_for(
+        message, ChannelConsent.Channel.SMS
     )
 
-    send_to, skipped = [], []
-    for row in rows:
-        reason = _refusal_reason(row)
+    # The shared ladder answers the membership question. Whether there is a
+    # number we may text is SMS's own, and is asked here.
+    textable, no_address = [], []
+    for row in send_to:
+        reason = _address_reason(row)
         if reason is None:
-            send_to.append(row)
+            textable.append(row)
         else:
-            skipped.append((row, reason))
-    return send_to, skipped
+            no_address.append((row, reason))
+
+    return textable, skipped + no_address
 
 
-def _refusal_reason(participant):
-    """Why this member must not be texted, or None if they may be."""
-    if not participant.sms_enabled:
-        return 'sms disabled for this group'
-    if participant.muted:
-        return 'muted'
-    if participant.sms_consent == Participant.Consent.STOPPED:
-        return 'opted out'
+def _address_reason(participant):
+    """Why there is no number we may text, or None if there is one.
 
+    Only the address question - membership, muting and consent were settled by
+    chat.delivery before this is reached.
+    """
     if participant.user_id is None:
-        if participant.sms_consent != Participant.Consent.GRANTED:
-            return 'consent not granted'
         number = participant.phone_number
     else:
         # An account member is texted on the number they verified when they
@@ -121,6 +115,33 @@ def _refusal_reason(participant):
         # allowlist narrows, and premium ranges hide inside ordinary prefixes.
         return 'destination not allowed'
     return None
+
+
+def still_eligible(participant, message):
+    """Why this member must not be texted RIGHT NOW, or None if they may be.
+
+    All three parts of the decision - the shared membership ladder, whether the
+    sender is somebody they have blocked, and SMS's own address question -
+    which together are exactly what `recipients_for` asks for a fresh fan-out.
+
+    It exists as its own function because the fan-out is not the only thing
+    that sends: `retry_delivery` picks a row up minutes or hours later, and the
+    world moves in between. A decision taken at fan-out time is not still true
+    when the retry runs - somebody can block the sender inside that window.
+
+    `message` is REQUIRED rather than defaulted, and that is the point. A
+    default would let a caller omit it and get a check that silently skipped
+    the block, which is worse than no check at all because it looks like one.
+    Asked again at every send, because "did we check?" should never be
+    answerable by reading how a function was called.
+
+    The composition itself lives in `chat/delivery.py:retry_refusal`, shared
+    with email, so the two channels cannot come to re-decide a retry
+    differently. Only the address question here is SMS's own.
+    """
+    return delivery.retry_refusal(
+        participant, message, ChannelConsent.Channel.SMS, _address_reason
+    )
 
 
 def number_for(participant):
@@ -542,13 +563,39 @@ def send_notice(conversation, participant, text, *, kind='notice'):
     if not number:
         return None
 
-    if participant.sms_consent == Participant.Consent.STOPPED:
+    consent = membership.consent_status(
+        participant, ChannelConsent.Channel.SMS
+    )
+
+    if consent in (
+        ChannelConsent.Status.OPTED_OUT,
+        ChannelConsent.Status.DECLINED,
+    ):
         return _record_notice(
             conversation, participant, SmsDelivery.Status.SKIPPED,
             reason='opted out',
         )
 
-    if kind != 'invitation' and participant.sms_consent == Participant.Consent.PENDING:
+    # The delivery switches, as well as the answer. This used to read consent
+    # alone, which meant the two could disagree and the notice would believe
+    # the wrong one: an admin who switched SMS off for a member, or a STOP that
+    # set the switch on every group this number belongs to, left a consent row
+    # still saying opted in - and a membership notice went out to somebody who
+    # should not have been texted at all.
+    if not participant.sms_enabled:
+        return _record_notice(
+            conversation, participant, SmsDelivery.Status.SKIPPED,
+            reason='sms disabled for this group',
+        )
+
+    profile = getattr(participant.user, 'profile', None) if participant.user_id else None
+    if profile is not None and not profile.sms_enabled:
+        return _record_notice(
+            conversation, participant, SmsDelivery.Status.SKIPPED,
+            reason='sms disabled account-wide',
+        )
+
+    if kind != 'invitation' and consent == ChannelConsent.Status.PENDING:
         # They have not answered the invitation yet, so no group traffic and no
         # chatter - only the invitation itself.
         return _record_notice(
@@ -633,6 +680,21 @@ def retry_delivery(delivery):
     Claimed with a conditional UPDATE before anything is sent, so two workers
     picking up the same row cannot both text the person. `attempts` bounds how
     many times this can ever happen for one row.
+
+    THE ELIGIBILITY CHECK IS RE-RUN, AND HAS TO BE. A retry can fire up to six
+    hours after the message was written, and the reason it failed the first
+    time - a carrier hiccup - says nothing about whether the person still wants
+    it. In that window they can text STOP, mute the group, leave it, or be
+    removed from it. Deciding once at fan-out time and trusting it hours later
+    is how somebody who has said no gets texted anyway, twice.
+
+    `sms/maintenance.py:PERMANENT_REASONS` does not cover this: it excludes
+    rows whose reason was ALREADY a policy refusal, and cannot know about a
+    refusal that only became true afterwards.
+
+    The row is marked SKIPPED rather than FAILED when that happens, which is
+    both accurate - it is a decision, not a failure - and self-limiting, since
+    the sweep never retries a SKIPPED row.
     """
     claimed = SmsDelivery.objects.filter(
         pk=delivery.pk, status=SmsDelivery.Status.FAILED
@@ -646,8 +708,30 @@ def retry_delivery(delivery):
 
     delivery.refresh_from_db()
     conversation = delivery.conversation
-    participant = delivery.participant
-    number = number_for(participant) if participant else None
+
+    # Read fresh, with the consent rows, rather than trusting whatever the
+    # sweep's queryset loaded: the point of the check below is that the world
+    # has moved since this row was written.
+    participant = (
+        Participant.objects.filter(pk=delivery.participant_id)
+        .select_related('user__profile')
+        .prefetch_related('channel_consents')
+        .first()
+    )
+
+    # Read BEFORE the check rather than after, because the check needs it: the
+    # message is who sent it, and whether the recipient has blocked them since
+    # is one of the things that can have changed in the retry window.
+    message = delivery.message
+
+    refusal = still_eligible(participant, message)
+    if refusal is not None:
+        delivery.status = SmsDelivery.Status.SKIPPED
+        delivery.reason = refusal
+        delivery.save(update_fields=['status', 'reason', 'updated_at'])
+        return False
+
+    number = number_for(participant)
     group_number = GroupNumber.for_number_of(conversation) if conversation else None
 
     if not number or group_number is None:
@@ -662,7 +746,7 @@ def retry_delivery(delivery):
         delivery.save(update_fields=['status', 'reason', 'updated_at'])
         return False
 
-    body = format_message(conversation, delivery.message) if delivery.message else None
+    body = format_message(conversation, message) if message else None
     if body is None:
         delivery.status = SmsDelivery.Status.FAILED
         delivery.reason = 'the message is gone'

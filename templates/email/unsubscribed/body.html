@@ -1,0 +1,23 @@
+{% extends "email/base.html" %}
+
+{% block title %}Emails from {{ group_name }} are off{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">
+  Done &mdash; emails from <strong>{{ group_name }}</strong> are off.
+</p>
+<p style="margin:0 0 16px; color:#52525b;">
+  Your other groups are not affected, and you will still see every message in
+  {{ product_name }}.
+</p>
+<p style="margin:0 0 24px; color:#52525b;">
+  To turn them back on, open {{ group_name }} in {{ product_name }} and switch
+  email updates on.
+</p>
+<p style="margin:0;">
+  <a href="{{ app_url }}"
+     style="display:inline-block; background-color:#0284c7; color:#ffffff; text-decoration:none; font-weight:600; padding:12px 24px; border-radius:8px;">
+    Open {{ product_name }}
+  </a>
+</p>
+{% endblock %}
