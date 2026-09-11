@@ -49,7 +49,7 @@ from django.db import transaction
 from chat import membership
 from chat.models import Message, Participant, PostingNotAllowed
 from chat.services import create_message
-from mail import authentication, commands
+from mail import authentication, autoreply, commands
 from mail.quoting import strip_quoted_reply
 from mail.tokens import participant_id_from
 
@@ -85,13 +85,15 @@ def resolve_recipient(to_address):
 
 
 @transaction.atomic
-def handle_inbound(to_address, from_address, body, *, headers):
+def handle_inbound(to_address, from_address, body, *, headers, subject=''):
     """Act on one inbound email. Returns an InboundResult.
 
     `headers` is the message's headers, keyed lower-case, and is required
     rather than defaulted for the reason `sms/outbound.py:still_eligible` gives:
     a default would let a caller skip the authentication check by forgetting,
     and "did we check?" must never be answerable by reading a call site.
+    `subject` only helps `mail/autoreply.py` catch a responder that set no
+    header, so it may be left out.
     """
     participant = resolve_recipient(to_address)
 
@@ -123,11 +125,17 @@ def handle_inbound(to_address, from_address, body, *, headers):
         )
         return InboundResult(action='ignored_address_mismatch', participant=participant)
 
+    if autoreply.is_automatic(headers, subject):
+        # A vacation responder answering from the member's own address passes
+        # every check above. Posting it would fan "I am away until Monday" to
+        # the whole group and invite the next responder to answer that.
+        return InboundResult(action='ignored_auto_reply', participant=participant)
+
     text = strip_quoted_reply(body)
     if not text:
-        # An auto-reply, a read receipt, or a message that was nothing but the
-        # thread quoted back. `create_message` has no opinion but the
-        # serializer forbids empty messages, so this path has to agree.
+        # A read receipt, or a message that was nothing but the thread quoted
+        # back. `create_message` has no opinion but the serializer forbids
+        # empty messages, so this path has to agree.
         return InboundResult(action='ignored_empty', participant=participant)
 
     # AFTER the quote-stripping, and the order is not incidental. Every group

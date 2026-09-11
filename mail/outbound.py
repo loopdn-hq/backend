@@ -29,9 +29,10 @@ from email.utils import formataddr
 
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 
 from chat import delivery
-from chat.models import ChannelConsent
+from chat.models import ChannelConsent, Participant
 from mail import commands
 from mail.models import EmailDelivery
 from mail.tokens import reply_address, unsubscribe_url
@@ -131,6 +132,20 @@ def recipients_for(message):
     return mailable, skipped + no_address
 
 
+def still_eligible(participant, message):
+    """Why this member must not be emailed RIGHT NOW, or None if they may be.
+
+    The email twin of `sms/outbound.py:still_eligible`, and one line for the
+    same reason: the composition - conversation, ladder, block, address - lives
+    once in `chat/delivery.py:retry_refusal`, so a retry cannot be re-decided
+    differently on the two channels. `message` is required, not defaulted;
+    that docstring says why.
+    """
+    return delivery.retry_refusal(
+        participant, message, ChannelConsent.Channel.EMAIL, _address_reason
+    )
+
+
 def _address_reason(participant):
     """Why there is no address we may mail, or None if there is one.
 
@@ -210,13 +225,74 @@ def fan_out(message):
 
 
 def _send_one(message, participant, sender, body):
+    record = _record(
+        message, participant, EmailDelivery.Status.SENDING, attempts=1
+    )
+    return _deliver(record, message, participant, sender, body)
+
+
+def retry_delivery(delivery_row):
+    """Send one previously failed delivery again. True if it went out.
+
+    Claimed with a conditional UPDATE before anything is sent, so two workers
+    picking up the same row cannot both mail the person. `attempts` bounds how
+    many times this can ever happen for one row.
+
+    The eligibility check is re-run, and has to be - `still_eligible` says
+    why. A refusal marks the row SKIPPED rather than FAILED: it is a decision,
+    not a failure, and the sweep never reads a SKIPPED row, so the question is
+    not asked again next hour.
+    """
+    claimed = EmailDelivery.objects.filter(
+        pk=delivery_row.pk, status=EmailDelivery.Status.FAILED
+    ).update(
+        status=EmailDelivery.Status.SENDING,
+        attempts=delivery_row.attempts + 1,
+        updated_at=timezone.now(),
+    )
+    if not claimed:
+        return False
+
+    delivery_row.refresh_from_db()
+
+    # Read fresh, with the consent rows, rather than trusting whatever the
+    # sweep's queryset loaded: the point of the check below is that the world
+    # has moved since this row was written.
+    participant = (
+        Participant.objects.filter(pk=delivery_row.participant_id)
+        .select_related('user__profile')
+        .prefetch_related('channel_consents')
+        .first()
+    )
+    message = delivery_row.message
+
+    refusal = still_eligible(participant, message)
+    if refusal is not None:
+        _finish(delivery_row, EmailDelivery.Status.SKIPPED, refusal)
+        return False
+
+    if message is None:
+        _finish(delivery_row, EmailDelivery.Status.FAILED, 'the message is gone')
+        return False
+
+    record = _deliver(
+        delivery_row, message, participant,
+        from_header(message.conversation), body_for(message),
+    )
+    return record.status == EmailDelivery.Status.SENT
+
+
+def _deliver(record, message, participant, sender, body):
+    """One provider call for one row, and the outcome written on the row.
+
+    Shared by the first send and by `retry_delivery`, so a failure is recorded
+    the same way whichever path met it. The reason is one of two fixed strings
+    rather than the provider's text: `mail/maintenance.py` reads it to decide
+    whether trying again could help, and the provider's wording is in the log.
+    """
     address = address_for(participant)
     reply_to = reply_address(participant)
     stop_url = unsubscribe_url(participant)
-
-    record = _record(
-        message, participant, EmailDelivery.Status.SENDING
-    )
 
     try:
         message_id = send_templated_email(
@@ -256,18 +332,27 @@ def _send_one(message, participant, sender, body):
     except EmailError as exc:
         # One bad address must not stop the other nine people getting the
         # message, so this is caught per recipient and never re-raised.
-        record.status = EmailDelivery.Status.FAILED
-        record.reason = str(exc)[:120]
-        record.save(update_fields=['status', 'reason', 'updated_at'])
+        _finish(
+            record,
+            EmailDelivery.Status.FAILED,
+            'provider rejected the message' if exc.permanent else 'provider unavailable',
+        )
         return record
 
     record.status = EmailDelivery.Status.SENT
+    record.reason = ''
     record.provider = 'resend' if message_id else ''
     record.provider_message_id = message_id or ''
-    record.save(
-        update_fields=['status', 'provider', 'provider_message_id', 'updated_at']
-    )
+    record.save(update_fields=[
+        'status', 'reason', 'provider', 'provider_message_id', 'updated_at',
+    ])
     return record
+
+
+def _finish(record, status, reason):
+    record.status = status
+    record.reason = reason[:120]
+    record.save(update_fields=['status', 'reason', 'updated_at'])
 
 
 def _headers_for(conversation, stop_url):
@@ -302,7 +387,7 @@ def _headers_for(conversation, stop_url):
     return headers
 
 
-def _record(message, participant, status, *, reason=''):
+def _record(message, participant, status, *, reason='', attempts=0):
     address = address_for(participant) or ''
     return EmailDelivery.objects.create(
         direction=EmailDelivery.Direction.OUTBOUND,
@@ -314,6 +399,7 @@ def _record(message, participant, status, *, reason=''):
         counterpart_hash=_hash_address(address),
         status=status,
         reason=reason,
+        attempts=attempts,
     )
 
 

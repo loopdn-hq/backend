@@ -425,6 +425,17 @@ MAIL_MAX_UNSUBSCRIBE_ATTEMPTS_PER_HOUR = int(
     os.environ.get('MAIL_MAX_UNSUBSCRIBE_ATTEMPTS_PER_HOUR', '20')
 )
 
+# The email retry sweep, with the same three bounds as SMS's: how many times
+# one row may be tried, how old a message may be and still be worth delivering,
+# and how long a row may sit in SENDING before the worker is presumed dead.
+MAIL_MAX_DELIVERY_ATTEMPTS = int(os.environ.get('MAIL_MAX_DELIVERY_ATTEMPTS', '3'))
+MAIL_RETRY_WINDOW_HOURS = int(os.environ.get('MAIL_RETRY_WINDOW_HOURS', '6'))
+MAIL_STALLED_AFTER_MINUTES = int(os.environ.get('MAIL_STALLED_AFTER_MINUTES', '15'))
+
+# A row per recipient per message, recording who is emailed about which
+# private group. Not something to keep forever.
+MAIL_RETENTION_DAYS = int(os.environ.get('MAIL_RETENTION_DAYS', '90'))
+
 # Signs the unsubscribe token. Defaults to SECRET_KEY, so leaving it unset
 # changes nothing at all - it exists so that rotating SECRET_KEY one day does
 # not have to invalidate every unsubscribe link already sitting in somebody's
@@ -880,6 +891,19 @@ CELERY_BEAT_SCHEDULE = {
     },
     'sms-daily-spend-report': {
         'task': 'sms.daily_spend_report',
+        'schedule': 86400.0,
+    },
+    # The same three jobs for email - see mail/maintenance.py.
+    'mail-retry-failed-deliveries': {
+        'task': 'mail.retry_failed_deliveries',
+        'schedule': 300.0,
+    },
+    'mail-requeue-stalled-deliveries': {
+        'task': 'mail.requeue_stalled_deliveries',
+        'schedule': 600.0,
+    },
+    'mail-purge-old-deliveries': {
+        'task': 'mail.purge_old_deliveries',
         'schedule': 86400.0,
     },
 }

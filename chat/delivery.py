@@ -71,22 +71,58 @@ def refusal_reason(participant, channel):
     the channel's own business - see the module docstring.
     """
     if participant.status != Participant.Status.ACTIVE:
-        return 'not an active member'
+        return NOT_A_MEMBER
 
     if participant.muted:
-        return 'muted'
+        return MUTED
 
     if not _channel_enabled(participant, channel):
         return f'{channel} disabled for this group'
 
     consent = consent_for(participant, channel)
     if consent is None:
-        return 'no consent on record'
+        return NO_CONSENT
     if not consent.allows_delivery:
         return _consent_reason(consent)
 
     # Archived deliberately absent. See the module docstring.
     return None
+
+
+def retry_refusal(participant, message, channel, address_reason):
+    """Why a FAILED delivery must not be tried again now, or None if it may be.
+
+    Everything a fresh fan-out asks, asked again: whether the conversation is
+    still carried at all, the ladder, the block screen, and the channel's own
+    address question - which is passed in, because it is the one part that is
+    the channel's. `sms/outbound.py:still_eligible` and its email twin are each
+    one line calling this, so the two channels cannot come to re-decide a
+    retry differently.
+
+    It has to be asked again. A retry fires minutes or hours after the message
+    was written, and the reason it failed - a provider having a bad minute -
+    says nothing about whether the person still wants it. Inside that window
+    they can say STOP, mute the group, leave it, be removed from it, or block
+    the sender. A decision taken at fan-out time and trusted later is how
+    somebody who said no is reached anyway.
+
+    `participant` may be None (the row was deleted) and `message` may be None
+    (a notice, or a deleted message); both are answered rather than raised on,
+    because the caller is a sweep over hundreds of rows.
+    """
+    if participant is None:
+        return 'the membership is gone'
+
+    if message is not None:
+        reason = conversation_reason(message.conversation)
+        if reason is not None:
+            return reason
+
+    return (
+        refusal_reason(participant, channel)
+        or sender_block_reason(participant, message)
+        or address_reason(participant)
+    )
 
 
 def conversation_reason(conversation):
@@ -155,6 +191,24 @@ def eligible_for(message, channel):
 #: serializer, no viewset and no URL, only the admin - and "why did I not get
 #: that" is the question the log exists to answer.
 BLOCKED_REASON = 'blocked between sender and recipient'
+
+#: The ladder's own words, as constants so the two channels' maintenance
+#: sweeps can name them without copying the strings - see POLICY_REASONS.
+NOT_A_MEMBER = 'not an active member'
+MUTED = 'muted'
+NO_CONSENT = 'no consent on record'
+OPTED_OUT = 'opted out'
+DECLINED = 'declined this group'
+CONSENT_NOT_GRANTED = 'consent not granted'
+
+#: Every reason that is a DECISION rather than a failure. A row carrying one of
+#: these is never worth retrying: the answer will be the same next hour, and
+#: re-deciding it is how somebody who said no gets reached anyway. Each channel
+#: adds its own address and provider reasons to this in its maintenance module.
+POLICY_REASONS = (
+    NOT_A_MEMBER, MUTED, NO_CONSENT, OPTED_OUT, DECLINED, CONSENT_NOT_GRANTED,
+    BLOCKED_REASON,
+)
 
 
 def screen_for_message(message):
@@ -270,10 +324,10 @@ def _channel_enabled(participant, channel):
 def _consent_reason(consent):
     """The refusal, in the words the state actually means."""
     if consent.status == ChannelConsent.Status.OPTED_OUT:
-        return 'opted out'
+        return OPTED_OUT
     if consent.status == ChannelConsent.Status.DECLINED:
-        return 'declined this group'
-    return 'consent not granted'
+        return DECLINED
+    return CONSENT_NOT_GRANTED
 
 
 # --- the registry ----------------------------------------------------------

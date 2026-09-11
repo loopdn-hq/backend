@@ -28,3 +28,30 @@ def fan_out_message(message_id):
     rows = dispatch(message_id)
     logger.info('Emailed message %s to %s recipients', message_id, len(rows))
     return len(rows)
+
+
+# --- the scheduled jobs ----------------------------------------------------
+#
+# Wrappers, exactly as sms/tasks.py has them. The work is in mail/maintenance.py
+# so a test can call it directly.
+
+
+@shared_task(name='mail.retry_failed_deliveries')
+def retry_failed_deliveries():
+    from mail.maintenance import retry_failed_deliveries as run
+
+    return run()
+
+
+@shared_task(name='mail.requeue_stalled_deliveries')
+def requeue_stalled_deliveries():
+    from mail.maintenance import requeue_stalled_deliveries as run
+
+    return run()
+
+
+@shared_task(name='mail.purge_old_deliveries')
+def purge_old_deliveries():
+    from mail.maintenance import purge_old_deliveries as run
+
+    return run()

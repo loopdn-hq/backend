@@ -19,8 +19,12 @@ import time
 from contextlib import contextmanager
 from unittest import mock
 
+from django.conf import settings
 from django.contrib.auth.models import User
+from datetime import timedelta
+
 from django.test import TestCase, TransactionTestCase, override_settings
+from django.utils import timezone
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -34,7 +38,16 @@ from chat.models import (
     Participant,
 )
 from chat.services import create_message
-from mail import authentication, commands, inbound, outbound, provider
+from mail import (
+    authentication,
+    autoreply,
+    commands,
+    inbound,
+    maintenance,
+    outbound,
+    provider,
+    receipts,
+)
 from mail.models import EmailDelivery, EmailWebhookEvent
 from mail.quoting import strip_quoted_reply
 from mail.tokens import (
@@ -1690,39 +1703,64 @@ class AuthenticationResultsTests(TestCase):
 class InboundProviderTests(TestCase):
     """The two Resend shapes - the event and the fetched content - read into one."""
 
-    def event(self, **data):
-        return provider.event_summary({'type': 'email.received', 'data': data})
+    def event(self, kind='email.received', **data):
+        return provider.parse_event({'type': kind, 'data': data})
 
     def test_the_event_is_only_a_notice(self):
-        summary = self.event(
+        event = self.event(
             email_id='abc', to=[f'reply+1.x@{REPLY_DOMAIN}'],
             **{'from': 'bob@example.com'}, subject='Re: Family',
         )
 
-        self.assertEqual(summary, ('abc', f'reply+1.x@{REPLY_DOMAIN}', 'bob@example.com'))
+        self.assertEqual(event.kind, provider.INBOUND)
+        self.assertEqual(
+            (event.email_id, event.to_address, event.from_address),
+            ('abc', f'reply+1.x@{REPLY_DOMAIN}', 'bob@example.com'),
+        )
 
-    def test_anything_but_an_inbound_message_is_nothing_to_do(self):
-        for kind in ('email.delivered', 'email.bounced', 'email.complained', ''):
+    def test_an_event_we_do_not_act_on_has_no_kind(self):
+        for kind in ('email.opened', 'email.clicked', 'domain.created', ''):
             with self.subTest(kind=kind):
-                self.assertEqual(
-                    provider.event_summary({'type': kind, 'data': {'email_id': 'abc'}}),
-                    ('', '', ''),
-                )
+                self.assertEqual(self.event(kind, email_id='abc').kind, '')
+
+    def test_a_receipt_is_read_with_the_providers_explanation(self):
+        bounce = self.event(
+            'email.bounced', email_id='sent-1',
+            bounce={'type': 'Permanent', 'subType': 'Suppressed',
+                    'message': 'mailbox unavailable'},
+        )
+        failed = self.event('email.failed', email_id='sent-2',
+                            failed={'reason': 'reached_daily_quota'})
+        soft = self.event('email.bounced', email_id='sent-3',
+                          bounce={'type': 'Temporary', 'subType': 'MailboxFull'})
+
+        self.assertEqual((bounce.kind, bounce.permanent), (provider.BOUNCED, True))
+        self.assertEqual(bounce.detail, 'Permanent Suppressed mailbox unavailable')
+        self.assertEqual((failed.kind, failed.detail), (provider.FAILED, 'reached_daily_quota'))
+        self.assertEqual((soft.kind, soft.permanent), (provider.BOUNCED, False))
+        self.assertEqual(self.event('email.complained', email_id='s').kind, provider.COMPLAINED)
+        self.assertEqual(self.event('email.delivered', email_id='s').kind, provider.DELIVERED)
+        self.assertEqual(self.event('email.suppressed', email_id='s').kind, provider.SUPPRESSED)
+
+    def test_a_malformed_payload_is_nothing_to_do_rather_than_an_error(self):
+        self.assertEqual(provider.parse_event({'type': 'email.bounced', 'data': 'junk'}).email_id, '')
+        self.assertEqual(provider.parse_event({}).kind, '')
 
     def test_our_address_is_found_wherever_it_sits(self):
         ours = f'reply+1.x@{REPLY_DOMAIN}'
 
         self.assertEqual(
-            self.event(email_id='a', to=['friend@example.com'], received_for=[ours])[1],
+            self.event(email_id='a', to=['friend@example.com'], received_for=[ours]).to_address,
             ours,
         )
         self.assertEqual(
-            self.event(email_id='a', to=[{'address': 'friend@example.com'}, ours])[1],
+            self.event(email_id='a', to=[{'address': 'friend@example.com'}, ours]).to_address,
             ours,
         )
         # And when none is ours, the first To - so "not ours" has a name.
         self.assertEqual(
-            self.event(email_id='a', to=['friend@example.com'])[1], 'friend@example.com'
+            self.event(email_id='a', to=['friend@example.com']).to_address,
+            'friend@example.com',
         )
 
     def test_fetching_reads_the_content_and_lower_cases_the_headers(self):
@@ -1730,6 +1768,7 @@ class InboundProviderTests(TestCase):
             'id': 'abc',
             'from': 'Bob <bob@example.com>',
             'to': [f'reply+1.x@{REPLY_DOMAIN}'],
+            'subject': 'Re: New message in Family',
             'text': None,
             'html': '<p>On my way</p>',
             'headers': {
@@ -1742,6 +1781,7 @@ class InboundProviderTests(TestCase):
         # The id goes into a URL path, so it is escaped rather than trusted.
         self.assertIn('/emails/receiving/abc%2F..%2Fevil', fetch.call_args.args[0])
         self.assertEqual(received.body, 'On my way')
+        self.assertEqual(received.subject, 'Re: New message in Family')
         self.assertEqual(
             received.headers['authentication-results'],
             'mx; dmarc=pass header.from=example.com',
@@ -1802,3 +1842,381 @@ class MailChecksTests(TestCase):
     )
     def test_with_replies_off_neither_applies(self):
         self.assertFalse({'mail.E003', 'mail.E004'} & self.problem_ids())
+
+
+class AutoReplyTests(TestCase):
+    """A vacation responder passes every identity check. It must still not post."""
+
+    def test_rfc_3834_auto_submitted_is_a_machine_unless_it_says_no(self):
+        for value in ('auto-replied', 'auto-generated', 'auto-notified', 'Auto-Replied; owner-notify'):
+            with self.subTest(value=value):
+                self.assertTrue(autoreply.is_automatic({'auto-submitted': value}))
+        self.assertFalse(autoreply.is_automatic({'auto-submitted': 'no'}))
+
+    def test_the_older_headers_count_by_being_present(self):
+        for name in ('x-autoreply', 'x-autorespond', 'x-auto-response-suppress'):
+            with self.subTest(name=name):
+                self.assertTrue(autoreply.is_automatic({name: 'All'}))
+
+    def test_precedence(self):
+        for value, automatic in (('bulk', True), ('junk', True), ('auto_reply', True),
+                                 ('list', False), ('first-class', False)):
+            with self.subTest(value=value):
+                self.assertEqual(autoreply.is_automatic({'precedence': value}), automatic)
+
+    def test_a_subject_that_says_so_is_the_last_resort(self):
+        for subject in ('Automatic reply: New message in Family', 'Re: Out of Office',
+                        'AutoReply: Dinner', 'Auto-Reply', 'OOO until Monday'):
+            with self.subTest(subject=subject):
+                self.assertTrue(autoreply.is_automatic({}, subject))
+        for subject in ('Re: New message in Family', "I'll be there", 'Autos for sale'):
+            with self.subTest(subject=subject):
+                self.assertFalse(autoreply.is_automatic({}, subject))
+
+    def test_a_header_given_as_a_list_reads_its_first_value(self):
+        self.assertTrue(autoreply.is_automatic({'auto-submitted': ['auto-replied']}))
+
+    def test_an_ordinary_reply_is_not_automatic(self):
+        self.assertFalse(autoreply.is_automatic(authenticated(), 'Re: Dinner'))
+        self.assertFalse(autoreply.is_automatic(None))
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN)
+class AutoReplyIsNotPostedTests(TestCase):
+    """The refusal, where it lives: after identity, before the words are read."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.bob_row = Participant.objects.get(conversation=self.group, user=self.bob)
+
+    def reply(self, **kwargs):
+        return inbound.handle_inbound(
+            reply_address(self.bob_row), 'bob@example.com', 'I am away until Monday.',
+            **{'headers': authenticated(), **kwargs},
+        )
+
+    def test_a_responder_from_the_members_own_address_is_dropped(self):
+        result = self.reply(headers={**authenticated(), 'auto-submitted': 'auto-replied'})
+
+        self.assertEqual(result.action, 'ignored_auto_reply')
+        self.assertEqual(self.group.messages.count(), 0)
+
+    def test_a_responder_that_only_says_so_in_the_subject_is_dropped(self):
+        result = self.reply(subject='Automatic reply: New message in Family')
+
+        self.assertEqual(result.action, 'ignored_auto_reply')
+
+    def test_the_same_words_typed_by_a_person_still_post(self):
+        self.assertEqual(self.reply(subject='Re: New message in Family').action, 'posted')
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN)
+class EmailMaintenanceTests(TestCase):
+    """A failed email is no longer terminal - and a retry re-asks the question."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.bob_row = Participant.objects.get(conversation=self.group, user=self.bob)
+
+    def a_failed_delivery(self, *, attempts=None, reason=None, permanent=False):
+        """A real FAILED row, produced by the real fan-out meeting a provider error."""
+        message = create_message(self.group, self.alice, text='Dinner at 7')
+        with mock.patch('mail.outbound.send_templated_email',
+                        side_effect=EmailError('down', permanent=permanent)):
+            outbound.fan_out(message)
+        row = EmailDelivery.objects.get(message=message, participant=self.bob_row)
+        if attempts is not None or reason is not None:
+            row.attempts = row.attempts if attempts is None else attempts
+            row.reason = row.reason if reason is None else reason
+            row.save(update_fields=['attempts', 'reason'])
+        return row
+
+    # --- what the fan-out writes --------------------------------------------
+
+    def test_a_provider_outage_and_a_provider_rejection_are_told_apart(self):
+        outage = self.a_failed_delivery()
+        rejection = self.a_failed_delivery(permanent=True)
+
+        self.assertEqual((outage.status, outage.reason, outage.attempts),
+                         ('failed', 'provider unavailable', 1))
+        self.assertEqual(rejection.reason, 'provider rejected the message')
+
+    # --- retry ---------------------------------------------------------------
+
+    def test_a_failed_delivery_is_tried_again(self):
+        row = self.a_failed_delivery()
+
+        with capture_sent() as sent:
+            self.assertEqual(maintenance.retry_failed_deliveries(), 1)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, EmailDelivery.Status.SENT)
+        self.assertEqual(row.reason, '')
+        self.assertEqual(row.attempts, 2)
+        self.assertEqual(sent[0]['to'], ['bob@example.com'])
+
+    def test_retrying_stops_after_a_few_goes(self):
+        row = self.a_failed_delivery(attempts=settings.MAIL_MAX_DELIVERY_ATTEMPTS)
+
+        with capture_sent() as sent:
+            self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, EmailDelivery.Status.FAILED)
+        self.assertEqual(sent, [])
+
+    def test_a_rejection_is_never_retried(self):
+        # 401, 403, 422: wrong until somebody changes it. Trying again asks the
+        # same question of the same answer.
+        self.a_failed_delivery(permanent=True)
+
+        with capture_sent() as sent:
+            self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+        self.assertEqual(sent, [])
+
+    def test_a_decision_is_never_retried(self):
+        # SKIPPED, BOUNCED and COMPLAINED are all answers, not failures.
+        for status_ in (EmailDelivery.Status.SKIPPED, EmailDelivery.Status.BOUNCED,
+                        EmailDelivery.Status.COMPLAINED):
+            with self.subTest(status=status_):
+                row = self.a_failed_delivery()
+                row.status = status_
+                row.save(update_fields=['status'])
+
+                self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+    def test_a_retry_is_dropped_if_they_said_stop_emails_meanwhile(self):
+        # The window is up to six hours. PERMANENT_REASONS cannot help: it
+        # excludes rows that were ALREADY a refusal, not ones that became one.
+        row = self.a_failed_delivery()
+        inbound.handle_inbound(
+            reply_address(self.bob_row), 'bob@example.com', commands.KEYWORD,
+            headers=authenticated(),
+        )
+
+        with capture_sent() as sent:
+            self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual((row.status, row.reason), ('skipped', 'declined this group'))
+        self.assertEqual(sent, [])
+        # And SKIPPED is self-limiting: the sweep never picks it up again.
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+    def assert_dropped_as(self, row, reason):
+        with capture_sent() as sent:
+            self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+        row.refresh_from_db()
+        self.assertEqual((row.status, row.reason), ('skipped', reason))
+        self.assertEqual(sent, [])
+
+    def test_a_retry_is_dropped_if_they_muted_meanwhile(self):
+        row = self.a_failed_delivery()
+        membership.set_muted(self.bob_row, True)
+
+        self.assert_dropped_as(row, 'muted')
+
+    def test_a_retry_is_dropped_if_they_left_meanwhile(self):
+        row = self.a_failed_delivery()
+        membership.leave(self.bob_row)
+
+        self.assert_dropped_as(row, 'not an active member')
+
+    def test_a_retry_is_dropped_if_they_turned_email_off_account_wide(self):
+        # The switch Settings > Notifications shows, read by email's own
+        # address question - the third rung of the retry check, after the
+        # ladder and the block.
+        row = self.a_failed_delivery()
+        self.bob.profile.email_enabled = False
+        self.bob.profile.save(update_fields=['email_enabled'])
+
+        self.assert_dropped_as(row, 'email disabled account-wide')
+
+    def test_a_retry_is_dropped_if_they_blocked_the_sender_meanwhile(self):
+        from chat.delivery import BLOCKED_REASON
+        from user.blocks import block
+
+        row = self.a_failed_delivery()
+        block(self.bob, user=self.alice)
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+        row.refresh_from_db()
+        self.assertEqual((row.status, row.reason), ('skipped', BLOCKED_REASON))
+
+    def test_a_row_claimed_by_one_worker_is_not_sent_by_another(self):
+        row = self.a_failed_delivery()
+
+        with capture_sent() as sent:
+            first = outbound.retry_delivery(row)
+            second = outbound.retry_delivery(row)
+
+        self.assertEqual((first, second), (True, False))
+        self.assertEqual(len(sent), 1)
+
+    def test_a_retry_that_fails_again_is_still_a_failure_with_a_reason(self):
+        row = self.a_failed_delivery()
+
+        with mock.patch('mail.outbound.send_templated_email',
+                        side_effect=EmailError('still down')):
+            self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual((row.status, row.reason, row.attempts),
+                         ('failed', 'provider unavailable', 2))
+
+    # --- stalled and old -----------------------------------------------------
+
+    def test_a_stalled_send_is_failed_and_then_retried(self):
+        row = self.a_failed_delivery()
+        long_ago = timezone.now() - timedelta(minutes=settings.MAIL_STALLED_AFTER_MINUTES + 1)
+        EmailDelivery.objects.filter(pk=row.pk).update(
+            status=EmailDelivery.Status.SENDING, updated_at=long_ago,
+        )
+
+        self.assertEqual(maintenance.requeue_stalled_deliveries(), 1)
+        row.refresh_from_db()
+        self.assertEqual((row.status, row.reason), ('failed', 'no answer from the sender process'))
+
+        with capture_sent():
+            self.assertEqual(maintenance.retry_failed_deliveries(), 1)
+
+    def test_a_send_still_in_progress_is_left_alone(self):
+        row = self.a_failed_delivery()
+        EmailDelivery.objects.filter(pk=row.pk).update(status=EmailDelivery.Status.SENDING)
+
+        self.assertEqual(maintenance.requeue_stalled_deliveries(), 0)
+
+    def test_old_rows_are_purged(self):
+        row = self.a_failed_delivery()
+        EmailDelivery.objects.filter(pk=row.pk).update(
+            created_at=timezone.now() - timedelta(days=settings.MAIL_RETENTION_DAYS + 1)
+        )
+        EmailWebhookEvent.objects.create(provider_event_id='old')
+        EmailWebhookEvent.objects.filter(provider_event_id='old').update(
+            received_at=timezone.now() - timedelta(days=settings.MAIL_RETENTION_DAYS + 1)
+        )
+
+        self.assertEqual(maintenance.purge_old_deliveries(), (1, 1))
+        self.assertFalse(EmailDelivery.objects.filter(pk=row.pk).exists())
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, RESEND_WEBHOOK_SECRET='')
+class ReceiptTests(APITestCase):
+    """What the provider says afterwards is written down - and two of them act."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.bob_row = Participant.objects.get(conversation=self.group, user=self.bob)
+        self.url = reverse('mail:inbound-webhook')
+
+        message = create_message(self.group, self.alice, text='Dinner at 7')
+        with capture_sent():
+            outbound.fan_out(message)
+        self.row = EmailDelivery.objects.get(message=message, participant=self.bob_row)
+        self.assertEqual(self.row.provider_message_id, 'resend-1')
+
+    def receipt(self, kind, event_id='evt-r1', **extra):
+        payload = {'type': kind, 'data': {'email_id': 'resend-1', 'to': ['bob@example.com'], **extra}}
+        return self.client.post(
+            self.url, data=json.dumps(payload), content_type='application/json',
+            HTTP_SVIX_ID=event_id,
+        )
+
+    def email_switch(self):
+        self.bob.profile.refresh_from_db()
+        return self.bob.profile.email_enabled
+
+    def test_delivered(self):
+        response = self.receipt('email.delivered')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, EmailDelivery.Status.DELIVERED)
+        self.assertIsNotNone(self.row.delivered_at)
+
+    def test_a_permanent_bounce_switches_the_account_off(self):
+        self.receipt('email.bounced', bounce={'type': 'Permanent', 'subType': 'General',
+                                               'message': 'mailbox unavailable'})
+
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, EmailDelivery.Status.BOUNCED)
+        self.assertEqual(self.row.reason, 'bounced: Permanent General mailbox unavailable')
+        self.assertFalse(self.email_switch())
+
+    def test_a_temporary_bounce_changes_only_the_row(self):
+        self.receipt('email.bounced', bounce={'type': 'Temporary', 'subType': 'MailboxFull'})
+
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, EmailDelivery.Status.BOUNCED)
+        self.assertTrue(self.email_switch())
+
+    def test_a_complaint_switches_the_account_off_and_the_next_message_skips_them(self):
+        self.receipt('email.complained')
+
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, EmailDelivery.Status.COMPLAINED)
+        self.assertFalse(self.email_switch())
+
+        # The switch is the same one Settings > Notifications shows, and the
+        # fan-out reads it - so nothing more reaches them until they turn it on.
+        _, skipped = outbound.recipients_for(
+            create_message(self.group, self.alice, text='Anyone?')
+        )
+        self.assertEqual(dict((r.pk, why) for r, why in skipped)[self.bob_row.pk],
+                         'email disabled account-wide')
+
+    def test_a_suppressed_send_is_a_permanent_failure(self):
+        self.receipt('email.suppressed',
+                     suppressed={'type': 'OnAccountSuppressionList', 'message': 'on the list'})
+
+        self.row.refresh_from_db()
+        self.assertEqual((self.row.status, self.row.reason),
+                         ('failed', 'suppressed by the provider'))
+        self.assertIn(self.row.reason, maintenance.PERMANENT_REASONS)
+
+    def test_a_late_failure_is_left_for_the_retry_sweep(self):
+        self.receipt('email.failed', failed={'reason': 'reached_daily_quota'})
+
+        self.row.refresh_from_db()
+        self.assertEqual((self.row.status, self.row.reason),
+                         ('failed', 'provider failed: reached_daily_quota'))
+        with capture_sent():
+            self.assertEqual(maintenance.retry_failed_deliveries(), 1)
+
+    def test_a_receipt_for_mail_we_do_not_know_changes_nothing(self):
+        payload = {'type': 'email.bounced',
+                   'data': {'email_id': 'somebody-elses', 'bounce': {'type': 'Permanent'}}}
+        response = self.client.post(
+            self.url, data=json.dumps(payload), content_type='application/json',
+            HTTP_SVIX_ID='evt-x',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, EmailDelivery.Status.SENT)
+        self.assertTrue(self.email_switch())
+
+    def test_the_same_receipt_twice_is_applied_once(self):
+        self.receipt('email.complained', event_id='evt-same')
+        self.bob.profile.email_enabled = True
+        self.bob.profile.save(update_fields=['email_enabled'])
+
+        response = self.receipt('email.complained', event_id='evt-same')
+
+        self.assertEqual(response.json().get('duplicate'), True)
+        self.assertTrue(self.email_switch())
+
+    def test_bounced_and_complained_rows_are_never_retried(self):
+        self.receipt('email.bounced', bounce={'type': 'Permanent'})
+        with capture_sent() as sent:
+            self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+        self.assertEqual(sent, [])

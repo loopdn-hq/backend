@@ -21,6 +21,11 @@ Resend's inbound event says who wrote to whom and nothing else - no body, no
 headers. The content is a second call, made here and only once the address has
 passed the one check that needs no network: that it is a reply address we
 issued. Everything that knows the provider's shape is in `mail/provider.py`.
+
+The same endpoint receives the RECEIPTS for mail we sent - delivered, bounced,
+marked as spam - which `mail/receipts.py` writes into the delivery log. One
+route, because the provider offers one webhook; two modules, because posting a
+reply and updating a log row have nothing in common but the signature.
 """
 import json
 import logging
@@ -33,7 +38,7 @@ from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from mail import inbound, provider, signature
+from mail import inbound, provider, receipts, signature
 from mail.models import EmailWebhookEvent
 from mail.outbound import record_inbound
 from mail.tokens import participant_id_from
@@ -110,11 +115,19 @@ class InboundEmailWebhook(APIView):
         return Response({'ok': True}, status=status.HTTP_200_OK)
 
     def _handle(self, payload):
-        email_id, to_address, from_address = provider.event_summary(payload)
-        if not email_id or not to_address:
+        event = provider.parse_event(payload)
+        if not event.kind:
+            return
+        if event.kind == provider.INBOUND:
+            self._reply(event)
+        else:
+            receipts.record(event)
+
+    def _reply(self, event):
+        if not event.email_id or not event.to_address:
             return
 
-        if participant_id_from(to_address) is None:
+        if participant_id_from(event.to_address) is None:
             # Not an address we issued - mail to a guessed or mistyped name on
             # the reply domain. Decided from the signature inside the address,
             # before the fetch, so junk sent at the domain costs no API call.
@@ -123,13 +136,15 @@ class InboundEmailWebhook(APIView):
         # A network call inside the request, on purpose. If it fails the
         # exception reaches `post`, which frees the claim and answers 500, and
         # the provider brings the same event back under the same id.
-        received = provider.fetch_received(email_id)
+        received = provider.fetch_received(event.email_id)
+        from_address = received.from_address or event.from_address
 
         result = inbound.handle_inbound(
-            to_address,
-            received.from_address or from_address,
+            event.to_address,
+            from_address,
             received.body,
             headers=received.headers,
+            subject=received.subject,
         )
         if result.participant is None:
             # Nothing to log against. A row keyed to no membership would be a
@@ -140,7 +155,7 @@ class InboundEmailWebhook(APIView):
             result.participant.conversation,
             result.participant,
             result.message,
-            received.from_address or from_address,
+            from_address,
             provider='resend',
         )
 

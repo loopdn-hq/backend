@@ -1,16 +1,22 @@
-"""What Resend hands us when somebody replies, and how we get the rest of it.
+"""What Resend posts to us, and how we get the rest of it.
 
-THE ONLY RESEND-SHAPED INBOUND CODE
------------------------------------
-Two shapes, and this module is the only place that knows either:
+THE ONLY RESEND-SHAPED CODE ON THE WEBHOOK SIDE
+-----------------------------------------------
+Three shapes, and this module is the only place that knows any of them:
 
-    the event      `email.received`, posted to mail/webhooks.py. Metadata
-                   only - an email_id, who it was from, who it was to, the
-                   subject. In Resend's own words: "Webhooks do not include the
-                   email body, headers, or attachments, only their metadata."
-    the content    GET /emails/receiving/{email_id}, which returns the text,
-                   the html and the headers - and the headers are where the
-                   SPF/DKIM/DMARC verdict lives, see mail/authentication.py.
+    an inbound event   `email.received`, posted to mail/webhooks.py. Metadata
+                       only - an email_id, who it was from, who it was to, the
+                       subject. In Resend's own words: "Webhooks do not include
+                       the email body, headers, or attachments, only their
+                       metadata."
+    its content        GET /emails/receiving/{email_id}, which returns the
+                       text, the html and the headers - and the headers are
+                       where the SPF/DKIM/DMARC verdict lives, see
+                       mail/authentication.py.
+    a receipt          `email.delivered`, `.bounced`, `.complained`, `.failed`,
+                       `.suppressed` - what happened to mail WE sent, keyed on
+                       the id the send API returned. Acted on by
+                       mail/receipts.py.
 
 `mail/webhooks.py` used to read `data.text` off the event. Resend never sends
 it, so that path would have dropped every real reply as empty and said nothing.
@@ -28,10 +34,43 @@ from django.conf import settings
 
 from utils.mail import RESEND_API_ROOT, fetch_json
 
-#: The event types that mean "somebody wrote to us". Everything else the
-#: provider can post - receipts, bounces, complaints - the webhook answers 200
+#: The kinds of event we act on, in our own words. Everything else the
+#: provider can post - opened, clicked, scheduled - the webhook answers 200
 #: and ignores.
-INBOUND_EVENT_TYPES = frozenset({'email.received'})
+INBOUND = 'inbound'
+DELIVERED = 'delivered'
+BOUNCED = 'bounced'
+COMPLAINED = 'complained'
+FAILED = 'failed'
+SUPPRESSED = 'suppressed'
+
+_EVENT_KINDS = {
+    'email.received': INBOUND,
+    'email.delivered': DELIVERED,
+    'email.bounced': BOUNCED,
+    'email.complained': COMPLAINED,
+    'email.failed': FAILED,
+    'email.suppressed': SUPPRESSED,
+}
+
+
+@dataclass(frozen=True)
+class ProviderEvent:
+    """One webhook event, reduced to what the rest of the app needs.
+
+    `kind` is one of the constants above, or '' for an event that means
+    nothing to us. `email_id` is the inbound email to fetch for INBOUND, and
+    the id our own send was given for everything else. `detail` and
+    `permanent` carry the provider's explanation of a bounce or failure for
+    the delivery log; nothing here interprets them.
+    """
+
+    kind: str
+    email_id: str
+    to_address: str = ''
+    from_address: str = ''
+    detail: str = ''
+    permanent: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +80,7 @@ class ReceivedEmail:
     email_id: str
     from_address: str
     to_address: str
+    subject: str = ''
     text: str = ''
     html: str = ''
     headers: dict = field(default_factory=dict)
@@ -57,19 +97,46 @@ class ReceivedEmail:
         return _strip_html(self.html) if self.html else ''
 
 
-def event_summary(payload):
-    """(email_id, to, from) out of one webhook event.
-
-    An empty email_id for anything that is not an inbound message - a delivery
-    receipt, a bounce, an event type added after this was written - which the
-    webhook treats as nothing to do.
-    """
-    if (payload.get('type') or '') not in INBOUND_EVENT_TYPES:
-        return '', '', ''
-
+def parse_event(payload):
+    """One webhook payload -> a ProviderEvent. Never raises on shape."""
+    kind = _EVENT_KINDS.get(payload.get('type') or '', '')
     data = payload.get('data') or {}
-    email_id = str(data.get('email_id') or data.get('id') or '').strip()
-    return email_id, _our_address(data), _first(data.get('from'))
+    if not isinstance(data, dict):
+        data = {}
+
+    if not kind:
+        return ProviderEvent(kind='', email_id='')
+
+    detail, permanent = '', False
+    if kind == BOUNCED:
+        bounce = data.get('bounce') or {}
+        kind_of = str(bounce.get('type') or '').strip()
+        permanent = kind_of.lower() == 'permanent'
+        detail = ' '.join(
+            part for part in (
+                kind_of, str(bounce.get('subType') or '').strip(),
+                str(bounce.get('message') or '').strip(),
+            ) if part
+        )
+    elif kind == FAILED:
+        detail = str((data.get('failed') or {}).get('reason') or '').strip()
+    elif kind == SUPPRESSED:
+        suppressed = data.get('suppressed') or {}
+        detail = ' '.join(
+            part for part in (
+                str(suppressed.get('type') or '').strip(),
+                str(suppressed.get('message') or '').strip(),
+            ) if part
+        )
+
+    return ProviderEvent(
+        kind=kind,
+        email_id=str(data.get('email_id') or data.get('id') or '').strip(),
+        to_address=_our_address(data),
+        from_address=_first(data.get('from')),
+        detail=detail,
+        permanent=permanent,
+    )
 
 
 def fetch_received(email_id):
@@ -83,6 +150,7 @@ def fetch_received(email_id):
         email_id=email_id,
         from_address=_first(data.get('from')),
         to_address=_our_address(data),
+        subject=str(data.get('subject') or ''),
         text=str(data.get('text') or ''),
         html=str(data.get('html') or ''),
         headers=_lower_keys(data.get('headers') or {}),

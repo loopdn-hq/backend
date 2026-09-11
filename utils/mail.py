@@ -73,7 +73,18 @@ class EmailError(Exception):
     has to stay usable from a management command or a Celery task, not just
     from a view. loopd/exceptions.py turns it into a 503, exactly as it does
     for SmsError.
+
+    `permanent` says whether trying again could help. A 401, 403 or 422 means a
+    key, a sending domain or the payload is wrong and will stay wrong until
+    somebody changes it; a 429, a 5xx or no answer at all means the service
+    was not there, and a later attempt may find it. The delivery log records
+    which, so the retry sweep does not spend an hour re-sending a message the
+    provider has already refused on principle.
     """
+
+    def __init__(self, message, *, permanent=False):
+        super().__init__(message)
+        self.permanent = permanent
 
 
 @dataclass(frozen=True)
@@ -341,12 +352,12 @@ def _request(method, url, *, failure_message, payload=None, idempotency_key=None
         detail = exc.read().decode(errors='replace')[:500]
         if exc.code in _TRANSIENT_STATUSES:
             logger.warning('Resend returned %s for %s: %s', exc.code, url, detail)
-        else:
-            # 401, 403, 422: a key, a sending domain or a payload is wrong, and
-            # it will stay wrong until somebody changes it. Logged loudly
-            # because retrying cannot fix it.
-            logger.error('Resend rejected %s with %s: %s', url, exc.code, detail)
-        raise EmailError(failure_message)
+            raise EmailError(failure_message)
+        # 401, 403, 422: a key, a sending domain or a payload is wrong, and it
+        # will stay wrong until somebody changes it. Logged loudly because
+        # retrying cannot fix it - and marked so the retry sweep knows too.
+        logger.error('Resend rejected %s with %s: %s', url, exc.code, detail)
+        raise EmailError(failure_message, permanent=True)
     except Exception as exc:
         # Timeout, DNS, TLS - anything meaning the request never landed.
         logger.error('Resend unreachable at %s: %s', url, exc)

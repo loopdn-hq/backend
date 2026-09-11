@@ -134,14 +134,13 @@ def still_eligible(participant, message):
     the block, which is worse than no check at all because it looks like one.
     Asked again at every send, because "did we check?" should never be
     answerable by reading how a function was called.
-    """
-    if participant is None:
-        return 'the membership is gone'
 
-    return (
-        delivery.refusal_reason(participant, ChannelConsent.Channel.SMS)
-        or delivery.sender_block_reason(participant, message)
-        or _address_reason(participant)
+    The composition itself lives in `chat/delivery.py:retry_refusal`, shared
+    with email, so the two channels cannot come to re-decide a retry
+    differently. Only the address question here is SMS's own.
+    """
+    return delivery.retry_refusal(
+        participant, message, ChannelConsent.Channel.SMS, _address_reason
     )
 
 

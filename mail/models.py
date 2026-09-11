@@ -66,6 +66,12 @@ class EmailDelivery(models.Model):
         # Deliberately not sent: muted, declined, no verified address, the
         # group is too large. Recorded rather than dropped - see the docstring.
         SKIPPED = 'skipped', 'Skipped'
+        # What the provider told us afterwards, via mail/receipts.py. Neither
+        # is FAILED, and that is not pedantry: the retry sweep reads FAILED
+        # rows, and re-sending to an address that bounced or to a person who
+        # marked us as spam is the one thing it must never do.
+        BOUNCED = 'bounced', 'Bounced'
+        COMPLAINED = 'complained', 'Marked as spam'
 
     direction = models.CharField(max_length=8, choices=Direction.choices)
     conversation = models.ForeignKey(
@@ -102,7 +108,7 @@ class EmailDelivery(models.Model):
     )
 
     status = models.CharField(
-        max_length=9,
+        max_length=10,
         choices=Status.choices,
         default=Status.QUEUED,
         db_default=Status.QUEUED,
