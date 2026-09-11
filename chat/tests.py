@@ -4056,10 +4056,10 @@ import chat.models as chat_models
 class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
     """A block stops direct contact and touches nothing else.
 
-    The narrowness is the feature. Suppressing what a blocked person's GROUP
-    messages trigger externally is a separate, deliberate, not-yet-built half -
-    so these hold the line in both directions: direct contact really stops, and
-    a shared group really does not change.
+    Two halves, and the line between them is the feature. Direct contact really
+    stops. A shared group really does not change - both stay members, both keep
+    seeing each other's messages - and what stops there is only the external
+    notification, which `BlockedGroupDeliveryTests` holds.
     """
 
     def setUp(self):
@@ -4426,8 +4426,9 @@ class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
     # --- and the group is untouched -----------------------------------------
 
     def test_a_shared_group_is_not_changed_at_all(self):
-        # The half that is deliberately NOT built. Both stay members, both
-        # still see each other, and the fan-out does not know blocks exist.
+        # Both stay members and both still see each other. A block suppresses
+        # the notification, never the membership - that distinction is the
+        # whole shape of the feature.
         group = Conversation.start_group(self.alice, name='Family')
         group.add_participant(self.bob)
 
@@ -4449,10 +4450,10 @@ class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
         self.assertIsNotNone(message.pk)
         self.assertEqual(group.messages.count(), 1)
 
-    def test_and_the_delivery_ladder_still_says_yes(self):
-        # Explicit: the external-suppression half is not built, and this test
-        # will FAIL the day somebody builds it - which is the right way to be
-        # told that the scope changed.
+    def test_the_ladder_itself_still_says_yes(self):
+        # The membership half is untouched, and has to stay untouched: a block
+        # is not a membership change. The pair question is asked NEXT to this
+        # ladder, not inside it - which is why this still returns None.
         from chat import delivery
 
         group = Conversation.start_group(self.alice, name='Family')
@@ -4462,6 +4463,27 @@ class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
 
         self.assertIsNone(
             delivery.refusal_reason(alice_row, ChannelConsent.Channel.SMS)
+        )
+
+    def test_but_the_audience_does_not(self):
+        # The half that used to be missing. Bob posts; Alice blocked him; the
+        # message is stored and visible, and only the notification stops.
+        from chat import delivery
+
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        alice_row = Participant.objects.get(conversation=group, user=self.alice)
+        self.block(self.alice, 'bob')
+
+        message = create_message(group, self.bob, text='Dinner at 7')
+        send_to, skipped = delivery.eligible_for(
+            message, ChannelConsent.Channel.SMS
+        )
+
+        self.assertEqual(send_to, [])
+        self.assertEqual(
+            dict((row.pk, why) for row, why in skipped)[alice_row.pk],
+            delivery.BLOCKED_REASON,
         )
 
     def test_and_they_still_see_each_other_in_the_member_list(self):
@@ -4479,3 +4501,178 @@ class BlockedDirectContactTests(EnvelopeAssertions, APITestCase):
             (r['user'] or {}).get('username') for r in rows
         ]
         self.assertIn('bob', usernames)
+
+
+class BlockedGroupDeliveryTests(EnvelopeAssertions, APITestCase):
+    """No notification caused by somebody you blocked, inside a shared group.
+
+    §17 gate 4 and §19 step 4 of the blocking spec. The message itself is
+    untouched - it is stored, it is broadcast, and both people still read it in
+    the app. What stops is the text, the email, and later the push and the
+    voice alert.
+
+    This is the half seven of the spec's eleven acceptance rows reduce to, so
+    the rules it holds are the rules mentions, replies, reactions and push will
+    inherit rather than each re-implement.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.carol = make_user('carol', '+639170000003')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        for account in (self.bob, self.carol):
+            self.group.add_participant(account)
+        self.rows = {
+            account.username: Participant.objects.get(
+                conversation=self.group, user=account
+            )
+            for account in (self.alice, self.bob, self.carol)
+        }
+
+    def block(self, blocker, blocked):
+        from user import blocks
+
+        blocks.block(blocker, user=blocked)
+
+    def audience(self, sender, channel=ChannelConsent.Channel.SMS):
+        """Who would be notified about a message from `sender`, and why not."""
+        from chat import delivery
+
+        message = create_message(self.group, sender, text='Dinner at 7')
+        send_to, skipped = delivery.eligible_for(message, channel)
+        return (
+            sorted(row.user.username for row in send_to),
+            dict((row.user.username, why) for row, why in skipped if row.user_id),
+        )
+
+    # --- the rule -----------------------------------------------------------
+
+    def test_a_blocked_senders_message_does_not_notify_the_blocker(self):
+        from chat import delivery
+
+        self.block(self.alice, self.bob)
+
+        send_to, skipped = self.audience(self.bob)
+
+        self.assertNotIn('alice', send_to)
+        self.assertEqual(skipped['alice'], delivery.BLOCKED_REASON)
+
+    def test_and_blocking_one_person_does_not_silence_the_group(self):
+        # §14. A blocked member must not turn off notifications from everybody
+        # else - which is the failure a whole-conversation suppression would
+        # produce, and nothing pinned it before.
+        self.block(self.alice, self.bob)
+
+        send_to, _ = self.audience(self.carol)
+
+        self.assertEqual(send_to, ['alice', 'bob'])
+
+    def test_it_holds_whichever_side_did_the_blocking(self):
+        # §16. One-way would be detectable: Bob would notice his own messages
+        # behaving differently from everybody else's.
+        self.block(self.bob, self.alice)
+
+        send_to, _ = self.audience(self.bob)
+
+        self.assertNotIn('alice', send_to)
+
+    def test_the_blocked_person_is_not_notified_either(self):
+        self.block(self.alice, self.bob)
+
+        send_to, _ = self.audience(self.alice)
+
+        self.assertNotIn('bob', send_to)
+        self.assertIn('carol', send_to)
+
+    def test_everybody_else_is_untouched(self):
+        self.block(self.alice, self.bob)
+
+        send_to, _ = self.audience(self.bob)
+
+        self.assertEqual(send_to, ['carol'])
+
+    def test_it_applies_to_email_as_well_as_sms(self):
+        # Both channels ask the same door, so neither needed its own change.
+        for account in (self.alice, self.bob, self.carol):
+            account.profile.email_verified = True
+            account.profile.save(update_fields=['email_verified'])
+        self.block(self.alice, self.bob)
+
+        send_to, _ = self.audience(self.bob, ChannelConsent.Channel.EMAIL)
+
+        self.assertEqual(send_to, ['carol'])
+
+    # --- a sender with no account, which is §6's own example ----------------
+
+    def test_a_bare_number_can_be_the_sender(self):
+        # `Message.sender` is NULL when somebody with no account texts in, so
+        # a block keyed on an account cannot name them. This is the scenario
+        # §6 uses to illustrate the feature, and the spec's own pseudocode
+        # quietly does nothing for it.
+        from chat import delivery
+        from user import blocks
+
+        mom = self.group.add_phone_participant('+639171230077', 'Mom')
+        membership.set_channel_consent(
+            mom, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
+        )
+        blocks.block(self.alice, phone_number='+639171230077')
+
+        message = create_message(
+            self.group, None, text='Dinner at 7', participant=mom
+        )
+        send_to, skipped = delivery.eligible_for(
+            message, ChannelConsent.Channel.SMS
+        )
+
+        by_name = dict(
+            (row.user.username, why) for row, why in skipped if row.user_id
+        )
+        self.assertEqual(by_name['alice'], delivery.BLOCKED_REASON)
+        self.assertIn('bob', [row.user.username for row in send_to if row.user_id])
+
+    # --- and the message itself is untouched --------------------------------
+
+    def test_the_message_is_still_stored_and_still_readable(self):
+        self.block(self.alice, self.bob)
+
+        create_message(self.group, self.bob, text='Dinner at 7')
+
+        self.assertEqual(self.group.messages.count(), 1)
+        self.client.force_authenticate(self.alice)
+        listed = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-messages', args=[self.group.id])
+            )
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        self.assertEqual([row['text'] for row in rows], ['Dinner at 7'])
+
+    def test_and_both_are_still_members(self):
+        self.block(self.alice, self.bob)
+
+        self.assertEqual(
+            Participant.objects.filter(
+                conversation=self.group, status=Participant.Status.ACTIVE
+            ).count(),
+            3,
+        )
+
+    # --- the cost -----------------------------------------------------------
+
+    def test_the_screen_is_one_query_however_big_the_group(self):
+        # Asked per recipient this is one round trip each - two hundred for a
+        # two-hundred-member group, and two hundred again when email fans out
+        # the same message. There is no other query-count guard in the suite.
+        from chat import delivery
+
+        for n in range(7):
+            self.group.add_participant(make_user(f'extra{n}'))
+        self.block(self.alice, self.bob)
+        message = create_message(self.group, self.bob, text='Dinner at 7')
+
+        # Two for the audience (participants + the consent prefetch), one for
+        # the screen. Not one per member.
+        with self.assertNumQueries(3):
+            delivery.eligible_for(message, ChannelConsent.Channel.SMS)

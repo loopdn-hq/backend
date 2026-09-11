@@ -117,26 +117,30 @@ def _address_reason(participant):
     return None
 
 
-def still_eligible(participant):
+def still_eligible(participant, message):
     """Why this member must not be texted RIGHT NOW, or None if they may be.
 
-    Both halves of the decision - the shared membership ladder and SMS's own
-    address question - which together are exactly what `recipients_for` asks
-    for a fresh fan-out.
+    All three parts of the decision - the shared membership ladder, whether the
+    sender is somebody they have blocked, and SMS's own address question -
+    which together are exactly what `recipients_for` asks for a fresh fan-out.
 
     It exists as its own function because the fan-out is not the only thing
     that sends: `retry_delivery` picks a row up minutes or hours later, and the
     world moves in between. A decision taken at fan-out time is not still true
-    when the retry runs.
+    when the retry runs - somebody can block the sender inside that window.
 
-    Named without a leading underscore, and asked again at every send, because
-    "did we check?" should never be answerable by reading how a function was
-    called.
+    `message` is REQUIRED rather than defaulted, and that is the point. A
+    default would let a caller omit it and get a check that silently skipped
+    the block, which is worse than no check at all because it looks like one.
+    Asked again at every send, because "did we check?" should never be
+    answerable by reading how a function was called.
     """
     if participant is None:
         return 'the membership is gone'
+
     return (
         delivery.refusal_reason(participant, ChannelConsent.Channel.SMS)
+        or delivery.sender_block_reason(participant, message)
         or _address_reason(participant)
     )
 
@@ -716,7 +720,12 @@ def retry_delivery(delivery):
         .first()
     )
 
-    refusal = still_eligible(participant)
+    # Read BEFORE the check rather than after, because the check needs it: the
+    # message is who sent it, and whether the recipient has blocked them since
+    # is one of the things that can have changed in the retry window.
+    message = delivery.message
+
+    refusal = still_eligible(participant, message)
     if refusal is not None:
         delivery.status = SmsDelivery.Status.SKIPPED
         delivery.reason = refusal
@@ -738,7 +747,7 @@ def retry_delivery(delivery):
         delivery.save(update_fields=['status', 'reason', 'updated_at'])
         return False
 
-    body = format_message(conversation, delivery.message) if delivery.message else None
+    body = format_message(conversation, message) if message else None
     if body is None:
         delivery.status = SmsDelivery.Status.FAILED
         delivery.reason = 'the message is gone'

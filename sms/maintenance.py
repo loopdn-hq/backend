@@ -67,7 +67,15 @@ def retry_failed_deliveries():
             created_at__gte=cutoff,
         )
         .exclude(reason__in=PERMANENT_REASONS)
-        .select_related('conversation', 'participant__user__profile')[:200]
+        # `message__sender_participant` is not decoration: retry_delivery reads
+        # the message to rebuild the body AND to ask whether the recipient has
+        # blocked its sender since. Without it that is two lazy queries per row,
+        # up to four hundred a sweep.
+        .select_related(
+            'conversation',
+            'participant__user__profile',
+            'message__sender_participant',
+        )[:200]
     )
 
     retried = 0

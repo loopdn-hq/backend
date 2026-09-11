@@ -23,6 +23,11 @@ way the rules were written down:
     no consent                 ->  deny, they have not agreed to it
     archived                   ->  DELIVER
 
+One question is asked NEXT TO this ladder rather than inside it: whether the
+recipient and the SENDER have blocked each other. That one is about a pair
+rather than about a person, so it lives in `_block_reason` and is applied by
+`eligible_for` - see the note there.
+
 Archive is the one that has to be stated rather than assumed. It hides a
 conversation from a list; it is not a request for silence. Muting is how
 somebody asks for that, and a member who tidied a group away still expects the
@@ -92,14 +97,94 @@ def eligible_for(message, channel):
         .prefetch_related('channel_consents')
     )
 
+    # One query for the whole audience, before the loop. See screen_for_message.
+    screen = screen_for_message(message)
+
     send_to, skipped = [], []
     for row in rows:
-        reason = refusal_reason(row, channel)
+        reason = refusal_reason(row, channel) or _block_reason(row, screen)
         if reason is None:
             send_to.append(row)
         else:
             skipped.append((row, reason))
     return send_to, skipped
+
+
+#: What the delivery log records when a block is why nothing was sent. Precise
+#: rather than vague because these tables are staff-only - they appear in no
+#: serializer, no viewset and no URL, only the admin - and "why did I not get
+#: that" is the question the log exists to answer.
+BLOCKED_REASON = 'blocked between sender and recipient'
+
+
+def screen_for_message(message):
+    """The accounts that must not be told about THIS message's sender.
+
+    The only place that knows how a sender is shaped, which is two ways:
+
+        an account      `message.sender`
+        a bare number   `message.sender_participant.phone_number`, for somebody
+                        with no account who texted or emailed in - `sender` is
+                        NULL for them, and they are most of the members of most
+                        groups
+
+    Built once per message and read per recipient, so a fan-out stays two
+    queries plus one however large the group is.
+    """
+    from user.blocks import screen_for_sender
+
+    participant = message.sender_participant
+    number = (
+        participant.phone_number
+        if participant is not None and participant.user_id is None
+        else None
+    )
+    return screen_for_sender(user_id=message.sender_id, phone_number=number)
+
+
+def sender_block_reason(participant, message):
+    """Whether this ONE recipient is screened from this ONE message's sender.
+
+    The single-recipient door, for a caller holding one of each and no audience
+    to amortise a screen over - `sms/outbound.py:still_eligible`, which re-asks
+    the whole decision when a failed text is retried hours later.
+
+    A fan-out must NOT use this: it would build a screen per recipient and turn
+    two queries into two hundred. `eligible_for` builds one screen and reads it
+    per row instead.
+    """
+    if participant is None or message is None:
+        return None
+    return _block_reason(participant, screen_for_message(message))
+
+
+def _block_reason(participant, screen):
+    """Whether this recipient is screened from that sender.
+
+    WHY THIS IS NOT A RUNG IN `refusal_reason`. Every rung up there is a fact
+    about the row in front of it - their status, their mute, their consent. A
+    block is a fact about a PAIR, and the function's own docstring promises it
+    "answers only the membership question". Smuggling a second person in
+    through a keyword argument would make that promise false and would let a
+    caller forget to pass one, which is the same thing as not checking.
+
+    So it lives here, one line below the `.exclude(sender)` in `eligible_for`
+    that already subtracts somebody from an audience for a relational reason.
+
+    ON ORDER: S19 of the blocking spec puts this at step 4, above channel and
+    consent, and it is asked after them instead. The outcome is identical -
+    both refuse - and only the reason written to the delivery log differs. That
+    is the better way round anyway: a member who muted the group AND blocked
+    the sender is logged as muted, which is the fact they chose, and the log
+    stays quieter about who has blocked whom.
+
+    A phone-only recipient is never screened: `UserBlock.blocker` is a
+    non-nullable FK to User, so somebody with no account cannot have blocked
+    anybody.
+    """
+    if not screen or participant.user_id is None:
+        return None
+    return BLOCKED_REASON if participant.user_id in screen else None
 
 
 def consent_for(participant, channel):

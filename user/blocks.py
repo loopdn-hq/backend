@@ -19,10 +19,11 @@ person as soon as that number is verified against that account - see
 `link_number_to_account`, which is what stops signing up being a way round one.
 
 Nothing about a group the two people already share changes: both stay members,
-both keep seeing each other's messages, and both stay in the member list. The
-spec asks for external notifications caused by a blocked member to be
-suppressed inside shared groups too - that half is deliberately not built yet,
-so `chat/delivery.py` is untouched and the fan-out does not know blocks exist.
+both keep seeing each other's messages in the app, and both stay in the member
+list. What DOES stop inside a shared group is the external notification - a
+text, an email, later a push or a voice alert - caused by somebody they
+blocked. The message is still there to read; it just does not come and find
+them. `screen_for_sender` below is how the fan-out asks.
 
 READ SYMMETRIC, WRITE ONE-SIDED
 -------------------------------
@@ -193,6 +194,63 @@ def link_number_to_account(user):
             moved, user.pk,
         )
     return moved
+
+
+def screen_for_sender(*, user_id=None, phone_number=None):
+    """Every account that must NOT be told about this sender. One query.
+
+    The bulk form of `blocks_between`, for the delivery path. A fan-out asks
+    this question once for a whole group rather than once per member: asked
+    per recipient it is one round trip each, which for a two-hundred-member
+    group is two hundred - and then two hundred again when the email channel
+    fans out the same message.
+
+    Returns a frozenset of account ids, so the caller matches it against the
+    `user_id` it has already loaded. Empty when the sender has neither
+    identity, which is a system message - nobody caused it, so nobody is
+    screened from it.
+
+    THREE WAYS SOMEBODY LANDS IN THE SET, and the asymmetry is not an oversight:
+
+        sender is an account   they blocked the recipient, OR the recipient
+                               blocked them - symmetric, per S16, because a
+                               block that worked one way would be detectable
+        sender is a number     only "the recipient blocked that number", since
+                               `blocker` is a non-nullable FK to User and
+                               somebody with no account cannot have blocked
+                               anyone
+
+    The second case is not a corner. `Message.sender` is NULL whenever somebody
+    with no account texts into a group, which is the scenario S6 of the
+    blocking spec uses to ILLUSTRATE the feature - and the spec's own
+    pseudocode (`if sender and ...`) quietly does nothing there.
+    """
+    condition = Q()
+    matched = False
+
+    if user_id is not None:
+        condition |= Q(blocker_id=user_id) | Q(blocked_user_id=user_id)
+        matched = True
+
+    number = _normalised(phone_number)
+    if number is not None:
+        condition |= Q(blocked_phone_number=number)
+        matched = True
+
+    if not matched:
+        return frozenset()
+
+    rows = UserBlock.objects.filter(condition).values_list(
+        'blocker_id', 'blocked_user_id'
+    )
+
+    screened = set()
+    for blocker_id, blocked_id in rows:
+        screened.add(blocker_id)
+        if blocked_id is not None:
+            screened.add(blocked_id)
+    screened.discard(user_id)
+    return frozenset(screened)
 
 
 def blocked_user_ids(viewer):

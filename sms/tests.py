@@ -2303,6 +2303,37 @@ class MaintenanceTests(TransactionTestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, SmsDelivery.Status.SENT)
 
+    def test_a_retry_is_dropped_if_they_blocked_the_sender_meanwhile(self):
+        # The retry window is up to six hours, and a block can happen inside
+        # it. A rule living only in the fan-out would be bypassed here - which
+        # is exactly the defect the STOP-after-failure fix closed, in the same
+        # function, for a different reason.
+        from chat import delivery
+        from user import blocks
+
+        bob = User.objects.create_user(username='bob', password='x')
+        bob.profile.phone_number = '+639172220002'
+        bob.profile.phone_no_verified = True
+        bob.profile.save()
+        self.group.add_participant(bob)
+        bob_row = Participant.objects.get(conversation=self.group, user=bob)
+
+        message = create_message(
+            conversation=self.group, sender=self.alice, text='Dinner at 7',
+            participant=self.sender,
+        )
+        row = SmsDelivery.objects.get(message=message, participant=bob_row)
+        row.status, row.reason = SmsDelivery.Status.FAILED, 'carrier hiccup'
+        row.save(update_fields=['status', 'reason'])
+
+        blocks.block(bob, user=self.alice)
+
+        self.assertEqual(maintenance.retry_failed_deliveries(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, SmsDelivery.Status.SKIPPED)
+        self.assertEqual(row.reason, delivery.BLOCKED_REASON)
+
     def test_an_old_failure_is_left_alone(self):
         # Nobody wants yesterday's "dinner at 7".
         row = self.a_failed_delivery()
