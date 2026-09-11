@@ -33,6 +33,18 @@ conversation from a list; it is not a request for silence. Muting is how
 somebody asks for that, and a member who tidied a group away still expects the
 text when somebody posts.
 
+ONLY A GROUP GOES OUT
+---------------------
+Before anybody in a conversation is considered, the conversation itself is.
+`conversation_reason` says whether the outside channels carry it at all, and
+today only a GROUP is carried. Every external channel is shaped for one: the
+email is signed "<group name> via Loopd" and ends with a footer for leaving the
+group, the text goes out from the group's own number. A direct conversation
+has neither a name nor a number, so its email arrived from " via Loopd" and
+invited the reader to leave a group that did not exist - which is how this rule
+was found. Telling somebody about a direct message is its own template and its
+own product decision, not a group message with the name left blank.
+
 CHANNELS REGISTER THEMSELVES
 ----------------------------
 `chat` does not know which channels exist. Each one calls `register_channel`
@@ -42,7 +54,7 @@ foot of this module.
 """
 import logging
 
-from chat.models import ChannelConsent, Participant
+from chat.models import ChannelConsent, Conversation, Participant
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +89,26 @@ def refusal_reason(participant, channel):
     return None
 
 
+def conversation_reason(conversation):
+    """Why NO channel carries this conversation outside the app, or None.
+
+    None for a group. For anything else a reason in the ladder's own idiom,
+    asked before any member is considered because it is a fact about the
+    conversation and not about anybody in it - see ONLY A GROUP GOES OUT in the
+    module docstring.
+
+    Asked in two places, on purpose. `schedule_all` asks so that no work is
+    queued: a busy day of direct messages would otherwise hand a worker one
+    empty fan-out per channel per message. `eligible_for` asks so that a
+    fan-out reached any other way - a task re-run from a shell, a "resend"
+    button written later - still finds nobody. One rule, defined here, applied
+    at the door and again at the desk.
+    """
+    if conversation.kind != Conversation.Kind.GROUP:
+        return f'{conversation.kind} conversations are not delivered externally'
+    return None
+
+
 def eligible_for(message, channel):
     """Split a message's audience into who may be sent it and who may not.
 
@@ -87,6 +119,14 @@ def eligible_for(message, channel):
     The sender is left out: they wrote it, and texting somebody their own
     message reads as an echo and bills for the privilege.
     """
+    if conversation_reason(message.conversation) is not None:
+        # Nobody - and nothing written to the delivery log either. The log
+        # answers for omissions among a group's members, and this is not an
+        # omission: nothing in the product promises a direct message will be
+        # texted or emailed. A row per direct message per channel would bury
+        # the one place that has to stay legible.
+        return [], []
+
     rows = (
         Participant.objects.filter(
             conversation=message.conversation,
@@ -271,6 +311,13 @@ def schedule_all(message):
     must not stop the other channels either, which is why the loop catches per
     channel rather than around the whole thing.
     """
+    reason = conversation_reason(message.conversation)
+    if reason is not None:
+        logger.debug(
+            'Message %s not offered to any channel: %s', message.pk, reason
+        )
+        return
+
     for name, scheduler in list(_channels.items()):
         try:
             scheduler(message)

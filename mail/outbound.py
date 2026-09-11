@@ -19,6 +19,9 @@ number is for SMS, because an unverified address is a string somebody typed and
 mailing it publishes a private group to whoever really owns it.
 
 Each of those is a row in `EmailDelivery` with a reason.
+
+And it will not mail a direct message at all. That is decided once for every
+channel in `chat/delivery.py:conversation_reason`, not here.
 """
 import hashlib
 import logging

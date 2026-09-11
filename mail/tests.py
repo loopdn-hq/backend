@@ -25,7 +25,7 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from chat import membership
+from chat import delivery, membership
 from chat.models import (
     Attachment,
     ChannelConsent,
@@ -863,6 +863,80 @@ class WiredUpTests(TransactionTestCase):
             message = create_message(self.group, self.alice, text='Dinner')
 
         self.assertIsNotNone(message.pk)
+
+
+@override_settings(
+    MAIL_SENDING_ENABLED=True, MAIL_REPLY_DOMAIN=REPLY_DOMAIN
+)
+class DirectMessagesAreNotEmailedTests(TransactionTestCase):
+    """A direct message never leaves the app, on any channel.
+
+    Found live: a direct message fanned out through the GROUP template, signed
+    " via Loopd" with the group name blank and ending in a footer for leaving
+    a group that did not exist. Only `MAIL_SENDING_ENABLED=False` in
+    production kept it in. The rule is `chat/delivery.py:conversation_reason`.
+
+    TransactionTestCase for the reason WiredUpTests is: the first test here is
+    the live reproduction, through create_message and on_commit.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.dm, _ = Conversation.start_direct(self.alice, self.bob)
+
+    def test_a_direct_message_is_not_emailed(self):
+        # Both have verified addresses and are opted in - in a group the same
+        # two people ARE emailed, which WiredUpTests holds.
+        with capture_sent() as sent:
+            create_message(self.dm, self.alice, text='Are you free later?')
+
+        self.assertEqual(sent, [])
+        self.assertFalse(EmailDelivery.objects.exists())
+
+    def test_the_audience_is_empty_on_every_channel(self):
+        message = create_message(self.dm, self.alice, text='hi')
+
+        for channel in ChannelConsent.Channel:
+            with self.subTest(channel=channel):
+                self.assertEqual(
+                    delivery.eligible_for(message, channel), ([], [])
+                )
+
+    def test_a_fan_out_reached_by_hand_still_finds_nobody(self):
+        # Not only the scheduler. The Celery task re-run from a shell, or a
+        # "resend" button written later, goes straight to fan_out.
+        message = create_message(self.dm, self.alice, text='hi')
+
+        with capture_sent() as sent:
+            rows = outbound.fan_out(message)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(sent, [])
+
+    def test_no_channel_is_even_offered_a_direct_message(self):
+        # Through the write path itself: create_message hands every message to
+        # schedule_all, which is where a direct one must stop.
+        offered = []
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+
+        with mock.patch.dict(
+            'chat.delivery._channels', {'probe': offered.append}, clear=True
+        ):
+            create_message(self.dm, self.alice, text='dm')
+            create_message(group, self.alice, text='group')
+
+        self.assertEqual([m.text for m in offered], ['group'])
+
+    def test_the_reason_names_the_kind(self):
+        group = Conversation.start_group(self.alice, name='Family')
+
+        self.assertEqual(
+            delivery.conversation_reason(self.dm),
+            'direct conversations are not delivered externally',
+        )
+        self.assertIsNone(delivery.conversation_reason(group))
 
 
 class ChannelConsentDefaultTests(TestCase):
