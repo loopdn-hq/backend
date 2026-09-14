@@ -21,6 +21,7 @@ from chat.services import (
     announce_added_to_conversation,
     broadcast_conversation_updated,
     create_message,
+    subscribe_to_conversation,
 )
 from user.blocks import has_blocked
 from user.lookups import find_user
@@ -1058,11 +1059,13 @@ class DirectConversationSerializer(serializers.Serializer):
         raise serializers.ValidationError(self.NOT_FOUND)
 
     def create(self, validated_data):
-        conversation, created = Conversation.start_direct(
-            self.context['request'].user, self.other
-        )
+        starter = self.context['request'].user
+        conversation, created = Conversation.start_direct(starter, self.other)
         if created:
             announce_added_to_conversation(conversation, [self.other])
+            # Not told they were added - they started it - but their socket
+            # must still join, or the reply never reaches them live.
+            subscribe_to_conversation(conversation, [starter])
         return conversation
 
 
@@ -1178,6 +1181,9 @@ class GroupCreateSerializer(serializers.Serializer):
             conversation.add_participant(user)
         if members:
             announce_added_to_conversation(conversation, members)
+
+        # The creator's own socket, which nothing else puts in the group.
+        subscribe_to_conversation(conversation, [creator])
 
         return conversation
 
