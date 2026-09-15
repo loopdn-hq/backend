@@ -27,6 +27,7 @@ import logging
 import stripe
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.renderers import JSONRenderer
@@ -35,6 +36,7 @@ from rest_framework.views import APIView
 
 from billing import services
 from billing.models import CreditPackage, Plan, StripeWebhookEvent, Subscription
+from utils.mail import EmailError, send_templated_email
 
 logger = logging.getLogger(__name__)
 
@@ -494,6 +496,11 @@ class StripeWebhook(APIView):
             # conversion as the top-level event, for the same reason.
             stripe_subscription = stripe.Subscription.retrieve(session['subscription']).to_dict()
             self._sync_subscription(user, stripe_subscription)
+            self._send_checkout_success_email(
+                user=user,
+                session=session,
+                stripe_subscription=stripe_subscription,
+            )
         elif session.get('mode') == 'payment':
             package_id = (session.get('metadata') or {}).get('credit_package_id')
             if not package_id:
@@ -513,6 +520,112 @@ class StripeWebhook(APIView):
                 description=f'Purchased {package.name}',
                 stripe_payment_intent_id=session.get('payment_intent') or '',
             )
+            self._send_checkout_success_email(
+                user=user,
+                session=session,
+                package=package,
+            )
+
+    def _send_checkout_success_email(self, *, user, session, stripe_subscription=None, package=None):
+        if not user.email:
+            return
+
+        invoice = self._invoice_summary_for_checkout(session)
+        amount_cents = invoice.get('amount_cents')
+        currency = invoice.get('currency') or str(session.get('currency') or 'usd').lower()
+
+        if amount_cents is None:
+            amount_cents = self._coerce_int(session.get('amount_total'))
+
+        if stripe_subscription is not None:
+            plan_name = self._plan_name_for_subscription(stripe_subscription) or 'Plan subscription'
+            billing_kind = 'plan subscription'
+            item_name = plan_name
+        else:
+            billing_kind = 'credit top-up'
+            item_name = package.name if package is not None else 'Credit package'
+
+        purchased_at = timezone.now().strftime('%Y-%m-%d %H:%M %Z')
+        amount_display = self._format_money(amount_cents, currency)
+        invoice_reference = invoice.get('reference') or (session.get('id') or 'checkout session')
+
+        try:
+            send_templated_email(
+                'billing_checkout_success',
+                to=user.email,
+                context={
+                    'billing_kind': billing_kind,
+                    'item_name': item_name,
+                    'amount_display': amount_display,
+                    'currency': currency,
+                    'invoice_reference': invoice_reference,
+                    'invoice_url': invoice.get('url') or '',
+                    'purchased_at': purchased_at,
+                },
+                idempotency_key=f'billing-checkout-{session.get("id")}',
+            )
+        except EmailError:
+            # Billing state is already committed; email failure should not ask
+            # Stripe to retry and risk duplicate wallet/subscription effects.
+            logger.exception('Checkout completed for user %s but receipt email failed', user.pk)
+
+    def _invoice_summary_for_checkout(self, session):
+        invoice_id = session.get('invoice')
+        if invoice_id:
+            try:
+                invoice = self._to_dict(stripe.Invoice.retrieve(invoice_id))
+                return {
+                    'reference': str(invoice.get('number') or invoice.get('id') or invoice_id),
+                    'url': str(invoice.get('hosted_invoice_url') or invoice.get('invoice_pdf') or ''),
+                    'amount_cents': self._coerce_int(invoice.get('amount_paid') or invoice.get('total')),
+                    'currency': str(invoice.get('currency') or '').lower(),
+                }
+            except stripe.StripeError:
+                logger.exception('Failed retrieving Stripe invoice %s', invoice_id)
+
+        payment_intent_id = session.get('payment_intent')
+        if payment_intent_id:
+            try:
+                payment_intent = self._to_dict(
+                    stripe.PaymentIntent.retrieve(payment_intent_id, expand=['latest_charge'])
+                )
+                latest_charge = payment_intent.get('latest_charge') or {}
+                if not isinstance(latest_charge, dict):
+                    latest_charge = self._to_dict(latest_charge) or {}
+
+                return {
+                    'reference': str(payment_intent.get('id') or payment_intent_id),
+                    'url': str(latest_charge.get('receipt_url') or ''),
+                    'amount_cents': self._coerce_int(
+                        payment_intent.get('amount_received') or payment_intent.get('amount')
+                    ),
+                    'currency': str(payment_intent.get('currency') or '').lower(),
+                }
+            except stripe.StripeError:
+                logger.exception('Failed retrieving Stripe payment intent %s', payment_intent_id)
+
+        return {
+            'reference': str(session.get('id') or ''),
+            'url': '',
+            'amount_cents': self._coerce_int(session.get('amount_total')),
+            'currency': str(session.get('currency') or '').lower(),
+        }
+
+    def _plan_name_for_subscription(self, stripe_subscription):
+        try:
+            price_id = stripe_subscription['items']['data'][0]['price']['id']
+        except (KeyError, IndexError, TypeError):
+            return None
+
+        plan = Plan.objects.filter(stripe_price_id=price_id).first()
+        return plan.name if plan else None
+
+    def _format_money(self, amount_cents, currency):
+        if amount_cents is None:
+            return 'Amount unavailable'
+
+        normalized_currency = str(currency or 'usd').upper()
+        return f'${amount_cents / 100:.2f} {normalized_currency}'
 
     def _handle_subscription_updated(self, stripe_subscription):
         user = self._user_for(customer_id=stripe_subscription.get('customer'))
