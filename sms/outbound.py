@@ -447,13 +447,10 @@ def _dispatch(message_id):
 
 
 def _worker_available():
-    """Whether there is a broker to hand work to.
+    """Whether there is a broker to hand work to. One definition, in loopd/celery.py."""
+    from loopd.celery import worker_available
 
-    Keyed on configuration rather than on liveness: asking the broker whether it
-    is up costs a round trip on every message, and the fallback handles the case
-    where the answer would have been no.
-    """
-    return bool(getattr(settings, 'CELERY_BROKER_URL', '') and settings.REDIS_URL)
+    return worker_available()
 
 
 def reply_allowed(number):

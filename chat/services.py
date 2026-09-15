@@ -168,6 +168,12 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     # happen inside the transaction still holding this row - see
     # sms/outbound.py:schedule.
     _schedule_delivery(message)
+
+    # A card for the first link, worked out after the commit and pushed to
+    # everyone as an update - see chat/link_previews.py.
+    from chat.link_previews import schedule_link_preview
+
+    schedule_link_preview(message)
     return message
 
 

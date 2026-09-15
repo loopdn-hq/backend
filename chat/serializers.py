@@ -99,6 +99,7 @@ class MessageSerializer(serializers.ModelSerializer):
     reply_to = serializers.SerializerMethodField()
     reactions = serializers.SerializerMethodField()
     forwarded = serializers.SerializerMethodField()
+    link_preview = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
@@ -123,6 +124,7 @@ class MessageSerializer(serializers.ModelSerializer):
             'reactions',
             # A bare flag, never who it came from. See create_message.
             'forwarded',
+            'link_preview',
             # Null until somebody edits it, so "edited" is exactly
             # `edited_at is not None`. `updated_at` cannot answer this: it is
             # auto_now on a row nothing re-saves, so it equals created_at
@@ -142,6 +144,11 @@ class MessageSerializer(serializers.ModelSerializer):
         return AttachmentSerializer(
             obj.attachments.all(), many=True, context=self.context
         ).data
+
+    def get_link_preview(self, obj):
+        # Withheld with the text: a deleted message's link is part of what was
+        # deleted.
+        return None if obj.is_deleted else obj.link_preview
 
     def get_forwarded(self, obj):
         return obj.forwarded_from_id is not None

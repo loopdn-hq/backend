@@ -967,6 +967,12 @@ class Message(models.Model):
         blank=True,
     )
 
+    # The card for the first link in the text: {url, title, description,
+    # image_url, site_name}. Null when there is no link, when the sender has
+    # "Show link previews" off, or when the page had nothing to show. Written
+    # after the message is saved, by chat/link_previews.py - never by a client.
+    link_preview = models.JSONField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
