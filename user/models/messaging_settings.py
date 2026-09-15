@@ -26,6 +26,12 @@ class MessagingSettings(UserSettings):
     Read it in a hot path with `of(user)`, which never writes; change it with
     `for_user(user)`, which creates the row if it is somehow missing, so an
     opt-out can never be lost.
+
+    Each field's comment names its control on Settings → Messaging, what
+    changing it does, and what it does TODAY. The web saves every row of that
+    screen except the SMS box to the account (PATCH /users/me/settings/messaging/),
+    but only `sms_enabled`, `email_enabled`, `enter_to_send` and
+    `link_previews_enabled` change anything yet.
     """
 
     class ExternalContactMethod(models.TextChoices):
@@ -33,6 +39,8 @@ class MessagingSettings(UserSettings):
         SMS = 'sms', 'SMS'
         EMAIL = 'email', 'Email'
 
+    # The web spells these `always` / `wifi` / `never`; frontend
+    # lib/user/accountSettings.ts translates both ways.
     class MediaAutoDownload(models.TextChoices):
         WIFI_MOBILE = 'wifi_mobile', 'Wi-Fi and mobile data'
         WIFI_ONLY = 'wifi_only', 'Wi-Fi only'
@@ -46,59 +54,87 @@ class MessagingSettings(UserSettings):
 
     # --- Delivery switches (consent) -----------------------------------------
 
-    # The master switch for every text this account could receive, across every
-    # group. It only ever SUBTRACTS: turning it on does not opt anybody into
-    # anything, because whether a given group texts you is decided per
-    # membership on `chat.Participant.sms_enabled`. The effective rule is
+    # "Allow messages to be delivered by SMS" - Settings → Messaging → SMS.
+    # The master switch for every text this account can receive, from every
+    # Loop.
+    #   On  - each Loop decides for itself whether it texts the person: its own
+    #         `chat.Participant.sms_enabled`, plus a verified phone number.
+    #   Off - no Loop texts them. Group messages and notices such as
+    #         invitations are skipped as "sms disabled account-wide"
+    #         (sms/outbound.py); the messages still show in the app.
+    # Turning it on never opts anybody into anything - it only stops blocking:
     #
     #     send = participant.sms_enabled and messaging_settings.sms_enabled
     #
-    # so this is the one control that stops everything at once. It defaults to
-    # True and only ever subtracts.
+    # WHO CHANGES IT: only the person's phone. Replying STOP to any Loop's
+    # number turns it off; replying START to that same number turns it back on
+    # (sms/inbound.py). Nothing in the app can: the API and Django admin show
+    # it read-only, and the web checkbox only keeps a copy in that browser. An
+    # app switch that could turn texts back on would undo somebody's STOP.
     #
-    # NO endpoint writes it, deliberately: the only thing that writes it is a
-    # carrier STOP or START (sms/inbound.py). GET /users/me/settings/messaging/
-    # shows it read-only. Its email counterpart below IS writable, because email
-    # has no carrier word and a member needs a switch somewhere.
-    # Settings → Messaging → "Allow messages to be delivered by SMS".
-    #
-    # Members who have no account have no row and therefore no switch here:
-    # replying STOP is their only way out, which is why STOP handling is not
-    # optional.
+    # Members with no account have no row, so replying STOP is their only way
+    # out - which is why STOP handling is not optional. Phone verification
+    # codes are not affected by it.
     sms_enabled = models.BooleanField(default=True, db_default=True)
-    # When they last turned it off, or replied STOP. Kept apart from the flag
-    # because "has never opted out" and "opted out and back in" are different
-    # facts, and a complaint turns on the second one.
+
+    # Not a control - a record. When a STOP last turned `sms_enabled` off;
+    # empty if the person has never replied STOP. Kept apart from the flag
+    # because "never opted out" and "opted out, then back in" are different
+    # facts.
     sms_opt_out_at = models.DateTimeField(null=True, blank=True)
+
+    # Not a control - a record. When a START last turned `sms_enabled` back on.
     sms_consent_at = models.DateTimeField(null=True, blank=True)
 
-    # The same master switch as `sms_enabled`, for group email, and it works
-    # the same way: it only ever subtracts. Whether a given group emails you is
-    # decided per membership by `chat.ChannelConsent`; this is the one control
-    # that stops every group at once. Written by the person (PATCH
-    # /users/me/settings/messaging/, or PATCH /users/me/profile/, which still
-    # carries it under this name) and by a complaint or a permanent bounce
-    # (mail/receipts.py). Settings → Messaging
-    # → "Allow messages to be delivered by email".
+    # "Allow messages to be delivered by email" - Settings → Messaging → Email.
+    # The master switch for group email, from every Loop.
+    #   On  - each Loop decides for itself whether it emails the person: its
+    #         `chat.ChannelConsent` row, which the link at the bottom of that
+    #         Loop's emails turns off.
+    #   Off - no Loop emails them; group messages are skipped as "email
+    #         disabled account-wide" (mail/outbound.py). They still show in the
+    #         app.
+    # Turning it back on does not restart a Loop stopped with its footer link -
+    # there is no per-Loop switch in the app yet.
     #
-    # Only group traffic. Verification codes and password resets are not
-    # subject to it - an account that cannot receive the code to get back into
-    # itself is an account somebody has locked themselves out of, and nobody
-    # who unticks "email updates" means that.
+    # WHO CHANGES IT: the person, with that checkbox (PATCH
+    # /users/me/settings/messaging/; PATCH /users/me/profile/ still carries it
+    # under this name). It also turns itself OFF when a Loop email to them
+    # bounces permanently or is reported as spam (mail/receipts.py).
+    #
+    # Only group email. Verification codes and password resets still arrive -
+    # an account that cannot receive the code to get back into itself is an
+    # account somebody has locked themselves out of, and nobody who unticks
+    # "email updates" means that.
     email_enabled = models.BooleanField(default=True, db_default=True)
 
     # --- Preferences -----------------------------------------------------------
 
-    # Whether Enter sends. The web composer is a one-line box, so with this off
-    # Enter does nothing there and Ctrl+Enter / Cmd+Enter sends.
+    # "Press Enter to send" - Settings → Messaging → Sending messages.
+    #   On  - pressing Enter in the chat box sends the message.
+    #   Off - Enter does nothing (the web chat box is a single line); Ctrl+Enter,
+    #         or Cmd+Enter on a Mac, sends. For people who hit Enter before they
+    #         have finished.
+    # Today: real on the web. The saved value is loaded into the browser when
+    # the app opens, and the chat box (components/home/HomeShell.tsx) follows it.
     enter_to_send = models.BooleanField(default=True, db_default=True)
 
-    # Whether links in conversations show a preview - the page's title,
-    # description or image.
+    # "Show link previews" - Settings → Messaging → Sending messages.
+    #   On  - a link in a message shows a small card with the page's title,
+    #         description or image.
+    #   Off - just the link.
+    # Today: real. It is the SENDER's choice: with it on, the first link in a
+    # message they send gets a card, fetched by the server after sending and
+    # shown to everyone in the chat (chat/link_previews.py). Off, their links
+    # go out as plain text. Changing it does not touch cards already sent.
     link_previews_enabled = models.BooleanField(default=True, db_default=True)
 
-    # How to reach somebody who has no Loopd'n account. ASK means the sender
-    # picks SMS or email each time.
+    # "Default way to contact people without Loopd'n" - Settings → Messaging →
+    # External messaging. How to reach somebody who has no account:
+    #   Ask me every time - pick SMS or email each time.
+    #   SMS               - text them.
+    #   Email             - email them.
+    # Today: saved, but changes nothing - nothing in the app asks this yet.
     default_external_contact_method = models.CharField(
         max_length=12,
         choices=ExternalContactMethod.choices,
@@ -106,15 +142,24 @@ class MessagingSettings(UserSettings):
         db_default=ExternalContactMethod.ASK,
     )
 
-    # Whether an account holder ALSO gets an SMS copy of messages they can read
-    # in the app. True is what the backend does today - every active member with
-    # a verified number, in a group whose texts are on, is texted whether or not
-    # they use the app (sms/outbound.py) - so True changes nothing and False is
-    # the new behaviour to build. SMS-only members are unaffected either way,
-    # and `sms_enabled` above and a carrier STOP still win.
+    # "Send SMS when recipient is available on Loopd'n" - Settings → Messaging
+    # → SMS. Whether people who DO have the app also get messages by text:
+    #   On  - yes, a text as well as the message in the app.
+    #   Off - the app only. People without an account are texted either way.
+    # Today: saved, but changes nothing. Delivery already behaves as if it were
+    # On - every member with a verified number, in a Loop whose texts are on, is
+    # texted whether or not they use the app (sms/outbound.py) - so Off is the
+    # behaviour still to build. `sms_enabled` above and a STOP always win.
     sms_to_loopd_users_enabled = models.BooleanField(default=True, db_default=True)
 
-    # Which photos and videos the client downloads without being asked.
+    # "Photo & video auto-download" - Settings → Messaging → Media.
+    #   Wi-Fi and mobile data - photos and videos in chats download by
+    #                           themselves on any connection.
+    #   Wi-Fi only            - by themselves on Wi-Fi only; on mobile data
+    #                           they wait for a tap, which saves data.
+    #   Never                 - always wait for a tap.
+    # Today: saved, but changes nothing - there is no auto-download in the app
+    # for it to control yet.
     media_auto_download = models.CharField(
         max_length=12,
         choices=MediaAutoDownload.choices,
