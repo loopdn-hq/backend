@@ -18,6 +18,9 @@ def avatar_upload_to(instance, filename):
 
     The original filename is discarded on purpose: it is attacker-controlled,
     and users routinely upload `IMG_0001.jpg`, which would collide.
+
+    Migration 0001 refers to this as `user.models.avatar_upload_to`, which
+    resolves because user/models/__init__.py re-exports it. Keep that export.
     """
     suffix = Path(filename).suffix.lower() or '.jpg'
     return f'avatars/{instance.user_id}/{uuid.uuid4().hex}{suffix}'
@@ -65,29 +68,10 @@ class Profile(models.Model):
     # mean nothing. Reset automatically in save() when the number changes.
     phone_no_verified = models.BooleanField(default=False)
 
-    # The master switch for every text this account could receive, across every
-    # group. It only ever SUBTRACTS: turning it on does not opt anybody into
-    # anything, because whether a given group texts you is decided per
-    # membership on `chat.Participant.sms_enabled`. The effective rule is
-    #
-    #     send = participant.sms_enabled and profile.sms_enabled
-    #
-    # so this is the one control that stops everything at once. It defaults to
-    # True and only ever subtracts.
-    #
-    # It is NOT on the profile endpoint, deliberately: the only thing that
-    # writes it is a carrier STOP. Its email counterpart below IS exposed,
-    # because email has no carrier word and a member needs a switch somewhere.
-    #
-    # Members who have no account have no Profile and therefore no switch here:
-    # replying STOP is their only way out, which is why STOP handling is not
-    # optional.
-    sms_enabled = models.BooleanField(default=True, db_default=True)
-    # When they last turned it off, or replied STOP. Kept apart from the flag
-    # because "has never opted out" and "opted out and back in" are different
-    # facts, and a complaint turns on the second one.
-    sms_opt_out_at = models.DateTimeField(null=True, blank=True)
-    sms_consent_at = models.DateTimeField(null=True, blank=True)
+    # The account-wide SMS and email switches - `sms_enabled`, `sms_opt_out_at`,
+    # `sms_consent_at`, `email_enabled` - lived here until user/0009 moved them
+    # to MessagingSettings. Their columns are still in this table, unread,
+    # until a later release drops them; see that migration.
 
     # Whether `user.email` has been confirmed with an emailed code. This is
     # the flag that gates signing in, not `user.is_active`.
@@ -106,23 +90,12 @@ class Profile(models.Model):
     # address changes, which is why is_active must not follow it.
     email_verified = models.BooleanField(default=False)
 
-    # The same master switch as `sms_enabled`, for group email, and it works
-    # the same way: it only ever subtracts. Whether a given group emails you is
-    # decided per membership by `chat.ChannelConsent`; this is the one control
-    # that stops every group at once.
-    #
-    # Only group traffic. Verification codes and password resets are not
-    # subject to it - an account that cannot receive the code to get back into
-    # itself is an account somebody has locked themselves out of, and nobody
-    # who unticks "email updates" means that.
-    email_enabled = models.BooleanField(default=True, db_default=True)
-
     bio = models.CharField(max_length=280, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
 
     # Presence, for the conversation list. `is_online` is the live flag the
     # websocket layer will flip; `last_seen_at` is what to show once it is
-    # False.
+    # False. Whether OTHER people may see it is PrivacySettings.online_status_visible.
     is_online = models.BooleanField(default=False)
     last_seen_at = models.DateTimeField(null=True, blank=True)
 
@@ -210,99 +183,3 @@ class Profile(models.Model):
     def display_label(self):
         """The name to render, never empty."""
         return self.display_name or self.user.get_full_name() or self.user.username
-
-
-class UserBlock(models.Model):
-    """One person's decision not to hear from another, person to person.
-
-    NOT `chat.Participant.Status.BLOCKED`, and the two must never be confused.
-    That one is an ADMIN removing somebody from ONE conversation, and it takes
-    their membership away - a blocked participant disappears from the member
-    list entirely. This one takes no membership from anybody: both people stay
-    in every group they share, both keep seeing each other's group messages,
-    and both stay visible to each other in the member list. Only DIRECT contact
-    stops.
-
-    Two different rules that happen to share a word. When they meet in the same
-    payload, this one is never called `blocked`.
-
-    SYMMETRIC WHEN IT IS READ, ONE-SIDED WHEN IT IS WRITTEN. A row records that
-    `blocker` blocked somebody; `blocks_between` returns True if EITHER side
-    has a row against the other. That asymmetry is deliberate - the spec asks
-    for it (§16) and it is what stops the block being detectable: if a block
-    only worked one way, B could discover A had blocked them by observing that
-    their own block behaved differently.
-
-    A NUMBER IS A BLOCKABLE THING. Most members of most groups have no account
-    at all - `chat.Participant.user` is nullable and a phone number is the only
-    identity many of them have - so a block keyed solely on User could not say
-    "not that person" about most of the people in the product. Exactly one of
-    the two target columns is set, which is the same shape, and the same
-    reasoning, as `Participant` itself.
-    """
-
-    blocker = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name='blocks_made',
-    )
-
-    # Exactly one of these two. See the class docstring.
-    blocked_user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name='blocks_against',
-        null=True,
-        blank=True,
-    )
-    blocked_phone_number = models.CharField(
-        max_length=16,
-        null=True,
-        blank=True,
-        validators=[phone_number_validator],
-    )
-
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ['-created_at']
-        constraints = [
-            # One row per pair. A second would make unblocking ambiguous -
-            # delete which? - and buys nothing, since the rule is a boolean.
-            models.UniqueConstraint(
-                fields=['blocker', 'blocked_user'],
-                condition=models.Q(blocked_user__isnull=False),
-                name='unique_user_block',
-            ),
-            models.UniqueConstraint(
-                fields=['blocker', 'blocked_phone_number'],
-                condition=models.Q(blocked_phone_number__isnull=False),
-                name='unique_phone_block',
-            ),
-            # Exactly one target, never both and never neither. Both set is the
-            # dangerous state: the rule would have two answers for one row.
-            models.CheckConstraint(
-                condition=(
-                    models.Q(blocked_user__isnull=False,
-                             blocked_phone_number__isnull=True)
-                    | models.Q(blocked_user__isnull=True,
-                               blocked_phone_number__isnull=False)
-                ),
-                name='block_identifies_someone',
-            ),
-            models.CheckConstraint(
-                condition=~models.Q(blocker=models.F('blocked_user')),
-                name='block_is_not_self',
-            ),
-        ]
-        indexes = [
-            # The reverse direction. The unique constraints above already index
-            # (blocker, ...), which answers "did I block them"; this answers
-            # "did they block me", and the symmetric read asks both every time.
-            models.Index(fields=['blocked_user']),
-            models.Index(fields=['blocked_phone_number']),
-        ]
-
-    def __str__(self):
-        target = self.blocked_user or self.blocked_phone_number
-        return f'{self.blocker} blocked {target}'

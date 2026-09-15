@@ -169,7 +169,7 @@ def eligible_for(message, channel):
             status=Participant.Status.ACTIVE,
         )
         .exclude(pk=message.sender_participant_id)
-        .select_related('user__profile')
+        .select_related('user__profile', 'user__messaging_settings')
         .prefetch_related('channel_consents')
     )
 

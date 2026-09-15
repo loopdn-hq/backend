@@ -33,6 +33,7 @@ from chat.models import ChannelConsent, Participant
 from sms import segments
 from sms.client import SmsError, is_allowed_destination, send_text
 from sms.models import GroupNumber, SmsDelivery, SmsSettings
+from user.models import MessagingSettings
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,7 @@ def _address_reason(participant):
         # unverified number is a string somebody typed, and texting it would
         # send this group's messages to whoever really owns it.
         profile = getattr(participant.user, 'profile', None)
-        if profile is None or not profile.sms_enabled:
+        if profile is None or not MessagingSettings.of(participant.user).sms_enabled:
             return 'sms disabled account-wide'
         if not profile.phone_no_verified or not profile.phone_number:
             return 'no verified number'
@@ -588,8 +589,7 @@ def send_notice(conversation, participant, text, *, kind='notice'):
             reason='sms disabled for this group',
         )
 
-    profile = getattr(participant.user, 'profile', None) if participant.user_id else None
-    if profile is not None and not profile.sms_enabled:
+    if participant.user_id and not MessagingSettings.of(participant.user).sms_enabled:
         return _record_notice(
             conversation, participant, SmsDelivery.Status.SKIPPED,
             reason='sms disabled account-wide',
@@ -714,7 +714,7 @@ def retry_delivery(delivery):
     # has moved since this row was written.
     participant = (
         Participant.objects.filter(pk=delivery.participant_id)
-        .select_related('user__profile')
+        .select_related('user__profile', 'user__messaging_settings')
         .prefetch_related('channel_consents')
         .first()
     )

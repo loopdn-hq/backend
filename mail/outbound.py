@@ -36,6 +36,7 @@ from chat.models import ChannelConsent, Participant
 from mail import commands
 from mail.models import EmailDelivery
 from mail.tokens import reply_address, unsubscribe_url
+from user.models import MessagingSettings
 from utils.mail import GROUP_MESSAGE, EmailError, send_templated_email
 
 logger = logging.getLogger(__name__)
@@ -160,7 +161,7 @@ def _address_reason(participant):
         return 'no verified address'
 
     profile = getattr(participant.user, 'profile', None)
-    if profile is None or not profile.email_enabled:
+    if profile is None or not MessagingSettings.of(participant.user).email_enabled:
         return 'email disabled account-wide'
     if not profile.email_verified:
         return 'no verified address'
@@ -260,7 +261,7 @@ def retry_delivery(delivery_row):
     # has moved since this row was written.
     participant = (
         Participant.objects.filter(pk=delivery_row.participant_id)
-        .select_related('user__profile')
+        .select_related('user__profile', 'user__messaging_settings')
         .prefetch_related('channel_consents')
         .first()
     )

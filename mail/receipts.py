@@ -11,7 +11,7 @@ TWO OF THESE CHANGE THE ACCOUNT, NOT JUST THE ROW
 --------------------------------------------------
 A COMPLAINT is the person saying stop, in the one place that also tells their
 mail provider we are spam. Group email is switched off for their whole account -
-`Profile.email_enabled`, the same switch Settings > Notifications shows - so
+`MessagingSettings.email_enabled`, the same switch Settings > Messaging shows - so
 they see it off and can turn it back on themselves if it was a slip. Nothing
 else would do: the next message would produce the next complaint, and a
 domain's reputation does not come back.
@@ -30,7 +30,7 @@ from django.utils import timezone
 
 from mail import provider
 from mail.models import EmailDelivery
-from user.models import Profile
+from user.models import MessagingSettings
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +102,23 @@ def _stop_mailing(rows, why):
     user_ids = {user_id for user_id in rows.values_list('user_id', flat=True) if user_id}
     if not user_ids:
         return
-    switched = Profile.objects.filter(
+    switched = MessagingSettings.objects.filter(
         user_id__in=user_ids, email_enabled=True
-    ).update(email_enabled=False)
+    ).update(email_enabled=False, updated_at=timezone.now())
+
+    # Every account has a row, but the opt-out must stick even for one that
+    # somehow does not - so create it, already off.
+    missing = user_ids - set(
+        MessagingSettings.objects.filter(user_id__in=user_ids).values_list(
+            'user_id', flat=True
+        )
+    )
+    if missing:
+        MessagingSettings.objects.bulk_create(
+            [MessagingSettings(user_id=user_id, email_enabled=False) for user_id in missing],
+            ignore_conflicts=True,
+        )
+        switched += len(missing)
     if switched:
         logger.warning(
             'Switched group email off for %s account(s): %s', switched, why

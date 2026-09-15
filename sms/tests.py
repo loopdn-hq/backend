@@ -21,6 +21,7 @@ import base64
 import time
 import urllib.parse
 from unittest import mock
+from user.models import MessagingSettings
 
 def grant_sms(participant, status):
     """Set a member's SMS consent, the way production does.
@@ -1301,8 +1302,8 @@ class AppMembersReceiveTextsTests(TestCase):
 
     def test_account_wide_off_beats_the_per_group_setting(self):
         bob = self.add_app_member('bob', '+639171111111')
-        bob.profile.sms_enabled = False
-        bob.profile.save(update_fields=['sms_enabled'])
+        bob.messaging_settings.sms_enabled = False
+        bob.messaging_settings.save(update_fields=['sms_enabled'])
         self.assertEqual(
             self.deliveries()[bob.pk].reason, 'sms disabled account-wide'
         )
@@ -2730,9 +2731,25 @@ class GroupConsentTests(TestCase):
 
         self.send(self.family, 'STOP')
 
-        bob.profile.refresh_from_db()
-        self.assertFalse(bob.profile.sms_enabled)
-        self.assertIsNotNone(bob.profile.sms_opt_out_at)
+        switches = MessagingSettings.objects.get(user=bob)
+        self.assertFalse(switches.sms_enabled)
+        self.assertIsNotNone(switches.sms_opt_out_at)
+
+    def test_stop_sticks_even_for_an_account_with_no_settings_row(self):
+        # Every account gets its row at sign-up, but an opt-out must not lean
+        # on that: with the row missing, the sweep creates it already off.
+        bob = User.objects.create_user(username='bob', password='x')
+        bob.profile.phone_number = self.number
+        bob.profile.phone_no_verified = True
+        bob.profile.save()
+        self.invite_to(self.family)
+        MessagingSettings.objects.filter(user=bob).delete()
+
+        self.send(self.family, 'STOP')
+
+        switches = MessagingSettings.objects.get(user=bob)
+        self.assertFalse(switches.sms_enabled)
+        self.assertIsNotNone(switches.sms_opt_out_at)
 
     def test_start_brings_the_account_back_too(self):
         bob = User.objects.create_user(username='bob', password='x')
@@ -2744,8 +2761,7 @@ class GroupConsentTests(TestCase):
 
         self.send(self.family, 'START')
 
-        bob.profile.refresh_from_db()
-        self.assertTrue(bob.profile.sms_enabled)
+        self.assertTrue(MessagingSettings.objects.get(user=bob).sms_enabled)
 
     def test_the_delivery_engine_agrees_across_both_kinds(self):
         # Through the ladder rather than the columns, because a column only

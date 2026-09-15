@@ -253,31 +253,47 @@ def broadcast_message_updated(message):
 
 
 def announce_added_to_conversation(conversation, users):
-    """Queue the added-to-conversation event for after the transaction commits.
+    """Tell people somebody else put them in a conversation.
 
-    Two bugs in one, both of which only appear on a real deployment:
-
-    Publishing inside the transaction lets a socket on another worker receive
-    the event, subscribe, and read a conversation that has not been committed
-    yet - the same hazard `create_message` documents for message broadcasts.
-
-    Serialising `conversation` as the caller holds it renders whatever its
-    participant prefetch was populated with, which was fetched BEFORE the new
-    people existed. Each new member is then told a member list that does not
-    include them. Re-reading by pk after commit is what makes the payload true.
+    Two things: an Activity notification, and their sockets joining it - see
+    `subscribe_to_conversation` for the second. For somebody who STARTED the
+    conversation, call that one alone: they are not told they were added to
+    something they did themselves.
     """
-    pks = [user.pk for user in users if user is not None]
-    if not pks:
+    users = [user for user in users if user is not None]
+    if not users:
         return
 
     from chat.models import Notification
     from chat.notifications import notify_many
 
-    notify_many(
-        [user for user in users if user is not None],
-        Notification.Type.MEMBER_ADDED,
-        conversation=conversation,
-    )
+    notify_many(users, Notification.Type.MEMBER_ADDED, conversation=conversation)
+    subscribe_to_conversation(conversation, users)
+
+
+def subscribe_to_conversation(conversation, users):
+    """Make these people's open sockets join a conversation, after commit.
+
+    A socket joins a conversation only when it connects or when it hears
+    `conversation.added`. Before this existed only the people ADDED were ever
+    sent that event - never whoever started the conversation - so the creator of
+    a group or the starter of a direct message had a socket that was not in it.
+    Their own messages still appeared, because the REST response carries them,
+    which is how it went unnoticed; the other side's replies, typing and read
+    receipts did not arrive until they reconnected.
+
+    Published after commit, and the payload built from a fresh read, for two
+    reasons that only show on a real deployment. Publishing inside the
+    transaction lets a socket on another worker receive the event, subscribe,
+    and read a conversation that has not been committed yet - the hazard
+    `create_message` documents for message broadcasts. And serialising
+    `conversation` as the caller holds it renders a participant prefetch taken
+    BEFORE the new people existed, so each would be told a member list that
+    does not include them.
+    """
+    pks = [user.pk for user in users if user is not None]
+    if not pks:
+        return
 
     def _publish():
         from django.contrib.auth.models import User

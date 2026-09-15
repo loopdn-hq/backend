@@ -27,7 +27,17 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from otp.models import OtpError
 from otp.services import start_email_verification, verify_email
 from user.lookups import active_users
-from user.models import Profile, UserBlock, phone_number_validator
+from user.models import (
+    AppearanceSettings,
+    MessagingSettings,
+    NotificationSettings,
+    PrivacySettings,
+    Profile,
+    SecuritySettings,
+    UserBlock,
+    phone_number_validator,
+)
+from user.user_settings import ensure_settings
 from utils.email import EmailError, send_email
 
 logger = logging.getLogger(__name__)
@@ -44,6 +54,10 @@ class ProfileSerializer(serializers.ModelSerializer):
     avatar = serializers.ImageField(write_only=True, required=False, allow_null=True)
     avatar_url = serializers.SerializerMethodField()
     display_label = serializers.CharField(read_only=True)
+    # Group email across every Loop. Not a Profile column since user/0009 - it
+    # lives on MessagingSettings - so it is declared here and read and written
+    # by hand below, under the name clients already use.
+    email_enabled = serializers.BooleanField(write_only=True, required=False)
 
     class Meta:
         model = Profile
@@ -58,6 +72,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             # The account-wide switch for group email. Writable, unlike its SMS
             # sibling: SMS has a carrier word for this and email does not, so
             # without an endpoint there would be nowhere at all to turn it off.
+            # Stored on MessagingSettings - see the declared field above.
             'email_enabled',
             'bio',
             'date_of_birth',
@@ -101,6 +116,25 @@ class ProfileSerializer(serializers.ModelSerializer):
         if taken.exists():
             raise serializers.ValidationError('That phone number is already in use.')
         return value
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Only where it is one of this serializer's fields: PublicProfileSerializer
+        # inherits the declaration, and must never show one person's switch to
+        # another.
+        if 'email_enabled' in self.fields:
+            data['email_enabled'] = MessagingSettings.of(instance.user).email_enabled
+        return data
+
+    def update(self, instance, validated_data):
+        email_enabled = validated_data.pop('email_enabled', None)
+        profile = super().update(instance, validated_data)
+        if email_enabled is not None:
+            switches = MessagingSettings.for_user(profile.user)
+            if switches.email_enabled != email_enabled:
+                switches.email_enabled = email_enabled
+                switches.save(update_fields=['email_enabled', 'updated_at'])
+        return profile
 
 
 class PublicProfileSerializer(ProfileSerializer):
@@ -361,6 +395,10 @@ class LoginSerializer(TokenObtainPairSerializer):
                 'Verify your email address before signing in.',
                 'email_not_verified',
             )
+
+        # Only past every refusal, so a failed sign-in creates nothing. The
+        # other sign-ins make the same call in `issue_tokens`.
+        ensure_settings(self.user)
 
         # Reshaped to match register, so a client parses one thing
         # whether it just signed up or just logged in.
@@ -716,3 +754,126 @@ class BlockedEntrySerializer(serializers.Serializer):
             return obj.blocked_phone_number
         profile = getattr(obj.blocked_user, 'profile', None)
         return profile.display_label if profile else obj.blocked_user.username
+
+
+# --- settings screens ---------------------------------------------------------
+
+
+class UserSettingsSerializer(serializers.ModelSerializer):
+    """What every settings screen's serializer shares.
+
+    Each screen names its fields rather than using `__all__`, so a column added
+    to a model is not writable over the API until somebody decides it should
+    be. `id`, `user` and `created_at` are never in the payload: the URL already
+    says whose settings these are.
+    """
+
+    class Meta:
+        read_only_fields = ['updated_at']
+
+
+class AppearanceSettingsSerializer(UserSettingsSerializer):
+    """Settings → Appearance."""
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = AppearanceSettings
+        fields = ['theme', 'text_size', 'message_spacing', 'updated_at']
+
+
+class MessagingSettingsSerializer(UserSettingsSerializer):
+    """Settings → Messaging.
+
+    `sms_enabled` is shown but never written here. Only a carrier STOP or
+    START changes it (sms/inbound.py): an API that could switch it back on
+    would undo somebody's STOP. `email_enabled` is writable, and is the same
+    column PATCH /users/me/profile/ writes for the web client that uses it
+    today. The SMS consent timestamps are records, not settings, and stay out.
+    """
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = MessagingSettings
+        fields = [
+            'sms_enabled',
+            'email_enabled',
+            'enter_to_send',
+            'link_previews_enabled',
+            'default_external_contact_method',
+            'sms_to_loopd_users_enabled',
+            'media_auto_download',
+            'updated_at',
+        ]
+        read_only_fields = [*UserSettingsSerializer.Meta.read_only_fields, 'sms_enabled']
+
+
+class NotificationSettingsSerializer(UserSettingsSerializer):
+    """Settings → Notifications."""
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = NotificationSettings
+        fields = [
+            'messages',
+            'group_messages',
+            'direct_messages',
+            'mentions_replies',
+            'group_invitations',
+            'incoming_calls',
+            'missed_calls',
+            'sms_delivery_failures',
+            'email_delivery_failures',
+            'show_preview',
+            'sound',
+            'updated_at',
+        ]
+
+
+class PrivacySettingsSerializer(UserSettingsSerializer):
+    """Settings → Privacy."""
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = PrivacySettings
+        fields = [
+            'direct_messages_from',
+            'group_adds_from',
+            'discoverable_by_phone',
+            'discoverable_by_email',
+            'read_receipts_enabled',
+            'online_status_visible',
+            'updated_at',
+        ]
+
+
+class SecuritySettingsSerializer(UserSettingsSerializer):
+    """Settings → Security.
+
+    Two-factor is shown but never written here. Turning it on has to prove the
+    phone number or address the codes will go to, and that flow does not exist
+    yet - a switch flipped without it would send sign-in codes to whatever was
+    typed in. Login alerts are plain preferences.
+    """
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = SecuritySettings
+        fields = [
+            'two_factor_enabled',
+            'two_factor_method',
+            'login_alerts_email',
+            'login_alerts_sms',
+            'updated_at',
+        ]
+        read_only_fields = [
+            *UserSettingsSerializer.Meta.read_only_fields,
+            'two_factor_enabled',
+            'two_factor_method',
+        ]
+
+
+# Each screen's name in the URL, and its serializer - which names its model.
+# The one place a screen is added to the API (SettingsApiTests checks it covers
+# every model in user/user_settings.py).
+SETTINGS_SERIALIZERS = {
+    'appearance': AppearanceSettingsSerializer,
+    'messaging': MessagingSettingsSerializer,
+    'notifications': NotificationSettingsSerializer,
+    'privacy': PrivacySettingsSerializer,
+    'security': SecuritySettingsSerializer,
+}

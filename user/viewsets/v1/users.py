@@ -57,13 +57,20 @@ from user.serializers import (
     UserSerializer,
     VerifyEmailSerializer,
 )
+from user.user_settings import ensure_settings
 from utils.mail import EmailError
 
 logger = logging.getLogger(__name__)
 
 
 def issue_tokens(user):
-    """The access/refresh pair, in the shape every auth action returns."""
+    """The access/refresh pair, in the shape every auth action returns.
+
+    Handing out tokens is signing in, so this is also where the account's
+    settings rows are made (user/user_settings.py). Password login mints its
+    tokens inside LoginSerializer and makes the same call there.
+    """
+    ensure_settings(user)
     refresh = RefreshToken.for_user(user)
     return {'access': str(refresh.access_token), 'refresh': str(refresh)}
 

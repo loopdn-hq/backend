@@ -3057,6 +3057,82 @@ class SettingsChangeBroadcastTests(EnvelopeAssertions, APITestCase):
 
 
 
+class ConversationStarterSubscriptionTests(EnvelopeAssertions, APITestCase):
+    """Whoever starts a conversation has a socket that is in it.
+
+    A socket joins a conversation when it connects, or when it hears
+    `conversation.added`. Only the people ADDED used to be sent that event, so
+    the starter of a direct message or the creator of a group was never in the
+    conversation they had just made. Their own messages still showed - the REST
+    response carries them - and the other side's replies, typing and read
+    receipts did not, until they reconnected.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice', '+639170000101')
+        self.bob = make_user('bob', '+639170000102')
+        self.client.force_authenticate(self.alice)
+
+    def start(self, url_name, payload):
+        """Run one request with its after-commit work, recording who was told."""
+        with mock.patch('chat.services.broadcast_added_to_conversation') as sent, \
+                mock.patch('chat.notifications.notify_many') as notified:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(
+                    reverse(url_name), payload, format='json'
+                )
+        subscribed = {
+            user.pk for call in sent.call_args_list for user in call.args[1]
+        }
+        told = {
+            user.pk for call in notified.call_args_list for user in call.args[0]
+        }
+        return response, subscribed, told
+
+    def test_starting_a_direct_message_subscribes_both_people(self):
+        response, subscribed, _ = self.start(
+            'chat:conversation-direct', {'identifier': 'bob'}
+        )
+
+        self.assertSuccess(response)
+        self.assertEqual(subscribed, {self.alice.pk, self.bob.pk})
+
+    def test_the_starter_is_not_notified_that_they_were_added(self):
+        _, _, told = self.start('chat:conversation-direct', {'identifier': 'bob'})
+
+        self.assertEqual(told, {self.bob.pk})
+
+    def test_opening_an_existing_direct_message_tells_nobody(self):
+        # Both sockets already joined it - at connect, or when it was made.
+        self.start('chat:conversation-direct', {'identifier': 'bob'})
+
+        response, subscribed, told = self.start(
+            'chat:conversation-direct', {'identifier': 'bob'}
+        )
+
+        self.assertSuccess(response)
+        self.assertEqual((subscribed, told), (set(), set()))
+
+    def test_creating_a_group_subscribes_the_creator(self):
+        response, subscribed, told = self.start(
+            'chat:conversation-group', {'name': 'Trip', 'members': ['bob']}
+        )
+
+        self.assertSuccess(response, status.HTTP_201_CREATED)
+        self.assertEqual(subscribed, {self.alice.pk, self.bob.pk})
+        # Bob was added by somebody else; Alice made it.
+        self.assertEqual(told, {self.bob.pk})
+
+    def test_a_group_with_nobody_else_in_it_still_subscribes_the_creator(self):
+        response, subscribed, told = self.start(
+            'chat:conversation-group', {'name': 'Just me'}
+        )
+
+        self.assertSuccess(response, status.HTTP_201_CREATED)
+        self.assertEqual(subscribed, {self.alice.pk})
+        self.assertEqual(told, set())
+
+
 class UnreadCountTests(EnvelopeAssertions, APITestCase):
     """What "unread" means, and who it means it for.
 

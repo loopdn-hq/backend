@@ -1,4 +1,4 @@
-"""Guarantee every User has a Profile.
+"""Guarantee every User has a Profile and MessagingSettings.
 
 Registration creates one explicitly, but users also arrive from
 `createsuperuser`, the admin, fixtures and the shell. Hanging this off
@@ -9,7 +9,7 @@ from django.conf import settings
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
-from user.models import Profile
+from user.models import MessagingSettings, Profile
 
 
 @receiver(post_save, sender=settings.AUTH_USER_MODEL, dispatch_uid='user.create_profile')
@@ -26,3 +26,7 @@ def create_profile_for_new_user(sender, instance, created, **kwargs):
             user=instance,
             defaults={'email_verified': instance.is_superuser},
         )
+        # The account-wide SMS and email switches live here, and the delivery
+        # code reads them for every member of a group - so the row exists from
+        # the start, not made lazily in the middle of a send.
+        MessagingSettings.objects.get_or_create(user=instance)

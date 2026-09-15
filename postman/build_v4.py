@@ -225,7 +225,7 @@ ME = [
             '**The two SMS switches, and why neither is set here:**\n\n'
             '| Switch | Set by | Meaning |\n'
             '| --- | --- | --- |\n'
-            '| `Profile.sms_enabled` | **texting STOP** - no endpoint | **all** '
+            '| `MessagingSettings.sms_enabled` | **texting STOP** - no endpoint | **all** '
             'texts, every group. A master off switch. |\n'
             '| `Participant.sms_enabled` | *Delivery settings* | whether **one '
             'group** texts you. |\n\n'
@@ -236,6 +236,31 @@ ME = [
             'account-wide switch is currently only reachable by replying STOP '
             'to a message - worth knowing before building a settings toggle '
             'against it.'
+        )),
+    req('Get my settings', 'GET', '/api/v1/users/me/settings/',
+        desc=(
+            'Every settings screen at once, keyed by name: `appearance`, '
+            '`messaging`, `notifications`, `privacy`, `security`. Always your '
+            'own - there is no id in the URL.'
+        )),
+    req('Get one settings screen', 'GET', '/api/v1/users/me/settings/privacy/',
+        desc=(
+            'One screen. Swap `privacy` for any of the five names; anything '
+            'else is 404.'
+        )),
+    req('Update a settings screen', 'PATCH', '/api/v1/users/me/settings/appearance/',
+        body={'theme': 'dark'},
+        desc=(
+            'Send only the fields you are changing; the answer is the whole '
+            'screen. An unknown choice is 400 with the field named. PUT is 405.\n\n'
+            '**Shown but never written here** - if sent they are ignored and the '
+            'request still returns 200:\n\n'
+            '- `messaging.sms_enabled` - only a carrier STOP or START changes it.\n'
+            '- `security.two_factor_enabled` / `two_factor_method` - turning '
+            'two-factor on must prove the phone or email first, and that flow '
+            'does not exist yet.\n\n'
+            '`messaging.email_enabled` is the same switch as `email_enabled` on '
+            '*Update my profile*.'
         )),
     req('Search people', 'GET', '/api/v1/users/search/',
         query=[{'key': 'q', 'value': 'bob'}],
@@ -813,7 +838,7 @@ COLLECTION = {
             'not a check bolted on top - so a conversation you are not in is '
             'indistinguishable from one that does not exist. That is '
             'deliberate.\n\n'
-            '**Two SMS switches.** `Profile.sms_enabled` (account-wide) and '
+            '**Two SMS switches.** `MessagingSettings.sms_enabled` (account-wide) and '
             '`Participant.sms_enabled` (this group). Both must be on, plus a '
             'verified number, plus consent for members with no account.'
         ),
