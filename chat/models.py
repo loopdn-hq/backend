@@ -231,7 +231,7 @@ class Conversation(models.Model):
 
     # OUTBOUND: a message posted here is texted to members.
     #
-    # Named `sms_delivery_enabled` rather than `sms_enabled` because Profile and
+    # Named `sms_delivery_enabled` rather than `sms_enabled` because MessagingSettings and
     # Participant each already have an `sms_enabled`, at different scopes.
     sms_delivery_enabled = models.BooleanField(
         default=True,

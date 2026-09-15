@@ -14,7 +14,9 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import override_settings
+from django.db import IntegrityError, connection, transaction
+from django.db.migrations.executor import MigrationExecutor
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
@@ -23,7 +25,16 @@ from rest_framework.test import APITestCase
 
 from otp.models import EmailOtp
 from otp.services import verify_email
-from user.models import Profile
+from user.models import (
+    AppearanceSettings,
+    MessagingSettings,
+    NotificationSettings,
+    PrivacySettings,
+    Profile,
+    SecuritySettings,
+)
+from user.serializers import SETTINGS_SERIALIZERS
+from user.user_settings import SETTINGS_MODELS
 from utils.mail import EmailError
 
 MEDIA_ROOT = tempfile.mkdtemp(prefix='loopd-test-media-')
@@ -791,6 +802,9 @@ class AuthenticatedFlowTests(EnvelopeAssertions, APITestCase):
         self.assertEqual(data['username'], 'yul')
         # Nothing was set, so display_label falls back to the username.
         self.assertEqual(data['profile']['display_label'], 'yul')
+        # The web app reads the group-email switch from here (frontend-web
+        # lib/auth/client.ts), though it no longer lives on Profile itself.
+        self.assertTrue(data['profile']['email_enabled'])
 
     def test_me_updates_account_fields(self):
         data = self.assertSuccess(
@@ -919,6 +933,9 @@ class AuthenticatedFlowTests(EnvelopeAssertions, APITestCase):
         self.assertEqual(data['profile']['bio'], 'hi')
         self.assertNotIn('phone_number', data['profile'])
         self.assertNotIn('date_of_birth', data['profile'])
+        # Declared on ProfileSerializer, which this one inherits from - and
+        # still nobody's business but the account's own.
+        self.assertNotIn('email_enabled', data['profile'])
         self.assertNotIn('email', data)
 
     def test_missing_user_is_a_clean_envelope_not_an_html_404(self):
@@ -1218,8 +1235,7 @@ class EmailPreferenceTests(EnvelopeAssertions, APITestCase):
         )
 
         self.assertFalse(data['email_enabled'])
-        self.user.profile.refresh_from_db()
-        self.assertFalse(self.user.profile.email_enabled)
+        self.assertFalse(MessagingSettings.objects.get(user=self.user).email_enabled)
 
     def test_and_back_on(self):
         self.client.patch(self.url(), {'email_enabled': False})
@@ -1235,8 +1251,7 @@ class EmailPreferenceTests(EnvelopeAssertions, APITestCase):
             self.client.patch(self.url(), {'email_enabled': False})
         )
 
-        self.user.profile.refresh_from_db()
-        self.assertTrue(self.user.profile.sms_enabled)
+        self.assertTrue(MessagingSettings.objects.get(user=self.user).sms_enabled)
 
     def test_the_sms_switch_is_still_not_writable(self):
         # Its absence is deliberate: the only thing that writes it is a carrier
@@ -1244,8 +1259,7 @@ class EmailPreferenceTests(EnvelopeAssertions, APITestCase):
         # asserts the outcome and not the status code.
         self.client.patch(self.url(), {'sms_enabled': False})
 
-        self.user.profile.refresh_from_db()
-        self.assertTrue(self.user.profile.sms_enabled)
+        self.assertTrue(MessagingSettings.objects.get(user=self.user).sms_enabled)
 
     def test_turning_group_email_off_does_not_stop_a_verification_code(self):
         # An account that cannot receive the code to get back into itself is an
@@ -1253,9 +1267,9 @@ class EmailPreferenceTests(EnvelopeAssertions, APITestCase):
         # "email updates" means that.
         from utils.mail import VERIFICATION_CODE, send_templated_email
 
-        profile = self.user.profile
-        profile.email_enabled = False
-        profile.save(update_fields=['email_enabled'])
+        switches = self.user.messaging_settings
+        switches.email_enabled = False
+        switches.save(update_fields=['email_enabled'])
 
         with mock.patch('utils.mail._is_configured', return_value=True), \
                 mock.patch('utils.mail._post', return_value={'id': 'x'}) as post:
@@ -1266,6 +1280,32 @@ class EmailPreferenceTests(EnvelopeAssertions, APITestCase):
             )
 
         self.assertEqual(post.call_count, 1)
+
+
+@override_settings(STORAGES={
+    **settings.STORAGES,
+    # The admin's templates use {% static %}, and the manifest storage the
+    # tests otherwise get raises without a collectstatic run.
+    'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+})
+class UserAdminTests(TestCase):
+    """The user page in Django admin, where staff look an account up."""
+
+    def setUp(self):
+        staff = User.objects.create_superuser('staff', 'staff@example.com', 'x')
+        self.client.force_login(staff)
+        self.alice = User.objects.create_user(username='alice', password='x')
+
+    def test_it_shows_the_delivery_switches_with_sms_view_only(self):
+        # The switches left Profile in user/0009, so without their own inline
+        # they would vanish from this page. Staff may switch group email either
+        # way; SMS is only ever moved by the person texting STOP or START, so
+        # here it is shown and not offered as a checkbox.
+        response = self.client.get(reverse('admin:auth_user_change', args=[self.alice.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertContains(response, 'name="messaging_settings-0-email_enabled"')
+        self.assertNotContains(response, 'name="messaging_settings-0-sms_enabled"')
 
 
 class UserBlockTests(EnvelopeAssertions, APITestCase):
@@ -1478,3 +1518,344 @@ class UserBlockTests(EnvelopeAssertions, APITestCase):
         User.objects.create_user(username='bobby', password='x')
 
         self.assertEqual(self.search('bob'), ['bobby'])
+
+
+class SettingsModelTests(TestCase):
+    """One settings row per screen, per user."""
+
+    SETTINGS_MODELS = SETTINGS_MODELS
+
+    def setUp(self):
+        self.user = User.objects.create_user('settings-owner', password='Str0ng-pass!')
+
+    def test_for_user_creates_one_valid_row_and_then_reuses_it(self):
+        for model in self.SETTINGS_MODELS:
+            with self.subTest(model=model.__name__):
+                row = model.for_user(self.user)
+                row.full_clean()
+                self.assertEqual(model.for_user(self.user).pk, row.pk)
+                self.assertEqual(model.objects.filter(user=self.user).count(), 1)
+
+    def test_defaults_match_the_settings_screens(self):
+        notifications = NotificationSettings.for_user(self.user)
+        self.assertTrue(all(
+            getattr(notifications, name) for name in (
+                'messages', 'group_messages', 'direct_messages', 'mentions_replies',
+                'group_invitations', 'incoming_calls', 'missed_calls',
+                'sms_delivery_failures', 'email_delivery_failures', 'show_preview',
+            )
+        ))
+        self.assertEqual(notifications.sound, NotificationSettings.Sound.DEFAULT)
+
+        privacy = PrivacySettings.for_user(self.user)
+        self.assertEqual(privacy.direct_messages_from, PrivacySettings.Audience.EVERYONE)
+        self.assertEqual(privacy.group_adds_from, PrivacySettings.Audience.EVERYONE)
+
+        messaging = MessagingSettings.for_user(self.user)
+        self.assertTrue(messaging.enter_to_send)
+        self.assertEqual(
+            messaging.default_external_contact_method,
+            MessagingSettings.ExternalContactMethod.ASK,
+        )
+        self.assertEqual(messaging.media_auto_download, MessagingSettings.MediaAutoDownload.WIFI_ONLY)
+        # True is what the backend already does: account holders are texted.
+        self.assertTrue(messaging.sms_to_loopd_users_enabled)
+
+        security = SecuritySettings.for_user(self.user)
+        self.assertFalse(security.two_factor_enabled)
+        self.assertEqual(security.two_factor_method, '')
+
+        appearance = AppearanceSettings.for_user(self.user)
+        self.assertEqual(appearance.theme, AppearanceSettings.Theme.SYSTEM)
+        self.assertEqual(appearance.text_size, AppearanceSettings.TextSize.DEFAULT)
+
+    def test_two_factor_cannot_be_on_without_a_method(self):
+        security = SecuritySettings.for_user(self.user)
+        security.two_factor_enabled = True
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            security.save()
+
+    def test_delivery_switches_live_on_messaging_settings_only(self):
+        # One home each, where the delivery code reads it - never a second copy.
+        profile_fields = {field.name for field in Profile._meta.get_fields()}
+        for name in ('sms_enabled', 'sms_opt_out_at', 'sms_consent_at', 'email_enabled'):
+            self.assertNotIn(name, profile_fields)
+        switches = MessagingSettings.of(self.user)
+        self.assertTrue(switches.sms_enabled)
+        self.assertTrue(switches.email_enabled)
+
+    def test_every_new_account_has_messaging_settings_at_once(self):
+        # The delivery code reads every member's switches; a row made lazily
+        # would mean a group send that writes.
+        self.assertTrue(MessagingSettings.objects.filter(user=self.user).exists())
+
+    def test_deleting_the_user_deletes_their_settings(self):
+        for model in self.SETTINGS_MODELS:
+            model.for_user(self.user)
+        self.user.delete()
+        for model in self.SETTINGS_MODELS:
+            with self.subTest(model=model.__name__):
+                self.assertFalse(model.objects.exists())
+
+
+class SettingsAtSignInTests(EnvelopeAssertions, APITestCase):
+    """Every way of signing in leaves the account with all its settings rows."""
+
+    def setUp(self):
+        cache.clear()
+        self.password = 'a-strong-passphrase-42'
+        self.user = User.objects.create_user(
+            username='yul', email='yul@example.com', password=self.password
+        )
+        self.user.profile.email_verified = True
+        self.user.profile.save(update_fields=['email_verified'])
+
+    def login(self):
+        return self.client.post(
+            reverse('user:user-login'), {'username': 'yul', 'password': self.password}
+        )
+
+    def assertHasEverySettingsRow(self, user):
+        for model in SETTINGS_MODELS:
+            with self.subTest(model=model.__name__):
+                self.assertEqual(model.objects.filter(user=user).count(), 1)
+
+    def rows_other_than_messaging(self, user):
+        # MessagingSettings is made at registration by the signal, so it is
+        # the one row an account has before it ever signs in.
+        return [
+            model.__name__ for model in SETTINGS_MODELS
+            if model is not MessagingSettings and model.objects.filter(user=user).exists()
+        ]
+
+    def test_registering_alone_does_not_create_them(self):
+        self.assertEqual(self.rows_other_than_messaging(self.user), [])
+
+    def test_password_login_creates_them(self):
+        self.assertSuccess(self.login())
+        self.assertHasEverySettingsRow(self.user)
+
+    def test_signing_in_again_keeps_the_same_rows_and_choices(self):
+        self.assertSuccess(self.login())
+        AppearanceSettings.objects.filter(user=self.user).update(
+            theme=AppearanceSettings.Theme.DARK
+        )
+
+        self.assertSuccess(self.login())
+
+        self.assertHasEverySettingsRow(self.user)
+        self.assertEqual(
+            AppearanceSettings.objects.get(user=self.user).theme,
+            AppearanceSettings.Theme.DARK,
+        )
+
+    @override_settings(REQUIRE_EMAIL_VERIFICATION=True)
+    def test_a_refused_login_creates_nothing(self):
+        self.user.profile.email_verified = False
+        self.user.profile.save(update_fields=['email_verified'])
+
+        self.assertFailure(self.login(), status.HTTP_401_UNAUTHORIZED)
+
+        self.assertEqual(self.rows_other_than_messaging(self.user), [])
+
+    @override_settings(REQUIRE_EMAIL_VERIFICATION=True)
+    def test_verify_email_creates_them(self):
+        self.client.post(
+            reverse('user:user-register'),
+            {
+                'username': 'mara',
+                'email': 'mara@example.com',
+                'password': self.password,
+                'confirm_password': self.password,
+            },
+        )
+        mara = User.objects.get(username='mara')
+        self.assertEqual(self.rows_other_than_messaging(mara), [])
+        code = EmailOtp.objects.get(profile=mara.profile).code
+
+        self.assertSuccess(
+            self.client.post(
+                reverse('user:user-verify-email'),
+                {'email': 'mara@example.com', 'code': code},
+            )
+        )
+
+        self.assertHasEverySettingsRow(mara)
+
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_google_sign_in_creates_them(self, verify_token):
+        verify_token.return_value = {
+            'sub': 'google-subject-456',
+            'email': 'ana@example.com',
+            'email_verified': True,
+            'name': 'Ana',
+        }
+
+        self.assertSuccess(
+            self.client.post(reverse('user:user-google'), {'credential': 'google-id-token'}),
+            status.HTTP_201_CREATED,
+        )
+
+        self.assertHasEverySettingsRow(User.objects.get(email='ana@example.com'))
+
+
+class SettingsApiTests(EnvelopeAssertions, APITestCase):
+    """GET and PATCH /users/me/settings/ - the signed-in user's own settings."""
+
+    def setUp(self):
+        self.user = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.client.force_authenticate(self.user)
+
+    def url(self, screen=None):
+        if screen is None:
+            return reverse('user:settings-list')
+        return reverse('user:settings-detail', kwargs={'screen': screen})
+
+    def patch(self, screen, body):
+        return self.client.patch(self.url(screen), body, format='json')
+
+    def test_requires_authentication(self):
+        self.client.force_authenticate(None)
+        self.assertFailure(self.client.get(self.url()), status.HTTP_401_UNAUTHORIZED)
+        self.assertFailure(
+            self.patch('privacy', {'read_receipts_enabled': False}),
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+    def test_every_settings_model_has_a_screen(self):
+        self.assertEqual(
+            {serializer.Meta.model for serializer in SETTINGS_SERIALIZERS.values()},
+            set(SETTINGS_MODELS),
+        )
+
+    def test_get_all_returns_every_screen_with_its_defaults(self):
+        data = self.assertSuccess(self.client.get(self.url()))
+
+        self.assertEqual(set(data), set(SETTINGS_SERIALIZERS))
+        self.assertEqual(data['appearance']['theme'], 'system')
+        self.assertTrue(data['messaging']['email_enabled'])
+        self.assertTrue(data['notifications']['messages'])
+        self.assertEqual(data['privacy']['direct_messages_from'], 'everyone')
+        self.assertFalse(data['security']['two_factor_enabled'])
+
+    def test_get_one_screen_makes_a_missing_row(self):
+        self.assertFalse(PrivacySettings.objects.filter(user=self.user).exists())
+
+        data = self.assertSuccess(self.client.get(self.url('privacy')))
+
+        self.assertTrue(data['read_receipts_enabled'])
+        self.assertTrue(PrivacySettings.objects.filter(user=self.user).exists())
+
+    def test_the_payload_carries_no_ids_or_records(self):
+        data = self.assertSuccess(self.client.get(self.url('messaging')))
+        for key in ('id', 'user', 'created_at', 'sms_opt_out_at', 'sms_consent_at'):
+            self.assertNotIn(key, data)
+
+    def test_patch_changes_only_the_fields_sent(self):
+        response = self.patch('appearance', {'theme': 'dark'})
+        data = self.assertSuccess(response)
+
+        self.assertEqual(response.json()['message'], 'Settings updated.')
+        self.assertEqual(data['theme'], 'dark')
+        self.assertEqual(data['text_size'], 'default')
+        self.assertEqual(AppearanceSettings.objects.get(user=self.user).theme, 'dark')
+
+    def test_an_unknown_choice_is_refused(self):
+        body = self.assertFailure(self.patch('privacy', {'group_adds_from': 'friends'}))
+
+        self.assertIn('group_adds_from', body['data'])
+        self.assertEqual(PrivacySettings.for_user(self.user).group_adds_from, 'everyone')
+
+    def test_an_unknown_screen_is_404(self):
+        self.assertFailure(self.client.get(self.url('billing')), status.HTTP_404_NOT_FOUND)
+        self.assertFailure(self.patch('billing', {'theme': 'dark'}), status.HTTP_404_NOT_FOUND)
+
+    def test_put_is_not_allowed(self):
+        self.assertFailure(
+            self.client.put(self.url('appearance'), {'theme': 'dark'}, format='json'),
+            status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    def test_sms_enabled_is_shown_but_cannot_be_written(self):
+        # Only a carrier STOP or START writes it; switching it back on over the
+        # API would undo a STOP.
+        MessagingSettings.objects.filter(user=self.user).update(sms_enabled=False)
+
+        data = self.assertSuccess(self.patch('messaging', {'sms_enabled': True}))
+
+        self.assertFalse(data['sms_enabled'])
+        self.assertFalse(MessagingSettings.objects.get(user=self.user).sms_enabled)
+
+    def test_two_factor_cannot_be_switched_on_here(self):
+        data = self.assertSuccess(self.patch('security', {
+            'two_factor_enabled': True,
+            'two_factor_method': 'sms',
+            'login_alerts_email': True,
+        }))
+
+        self.assertFalse(data['two_factor_enabled'])
+        self.assertEqual(data['two_factor_method'], '')
+        self.assertTrue(data['login_alerts_email'])
+
+    def test_email_enabled_is_the_same_switch_the_profile_shows(self):
+        self.assertSuccess(self.patch('messaging', {'email_enabled': False}))
+
+        profile = self.assertSuccess(self.client.get(reverse('user:user-me-profile')))
+        self.assertFalse(profile['email_enabled'])
+
+    def test_a_change_touches_only_the_callers_row(self):
+        other = User.objects.create_user('mara', password='x')
+
+        self.assertSuccess(self.patch('notifications', {'messages': False}))
+
+        self.assertFalse(NotificationSettings.for_user(self.user).messages)
+        self.assertTrue(NotificationSettings.for_user(other).messages)
+
+
+class DeliverySwitchMigrationTests(TransactionTestCase):
+    """user/0009 must carry every account's delivery switches across.
+
+    Run against the real migration with the historical models, because a STOP
+    that did not survive the move would be a compliance failure nobody sees.
+    """
+
+    before = [('user', '0008_settings_models')]
+    after = [('user', '0009_move_delivery_switches_to_messaging_settings')]
+
+    def setUp(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.before)
+        self.executor.loader.build_graph()
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+
+    def test_opt_outs_are_copied_and_missing_rows_created(self):
+        old = self.executor.loader.project_state(self.before).apps
+        OldUser = old.get_model('auth', 'User')
+        OldProfile = old.get_model('user', 'Profile')
+        stopped_at = timezone.now()
+
+        # Historical models fire no signals, so neither account has a
+        # MessagingSettings row yet - the migration has to make both.
+        stopped = OldUser.objects.create(username='stopped-before-the-move')
+        OldProfile.objects.create(
+            user=stopped, sms_enabled=False, sms_opt_out_at=stopped_at, email_enabled=False,
+        )
+        untouched = OldUser.objects.create(username='never-opted-out')
+        OldProfile.objects.create(user=untouched)
+
+        self.executor.migrate(self.after)
+        new = self.executor.loader.project_state(self.after).apps
+        NewMessagingSettings = new.get_model('user', 'MessagingSettings')
+
+        row = NewMessagingSettings.objects.get(user_id=stopped.pk)
+        self.assertFalse(row.sms_enabled)
+        self.assertFalse(row.email_enabled)
+        self.assertEqual(row.sms_opt_out_at, stopped_at)
+
+        other = NewMessagingSettings.objects.get(user_id=untouched.pk)
+        self.assertTrue(other.sms_enabled)
+        self.assertTrue(other.email_enabled)
+

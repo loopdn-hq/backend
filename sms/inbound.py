@@ -48,7 +48,7 @@ from chat.models import (
 )
 from chat.services import create_message
 from sms import commands
-from user.models import Profile
+from user.models import MessagingSettings, Profile
 
 logger = logging.getLogger(__name__)
 
@@ -423,7 +423,7 @@ def _carry_to_every_group(participant, phone_number, *, enabled):
     others either.
 
     IT MOVES SWITCHES, NOT ANSWERS. `sms_enabled` on the membership and
-    `Profile.sms_enabled` on the account, never the ChannelConsent rows.
+    `MessagingSettings.sms_enabled` on the account, never the ChannelConsent rows.
     Overwriting every group's ANSWER would lose the difference between
     "declined Family" and "never asked about Work", and the matching START
     would hand all of them back as opted in. A switch is the right shape for a
@@ -446,32 +446,34 @@ def _carry_to_every_group(participant, phone_number, *, enabled):
 
     stamp = timezone.now()
 
-    # The account that verified this number, if there is one. Its profile
-    # switch is what `sms/outbound.py:_address_reason` reads for every account
-    # row, so writing it covers every group they are in at once - including the
-    # ones this text did not come from.
-    profiles = list(
+    # The account that verified this number, if there is one. Its switch is
+    # what `sms/outbound.py:_address_reason` reads for every account row, so
+    # writing it covers every group they are in at once - including the ones
+    # this text did not come from.
+    user_ids = set(
         Profile.objects.filter(
             phone_number=phone_number, phone_no_verified=True
-        )
+        ).values_list('user_id', flat=True)
     )
 
     # And the answering account itself. Normally the query above already found
     # it, but a row can only be resolved from a verified number in the first
     # place - this is belt and braces on the one path a carrier audits.
-    own = getattr(participant.user, 'profile', None) if participant.user_id else None
-    if own is not None and not any(p.pk == own.pk for p in profiles):
-        profiles.append(own)
+    if participant.user_id:
+        user_ids.add(participant.user_id)
 
-    for profile in profiles:
-        profile.sms_enabled = enabled
+    for user_id in user_ids:
+        # get_or_create, never a filtered update: every account has a row,
+        # but a STOP must be recorded even for one that somehow does not.
+        switches, _ = MessagingSettings.objects.get_or_create(user_id=user_id)
+        switches.sms_enabled = enabled
         if enabled:
-            profile.sms_consent_at = stamp
+            switches.sms_consent_at = stamp
             fields = ['sms_enabled', 'sms_consent_at', 'updated_at']
         else:
-            profile.sms_opt_out_at = stamp
+            switches.sms_opt_out_at = stamp
             fields = ['sms_enabled', 'sms_opt_out_at', 'updated_at']
-        profile.save(update_fields=fields)
+        switches.save(update_fields=fields)
 
     return moved
 

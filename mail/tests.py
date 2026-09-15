@@ -58,6 +58,7 @@ from mail.tokens import (
     unsubscribe_url,
 )
 from utils.mail import EmailError
+from user.models import MessagingSettings
 
 REPLY_DOMAIN = 'reply.loopdn.com'
 API_URL = 'https://api.loopdn.com'
@@ -376,9 +377,9 @@ class EmailFanOutTests(TestCase):
         )
 
     def test_email_switched_off_account_wide_does_not(self):
-        profile = self.bob.profile
-        profile.email_enabled = False
-        profile.save(update_fields=['email_enabled'])
+        switches = self.bob.messaging_settings
+        switches.email_enabled = False
+        switches.save(update_fields=['email_enabled'])
 
         send_to, skipped = self.audience()
 
@@ -1260,8 +1261,7 @@ class UnsubscribeEndpointTests(APITestCase):
     def test_and_leaves_the_account_wide_switch_alone(self):
         self.client.post(self.url())
 
-        self.bob.profile.refresh_from_db()
-        self.assertTrue(self.bob.profile.email_enabled)
+        self.assertTrue(MessagingSettings.objects.get(user=self.bob).email_enabled)
 
     def test_and_leaves_sms_alone(self):
         self.client.post(self.url())
@@ -2029,12 +2029,12 @@ class EmailMaintenanceTests(TestCase):
         self.assert_dropped_as(row, 'not an active member')
 
     def test_a_retry_is_dropped_if_they_turned_email_off_account_wide(self):
-        # The switch Settings > Notifications shows, read by email's own
+        # The switch Settings > Messaging shows, read by email's own
         # address question - the third rung of the retry check, after the
         # ladder and the block.
         row = self.a_failed_delivery()
-        self.bob.profile.email_enabled = False
-        self.bob.profile.save(update_fields=['email_enabled'])
+        self.bob.messaging_settings.email_enabled = False
+        self.bob.messaging_settings.save(update_fields=['email_enabled'])
 
         self.assert_dropped_as(row, 'email disabled account-wide')
 
@@ -2132,8 +2132,7 @@ class ReceiptTests(APITestCase):
         )
 
     def email_switch(self):
-        self.bob.profile.refresh_from_db()
-        return self.bob.profile.email_enabled
+        return MessagingSettings.objects.get(user=self.bob).email_enabled
 
     def test_delivered(self):
         response = self.receipt('email.delivered')
@@ -2166,13 +2165,22 @@ class ReceiptTests(APITestCase):
         self.assertEqual(self.row.status, EmailDelivery.Status.COMPLAINED)
         self.assertFalse(self.email_switch())
 
-        # The switch is the same one Settings > Notifications shows, and the
+        # The switch is the same one Settings > Messaging shows, and the
         # fan-out reads it - so nothing more reaches them until they turn it on.
         _, skipped = outbound.recipients_for(
             create_message(self.group, self.alice, text='Anyone?')
         )
         self.assertEqual(dict((r.pk, why) for r, why in skipped)[self.bob_row.pk],
                          'email disabled account-wide')
+
+    def test_a_complaint_sticks_even_for_an_account_with_no_settings_row(self):
+        # Every account gets its row at sign-up, but an opt-out must not lean
+        # on that: with the row missing, the complaint creates it already off.
+        MessagingSettings.objects.filter(user=self.bob).delete()
+
+        self.receipt('email.complained')
+
+        self.assertFalse(self.email_switch())
 
     def test_a_suppressed_send_is_a_permanent_failure(self):
         self.receipt('email.suppressed',
@@ -2207,8 +2215,9 @@ class ReceiptTests(APITestCase):
 
     def test_the_same_receipt_twice_is_applied_once(self):
         self.receipt('email.complained', event_id='evt-same')
-        self.bob.profile.email_enabled = True
-        self.bob.profile.save(update_fields=['email_enabled'])
+        switches = MessagingSettings.objects.get(user=self.bob)
+        switches.email_enabled = True
+        switches.save(update_fields=['email_enabled'])
 
         response = self.receipt('email.complained', event_id='evt-same')
 

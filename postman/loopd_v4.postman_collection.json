@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Loopd'n API v4",
-    "description": "# Loopd'n API v4\n\nEvery reply is wrapped in the same envelope:\n\n```json\n{ \"code\": 1, \"message\": \"...\", \"data\": { } }\n```\n\n`code` is `1` for success and `-1` for failure; the HTTP status stays meaningful. `data` is the payload, or the field errors on a failure.\n\n## Start here\n1. **Register**, then **Verify email** (the code is in the server log when `DEBUG` is on).\n2. **Login** - stores your tokens automatically.\n3. **Request phone code** then **Verify phone** - without a verified number your account can never receive a group text.\n4. **Create group** - stores `conversation_id` and gives the group its own phone number.\n\n## What is new since v3\n- **`9. Billing`** - the four platform plans (Free, Premium, Business, Enterprise), Pay-As-You-Go Communication Credit packages, a billing summary, Stripe Checkout for both a plan subscription and a credit top-up, the Stripe billing portal, and the Stripe webhook that keeps `Subscription` and the wallet in sync.\n- **Plan limits are enforced.** *Create group* and *Add members* now return `403` once a Free/Premium/Business plan's `max_groups` or `max_members_per_group` would be exceeded - see *List plans*.\n\n## What was new in v3\n- **Every URL now ends in a slash.** v1 and v2 stripped it, and Django answers a slash-less POST with a 301 that drops the body - so every write request in them silently did nothing.\n- **Payloads fixed**: `Register` and `Reset password` were missing `confirm_password`; `Google sign-in` sent `id_token` where the serializer wants `credential`; `Update my profile` sent an `sms_enabled` that no serializer declares.\n- **Runs top to bottom.** Verify email now precedes Login, the join code is fetched before it is used, and *Delete a group* moved to its own final folder instead of destroying the group halfway through.\n- **Forgot / reset / change password** were missing entirely.\n- **`GET .../participants/`** - the member list, paginated ten at a time. Conversation payloads no longer embed it.\n\n## What was new in v2\n- **Every group has its own phone number.** Bought on creation in the creator's country, never changes, deleted with the group.\n- **Membership has states** - active, pending, left, removed, blocked - and four join modes.\n- **Roles**: promote and demote admins.\n- **Broadcast groups** where only admins post.\n- **Members without accounts**, reachable only by SMS.\n- **Delivery settings** per group, and account-wide.\n- **The inbound SMS webhook.**\n\n## Two things that surprise people\n**404 means \"not yours\".** Access control is the database query, not a check bolted on top - so a conversation you are not in is indistinguishable from one that does not exist. That is deliberate.\n\n**Two SMS switches.** `Profile.sms_enabled` (account-wide) and `Participant.sms_enabled` (this group). Both must be on, plus a verified number, plus consent for members with no account.",
+    "description": "# Loopd'n API v4\n\nEvery reply is wrapped in the same envelope:\n\n```json\n{ \"code\": 1, \"message\": \"...\", \"data\": { } }\n```\n\n`code` is `1` for success and `-1` for failure; the HTTP status stays meaningful. `data` is the payload, or the field errors on a failure.\n\n## Start here\n1. **Register**, then **Verify email** (the code is in the server log when `DEBUG` is on).\n2. **Login** - stores your tokens automatically.\n3. **Request phone code** then **Verify phone** - without a verified number your account can never receive a group text.\n4. **Create group** - stores `conversation_id` and gives the group its own phone number.\n\n## What is new since v3\n- **`9. Billing`** - the four platform plans (Free, Premium, Business, Enterprise), Pay-As-You-Go Communication Credit packages, a billing summary, Stripe Checkout for both a plan subscription and a credit top-up, the Stripe billing portal, and the Stripe webhook that keeps `Subscription` and the wallet in sync.\n- **Plan limits are enforced.** *Create group* and *Add members* now return `403` once a Free/Premium/Business plan's `max_groups` or `max_members_per_group` would be exceeded - see *List plans*.\n\n## What was new in v3\n- **Every URL now ends in a slash.** v1 and v2 stripped it, and Django answers a slash-less POST with a 301 that drops the body - so every write request in them silently did nothing.\n- **Payloads fixed**: `Register` and `Reset password` were missing `confirm_password`; `Google sign-in` sent `id_token` where the serializer wants `credential`; `Update my profile` sent an `sms_enabled` that no serializer declares.\n- **Runs top to bottom.** Verify email now precedes Login, the join code is fetched before it is used, and *Delete a group* moved to its own final folder instead of destroying the group halfway through.\n- **Forgot / reset / change password** were missing entirely.\n- **`GET .../participants/`** - the member list, paginated ten at a time. Conversation payloads no longer embed it.\n\n## What was new in v2\n- **Every group has its own phone number.** Bought on creation in the creator's country, never changes, deleted with the group.\n- **Membership has states** - active, pending, left, removed, blocked - and four join modes.\n- **Roles**: promote and demote admins.\n- **Broadcast groups** where only admins post.\n- **Members without accounts**, reachable only by SMS.\n- **Delivery settings** per group, and account-wide.\n- **The inbound SMS webhook.**\n\n## Two things that surprise people\n**404 means \"not yours\".** Access control is the database query, not a check bolted on top - so a conversation you are not in is indistinguishable from one that does not exist. That is deliberate.\n\n**Two SMS switches.** `MessagingSettings.sms_enabled` (account-wide) and `Participant.sms_enabled` (this group). Both must be on, plus a verified number, plus consent for members with no account.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -613,10 +613,92 @@
                 ""
               ]
             },
-            "description": "Setting `phone_number` here clears `phone_no_verified` - a number is only trusted once proved, and an unverified number is never texted. Send `avatar` as form-data to set a photo.\n\n**The two SMS switches, and why neither is set here:**\n\n| Switch | Set by | Meaning |\n| --- | --- | --- |\n| `Profile.sms_enabled` | **texting STOP** - no endpoint | **all** texts, every group. A master off switch. |\n| `Participant.sms_enabled` | *Delivery settings* | whether **one group** texts you. |\n\nBoth must be on for a text to go out.\n\n`sms_enabled` is **not a field on this endpoint**, and sending it here does nothing: DRF drops keys a serializer does not declare, so the request returns 200 and the switch is unchanged. The account-wide switch is currently only reachable by replying STOP to a message - worth knowing before building a settings toggle against it.",
+            "description": "Setting `phone_number` here clears `phone_no_verified` - a number is only trusted once proved, and an unverified number is never texted. Send `avatar` as form-data to set a photo.\n\n**The two SMS switches, and why neither is set here:**\n\n| Switch | Set by | Meaning |\n| --- | --- | --- |\n| `MessagingSettings.sms_enabled` | **texting STOP** - no endpoint | **all** texts, every group. A master off switch. |\n| `Participant.sms_enabled` | *Delivery settings* | whether **one group** texts you. |\n\nBoth must be on for a text to go out.\n\n`sms_enabled` is **not a field on this endpoint**, and sending it here does nothing: DRF drops keys a serializer does not declare, so the request returns 200 and the switch is unchanged. The account-wide switch is currently only reachable by replying STOP to a message - worth knowing before building a settings toggle against it.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"display_name\": \"Yul\",\n  \"bio\": \"Manila\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get my settings",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/settings/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "settings",
+                ""
+              ]
+            },
+            "description": "Every settings screen at once, keyed by name: `appearance`, `messaging`, `notifications`, `privacy`, `security`. Always your own - there is no id in the URL."
+          }
+        },
+        {
+          "name": "Get one settings screen",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/settings/privacy/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "settings",
+                "privacy",
+                ""
+              ]
+            },
+            "description": "One screen. Swap `privacy` for any of the five names; anything else is 404."
+          }
+        },
+        {
+          "name": "Update a settings screen",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/settings/appearance/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "settings",
+                "appearance",
+                ""
+              ]
+            },
+            "description": "Send only the fields you are changing; the answer is the whole screen. An unknown choice is 400 with the field named. PUT is 405.\n\n**Shown but never written here** - if sent they are ignored and the request still returns 200:\n\n- `messaging.sms_enabled` - only a carrier STOP or START changes it.\n- `security.two_factor_enabled` / `two_factor_method` - turning two-factor on must prove the phone or email first, and that flow does not exist yet.\n\n`messaging.email_enabled` is the same switch as `email_enabled` on *Update my profile*.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"theme\": \"dark\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
