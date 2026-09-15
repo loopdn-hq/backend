@@ -17,7 +17,7 @@ class NotificationSettings(UserSettings):
     NOT HERE, ON PURPOSE - these already exist:
 
     - Muting one group is `chat.Participant.muted`.
-    - The activity feed itself is `chat.Notification` (and its `read_at`).
+    - The activity feed itself is `notification.Notification` (and its `read_at`).
     - Whether group messages arrive by SMS or email is
       `MessagingSettings.sms_enabled` / `email_enabled`.
 
@@ -69,7 +69,7 @@ class NotificationSettings(UserSettings):
     #   On  - an alert when the person is invited to or added to a Loop.
     #   Off - no alert.
     # Today: saved, but changes nothing. The Activity feed still lists being
-    # added ("Added to a group", `chat.Notification`) either way.
+    # added ("Added to a group", `notification.Notification`) either way.
     group_invitations = models.BooleanField(default=True, db_default=True)
 
     # --- Calls -----------------------------------------------------------------

@@ -5,7 +5,7 @@ A member who was promoted while their laptop was shut simply never found out.
 This is the durable half: one row per event per recipient, and the same socket
 frame on top so an open client updates without polling.
 
-One entry point, `notify`, for the same reason membership.py has one entry
+One entry point, `notify`, for the same reason chat/membership.py has one entry
 point per action: the REST API, the inbound-SMS commands and a Celery sweep all
 have to produce identical rows, and three copies of that would be three places
 to get the recipient wrong.
@@ -18,7 +18,7 @@ import logging
 
 from django.db import transaction
 
-from chat.models import Notification
+from notification.models import Notification
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +80,12 @@ def _push(notification):
 
     Their own channel, never the conversation's: this is one person's activity
     feed, and the conversation group would hand it to everybody in the group.
+
+    The socket and its groups are chat's (chat/services.py, and
+    `notification_new` in chat/consumers.py); this only puts the frame on it.
     """
-    from chat.serializers import NotificationSerializer
     from chat.services import send_to_group, user_group
+    from notification.serializers import NotificationSerializer
 
     send_to_group(
         user_group(notification.to_user_id),

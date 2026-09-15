@@ -15,8 +15,8 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from chat.models import Notification
-from chat.serializers import (
+from notification.models import Notification
+from notification.serializers import (
     MarkNotificationsReadSerializer,
     NotificationSerializer,
 )

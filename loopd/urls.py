@@ -35,6 +35,11 @@ urlpatterns = [
     path('api/v1/users/me/phone/', include('otp.urls')),
 
     path('api/v1/users/', include('user.urls')),
+
+    # The activity feed belongs to the notification app but keeps the address
+    # the web app already calls. Ahead of chat.urls for the same reason as the
+    # phone routes above: they cannot collide, but the order says the intent.
+    path('api/v1/chat/notifications/', include('notification.urls')),
     path('api/v1/chat/', include('chat.urls')),
 
     # The one public route a phone network calls. Authenticated by signature

@@ -270,8 +270,8 @@ def announce_added_to_conversation(conversation, users):
     if not users:
         return
 
-    from chat.models import Notification
-    from chat.notifications import notify_many
+    from notification.models import Notification
+    from notification.services import notify_many
 
     notify_many(users, Notification.Type.MEMBER_ADDED, conversation=conversation)
     subscribe_to_conversation(conversation, users)
