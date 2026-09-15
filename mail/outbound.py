@@ -498,4 +498,8 @@ def _dispatch(message_id):
 
 
 def _worker_available():
-    return bool(getattr(settings, 'CELERY_BROKER_URL', '') and settings.REDIS_URL)
+    # One definition, in loopd/celery.py. Kept as a function here because
+    # tests patch it by this name.
+    from loopd.celery import worker_available
+
+    return worker_available()

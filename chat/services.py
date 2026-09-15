@@ -168,6 +168,12 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     # happen inside the transaction still holding this row - see
     # sms/outbound.py:schedule.
     _schedule_delivery(message)
+
+    # A card for the first link, worked out after the commit and pushed to
+    # everyone as an update - see chat/link_previews.py.
+    from chat.link_previews import schedule_link_preview
+
+    schedule_link_preview(message)
     return message
 
 
@@ -264,8 +270,8 @@ def announce_added_to_conversation(conversation, users):
     if not users:
         return
 
-    from chat.models import Notification
-    from chat.notifications import notify_many
+    from notification.models import Notification
+    from notification.services import notify_many
 
     notify_many(users, Notification.Type.MEMBER_ADDED, conversation=conversation)
     subscribe_to_conversation(conversation, users)

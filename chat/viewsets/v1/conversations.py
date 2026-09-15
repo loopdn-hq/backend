@@ -919,9 +919,20 @@ class ConversationViewSet(
         serializer = MessageEditSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        from chat.link_previews import first_link, schedule_link_preview
+
+        previous_link = first_link(message.text)
         message.text = serializer.validated_data['text']
         message.edited_at = timezone.now()
-        message.save(update_fields=['text', 'edited_at', 'updated_at'])
+        fields = ['text', 'edited_at', 'updated_at']
+        if first_link(message.text) != previous_link and message.link_preview:
+            # The old card describes a link that is gone; it goes at once, and
+            # the new link's card follows as its own update.
+            message.link_preview = None
+            fields.append('link_preview')
+        message.save(update_fields=fields)
+        if first_link(message.text) != previous_link:
+            schedule_link_preview(message)
         return self._message_response(message)
 
     def _delete_message(self, request, conversation, message):

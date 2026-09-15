@@ -361,8 +361,8 @@ def _opt_out(participant, phone_number):
         # member simply goes quiet, and every message they send from now on
         # silently misses one person.
         from chat.membership import admin_users
-        from chat.models import Notification
-        from chat.notifications import notify_many
+        from notification.models import Notification
+        from notification.services import notify_many
 
         notify_many(
             admin_users(participant.conversation),

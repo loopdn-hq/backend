@@ -26,12 +26,12 @@ from chat.models import (
     BlockedFromConversation,
     ChannelConsent,
     Conversation,
-    Notification,
     Participant,
     local_part,
     mask_number,
 )
-from chat.notifications import notify
+from notification.models import Notification
+from notification.services import notify
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +100,8 @@ def request_to_join(conversation, *, user=None, phone_number=None,
         """Tell the admins, once the row is really committed."""
         if row.status != Participant.Status.PENDING:
             return
-        from chat.notifications import notify_many
         from chat.services import broadcast_join_request
+        from notification.services import notify_many
 
         # The socket frame tells admins who are looking right now; the
         # notification is what an admin who was not finds waiting for them.

@@ -29,7 +29,6 @@ from chat.models import (
     Conversation,
     Message,
     MessageReaction,
-    Notification,
     Participant,
     REACTION_EMOJI,
 )
@@ -3076,7 +3075,7 @@ class ConversationStarterSubscriptionTests(EnvelopeAssertions, APITestCase):
     def start(self, url_name, payload):
         """Run one request with its after-commit work, recording who was told."""
         with mock.patch('chat.services.broadcast_added_to_conversation') as sent, \
-                mock.patch('chat.notifications.notify_many') as notified:
+                mock.patch('notification.services.notify_many') as notified:
             with self.captureOnCommitCallbacks(execute=True):
                 response = self.client.post(
                     reverse(url_name), payload, format='json'
@@ -3298,153 +3297,6 @@ class UnreadCountTests(EnvelopeAssertions, APITestCase):
 
         self.client.force_authenticate(self.alice)
         self.assertSuccess(self.client.post(self.read_url(empty), {}))
-
-
-class ActivityNotificationTests(EnvelopeAssertions, APITestCase):
-    """The events that used to exist only as a socket frame.
-
-    Each of these already happened before this table; what is new is that it
-    survives nobody being there to see it. The cases worth holding are the
-    ones where a notification would be wrong rather than merely missing: your
-    own actions, a phone-only member with no account to address, and one
-    person's feed being reachable from another person's session.
-    """
-
-    def setUp(self):
-        self.alice = make_user('alice')
-        self.bob = make_user('bob')
-        self.carol = make_user('carol')
-        self.group = Conversation.start_group(self.alice, name='Family')
-        self.group.add_participant(self.bob)
-
-    def feed(self, user, **params):
-        self.client.force_authenticate(user)
-        return self.assertSuccess(
-            self.client.get(reverse('chat:notification-list'), params)
-        )
-
-    def types_for(self, user, **params):
-        return [row['type'] for row in self.feed(user, **params)['results']]
-
-    def bob_row(self):
-        return Participant.objects.get(conversation=self.group, user=self.bob)
-
-    # --- the events ---------------------------------------------------------
-
-    def test_being_promoted_is_recorded(self):
-        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
-
-        self.assertIn('role.granted', self.types_for(self.bob))
-
-    def test_being_demoted_is_recorded(self):
-        row = self.bob_row()
-        membership.set_role(row, Participant.Role.ADMIN, self.alice)
-        membership.set_role(row, Participant.Role.MEMBER, self.alice)
-
-        self.assertIn('role.revoked', self.types_for(self.bob))
-
-    def test_being_removed_is_recorded(self):
-        membership.remove(self.bob_row(), self.alice)
-
-        self.assertIn('member.removed', self.types_for(self.bob))
-
-    def test_being_added_is_recorded(self):
-        # Through the endpoint an admin actually uses. Conversation
-        # .add_participant is deliberately NOT the hook: it also runs for both
-        # sides of a direct chat and for a group's own creator, neither of whom
-        # wants telling they were added to something.
-        self.client.force_authenticate(self.alice)
-        self.assertSuccess(
-            self.client.post(
-                reverse('chat:conversation-members', args=[self.group.id]),
-                {'members': ['carol']},
-                format='json',
-            )
-        )
-
-        self.assertIn('member.added', self.types_for(self.carol))
-
-    # --- who does NOT get told ---------------------------------------------
-
-    def test_you_are_not_told_about_your_own_action(self):
-        # Alice demoting Alice would otherwise put "you are no longer an
-        # admin" in the feed of the person who just clicked it.
-        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
-        alice_row = Participant.objects.get(
-            conversation=self.group, user=self.alice
-        )
-        membership.set_role(alice_row, Participant.Role.MEMBER, self.alice)
-
-        self.assertNotIn('role.revoked', self.types_for(self.alice))
-
-    def test_a_phone_only_member_is_not_notified(self):
-        # No account, so nothing to address - and the call must not raise
-        # rather than every call site having to check for itself.
-        mom = self.group.add_phone_participant(
-            '+639171234567', display_name='Mom', added_by=self.alice
-        )
-        membership.remove(mom, self.alice)
-
-        self.assertEqual(Notification.objects.filter(to_user=None).count(), 0)
-
-    def test_a_message_never_creates_a_notification(self):
-        # unread_count answers this. Two sources of truth would disagree.
-        create_message(self.group, self.alice, text='hello')
-
-        self.assertEqual(self.types_for(self.bob), [])
-
-    # --- the feed itself ----------------------------------------------------
-
-    def test_the_feed_is_only_your_own(self):
-        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
-
-        self.assertEqual(self.types_for(self.carol), [])
-
-    def test_the_unread_count_rides_with_the_list(self):
-        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
-
-        self.assertEqual(self.feed(self.bob)['unread_count'], 1)
-
-    def test_filtering_by_category(self):
-        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
-
-        self.assertEqual(self.types_for(self.bob, category='groups'),
-                         ['role.granted'])
-        self.assertEqual(self.types_for(self.bob, category='sms'), [])
-
-    def test_marking_everything_read(self):
-        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
-
-        self.client.force_authenticate(self.bob)
-        data = self.assertSuccess(
-            self.client.post(reverse('chat:notification-read'), {})
-        )
-
-        self.assertEqual(data['marked'], 1)
-        self.assertEqual(data['unread_count'], 0)
-        self.assertEqual(self.feed(self.bob)['unread_count'], 0)
-
-    def test_marking_read_cannot_reach_somebody_elses_row(self):
-        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
-        theirs = Notification.objects.get(to_user=self.bob)
-
-        self.client.force_authenticate(self.carol)
-        self.assertSuccess(
-            self.client.post(
-                reverse('chat:notification-read'), {'ids': [theirs.pk]},
-                format='json',
-            )
-        )
-
-        theirs.refresh_from_db()
-        self.assertIsNone(theirs.read_at)
-
-    def test_unread_filter(self):
-        membership.set_role(self.bob_row(), Participant.Role.ADMIN, self.alice)
-        self.client.force_authenticate(self.bob)
-        self.client.post(reverse('chat:notification-read'), {})
-
-        self.assertEqual(self.types_for(self.bob, unread='1'), [])
 
 
 class ArchiveAndMuteTests(EnvelopeAssertions, APITestCase):
@@ -3755,155 +3607,6 @@ class ReadReceiptTests(EnvelopeAssertions, APITestCase):
         ]
         self.assertEqual(len(rows), 1)
         self.assertIsNone(rows[0]['last_read_message'])
-
-
-class NotificationActionContextTests(EnvelopeAssertions, APITestCase):
-    """What a client needs to decide what to OFFER on a notification.
-
-    The row records what happened; the action has to be about what is true
-    now. Somebody added and then removed must not still be handed a way in,
-    and how a stranger gets into the group decides what "a way in" even is.
-    """
-
-    def setUp(self):
-        self.alice = make_user('alice')
-        self.bob = make_user('bob')
-        self.group = Conversation.start_group(self.alice, name='Family')
-        self.group.join_mode = Conversation.JoinMode.CODE
-        self.group.save(update_fields=['join_mode'])
-        # Through the endpoint an admin uses. The model's add_participant is
-        # deliberately not the hook - it also runs for both sides of a direct
-        # chat and for a group's own creator.
-        self.add_member(self.group, 'bob')
-
-    def add_member(self, group, username):
-        self.client.force_authenticate(self.alice)
-        self.assertSuccess(
-            self.client.post(
-                reverse('chat:conversation-members', args=[group.id]),
-                {'members': [username]},
-                format='json',
-            )
-        )
-
-    def feed(self, user):
-        self.client.force_authenticate(user)
-        return self.assertSuccess(
-            self.client.get(reverse('chat:notification-list'))
-        )['results']
-
-    def test_the_join_mode_rides_along(self):
-        self.assertEqual(
-            self.feed(self.bob)[0]['conversation_join_mode'], 'code'
-        )
-
-    def test_a_member_reports_as_active(self):
-        self.assertEqual(self.feed(self.bob)[0]['viewer_status'], 'active')
-
-    def test_being_removed_afterwards_changes_the_answer(self):
-        # The "you were added" notification stays - it did happen - but the
-        # client must stop offering a door that is now shut.
-        membership.remove(
-            Participant.objects.get(conversation=self.group, user=self.bob),
-            self.alice,
-        )
-
-        rows = self.feed(self.bob)
-        added = [r for r in rows if r['type'] == 'member.added'][0]
-        self.assertEqual(added['viewer_status'], 'removed')
-
-    def test_the_whole_page_costs_one_query_for_membership(self):
-        # Twenty notifications about twenty groups must not be twenty lookups.
-        for index in range(5):
-            group = Conversation.start_group(self.alice, name=f'G{index}')
-            self.add_member(group, 'bob')
-
-        self.client.force_authenticate(self.bob)
-        url = reverse('chat:notification-list')
-        with CaptureQueriesContext(connection) as first:
-            self.client.get(url)
-
-        for index in range(5, 10):
-            group = Conversation.start_group(self.alice, name=f'G{index}')
-            self.add_member(group, 'bob')
-
-        with CaptureQueriesContext(connection) as second:
-            self.client.get(url)
-
-        self.assertEqual(len(second), len(first))
-
-
-class JoinRequestNotificationTests(EnvelopeAssertions, APITestCase):
-    """An admin should be able to act on a request from the notification.
-
-    Which means the row has to say WHICH membership is asking. Every review
-    endpoint is keyed on Participant.pk, and that is not the user's id - they
-    differ as soon as somebody is in more than one group, and a phone-only
-    requester has no user id at all.
-    """
-
-    def setUp(self):
-        self.admin = make_user('alice')
-        self.stranger = make_user('bob')
-        self.group = Conversation.start_group(self.admin, name='Pickle')
-        self.group.join_mode = Conversation.JoinMode.APPROVAL
-        self.group.save(update_fields=['join_mode'])
-
-    def test_the_admin_is_told_which_membership_is_asking(self):
-        membership.request_to_join(self.group, user=self.stranger)
-
-        self.client.force_authenticate(self.admin)
-        rows = self.assertSuccess(
-            self.client.get(reverse('chat:notification-list'))
-        )['results']
-        asking = [r for r in rows if r['type'] == 'join.requested'][0]
-
-        pending = Participant.objects.get(
-            conversation=self.group, user=self.stranger
-        )
-        self.assertEqual(asking['data']['participant_id'], pending.pk)
-
-    def test_that_id_is_what_the_review_endpoint_takes(self):
-        membership.request_to_join(self.group, user=self.stranger)
-        pending = Participant.objects.get(
-            conversation=self.group, user=self.stranger
-        )
-
-        self.client.force_authenticate(self.admin)
-        self.assertSuccess(
-            self.client.post(
-                reverse('chat:conversation-requests', args=[self.group.id]),
-                {'participant': pending.pk, 'decision': 'approve'},
-                format='json',
-            )
-        )
-
-        pending.refresh_from_db()
-        self.assertEqual(pending.status, Participant.Status.ACTIVE)
-
-    def test_the_feed_says_whether_a_request_is_still_open(self):
-        # A notification is a record, not a queue. Once the request behind it
-        # has been answered - here, or from the admin panel, or by another
-        # admin - the client has to stop offering to answer it again.
-        membership.request_to_join(self.group, user=self.stranger)
-        pending = Participant.objects.get(
-            conversation=self.group, user=self.stranger
-        )
-
-        self.client.force_authenticate(self.admin)
-        rows = self.assertSuccess(
-            self.client.get(reverse('chat:notification-list'))
-        )['results']
-        asking = [r for r in rows if r['type'] == 'join.requested'][0]
-        self.assertEqual(asking['request_status'], 'pending')
-
-        membership.approve(pending, self.admin)
-
-        rows = self.assertSuccess(
-            self.client.get(reverse('chat:notification-list'))
-        )['results']
-        asking = [r for r in rows if r['type'] == 'join.requested'][0]
-        self.assertEqual(asking['request_status'], 'active')
 
 
 class DeliveryEngineTests(EnvelopeAssertions, APITestCase):
@@ -5365,3 +5068,343 @@ class ForwardMessageTests(
             self.forward()
 
         fan_out.assert_called_once()
+
+
+class _FakePage:
+    """Just enough of a `requests` response for chat/link_previews.py."""
+
+    def __init__(self, status=200, headers=None, body=b''):
+        self.status_code = status
+        self.headers = headers or {}
+        self._body = body
+
+    def iter_content(self, size):
+        for index in range(0, len(self._body), size):
+            yield self._body[index:index + size]
+
+    def close(self):
+        pass
+
+
+def _resolves_to(*addresses):
+    import socket
+
+    return [
+        (socket.AF_INET6 if ':' in a else socket.AF_INET, socket.SOCK_STREAM, 6, '', (a, 443))
+        for a in addresses
+    ]
+
+
+class LinkPreviewTests(APITestCase):
+    """The card under a link: what is fetched, what is refused, whose setting counts."""
+
+    PUBLIC = '93.184.216.34'
+    HTML = {'Content-Type': 'text/html; charset=utf-8'}
+
+    def setUp(self):
+        self.alice = make_user('alice', '+639170000301')
+        self.group = Conversation.start_group(self.alice, name='Links')
+
+    def fetch(self, url, pages, addresses=None):
+        from chat import link_previews
+
+        with mock.patch('chat.link_previews.socket.getaddrinfo',
+                        side_effect=addresses or (lambda *a, **k: _resolves_to(self.PUBLIC))), \
+                mock.patch('chat.link_previews.requests.get', side_effect=pages) as get:
+            return link_previews.fetch_preview(url), get
+
+    # --- finding the link ---------------------------------------------------
+
+    def test_the_first_link_is_used_without_trailing_punctuation(self):
+        from chat.link_previews import first_link
+
+        self.assertEqual(
+            first_link('see https://example.com/a?b=1. and http://other.test'),
+            'https://example.com/a?b=1',
+        )
+        self.assertIsNone(first_link('no link here, just www.example.com'))
+
+    # --- reading a page ------------------------------------------------------
+
+    def test_a_page_gives_its_open_graph_card(self):
+        body = (b'<html><head><title>Fallback</title>'
+                b'<meta property="og:title" content="A  Real   Title">'
+                b'<meta property="og:description" content="What it is about">'
+                b'<meta property="og:image" content="/cover.png">'
+                b'<meta property="og:site_name" content="Example"></head><body></body></html>')
+
+        card, _ = self.fetch('https://example.com/post', [_FakePage(headers=self.HTML, body=body)])
+
+        self.assertEqual(card, {
+            'url': 'https://example.com/post',
+            'title': 'A Real Title',
+            'description': 'What it is about',
+            'image_url': 'https://example.com/cover.png',
+            'site_name': 'Example',
+        })
+
+    def test_the_title_and_meta_description_are_the_fallback(self):
+        body = b'<head><title>Plain page</title><meta name="description" content="Words"></head>'
+
+        card, _ = self.fetch('https://example.com/', [_FakePage(headers=self.HTML, body=body)])
+
+        self.assertEqual((card['title'], card['description'], card['image_url']),
+                         ('Plain page', 'Words', None))
+        self.assertEqual(card['site_name'], 'example.com')
+
+    def test_an_http_picture_is_not_kept(self):
+        # Mixed content on an https page, which browsers block anyway.
+        body = b'<head><meta property="og:title" content="T"><meta property="og:image" content="http://example.com/p.png"></head>'
+
+        card, _ = self.fetch('https://example.com/', [_FakePage(headers=self.HTML, body=body)])
+
+        self.assertIsNone(card['image_url'])
+
+    def test_a_file_that_is_neither_a_page_nor_an_image_has_no_card(self):
+        card, _ = self.fetch('https://example.com/file.pdf',
+                             [_FakePage(headers={'Content-Type': 'application/pdf'}, body=b'%PDF')])
+        self.assertIsNone(card)
+
+    def test_nothing_past_the_size_cap_is_read(self):
+        from chat import link_previews
+
+        body = b'<head>' + b' ' * 200 + b'<meta property="og:title" content="Too far"></head>'
+        with mock.patch.object(link_previews, 'MAX_BYTES', 100):
+            card, _ = self.fetch('https://example.com/', [_FakePage(headers=self.HTML, body=body)])
+        self.assertIsNone(card)
+
+    # --- what is refused -----------------------------------------------------
+
+    def test_internal_addresses_are_refused_before_anything_is_fetched(self):
+        from chat.link_previews import UnsafeLink
+
+        for address in ('127.0.0.1', '10.0.0.5', '192.168.1.1', '169.254.169.254', '::1', '::ffff:127.0.0.1'):
+            with self.subTest(address=address):
+                with self.assertRaises(UnsafeLink):
+                    self.fetch('https://example.com/', [], addresses=lambda *a, _x=address, **k: _resolves_to(_x))
+
+    def test_a_redirect_to_an_internal_address_is_refused(self):
+        from chat.link_previews import UnsafeLink
+
+        answers = iter([_resolves_to(self.PUBLIC), _resolves_to('10.0.0.1')])
+        with self.assertRaises(UnsafeLink):
+            self.fetch(
+                'https://example.com/',
+                [_FakePage(status=302, headers={'Location': 'http://internal.test/admin'})],
+                addresses=lambda *a, **k: next(answers),
+            )
+
+    def test_non_web_schemes_odd_ports_and_credentials_are_refused(self):
+        from chat.link_previews import UnsafeLink
+
+        for url in ('ftp://example.com/', 'https://example.com:8080/', 'https://user:pw@example.com/'):
+            with self.subTest(url=url):
+                with self.assertRaises(UnsafeLink):
+                    self.fetch(url, [])
+
+    # --- whose setting, and what happens -----------------------------------
+
+    def test_the_senders_setting_decides(self):
+        from chat.link_previews import wants_preview
+        from user.models import MessagingSettings
+
+        message = Message.objects.create(
+            conversation=self.group, sender=self.alice, text='https://example.com'
+        )
+        self.assertTrue(wants_preview(message))
+
+        settings_row = MessagingSettings.for_user(self.alice)
+        settings_row.link_previews_enabled = False
+        settings_row.save(update_fields=['link_previews_enabled'])
+        message.sender.refresh_from_db()
+        self.assertFalse(wants_preview(Message.objects.get(pk=message.pk)))
+
+    def test_no_card_for_a_message_without_an_account_or_a_link(self):
+        from chat.link_previews import wants_preview
+
+        phone_only = Message.objects.create(conversation=self.group, sender=None, text='https://example.com')
+        no_link = Message.objects.create(conversation=self.group, sender=self.alice, text='hello')
+
+        self.assertFalse(wants_preview(phone_only))
+        self.assertFalse(wants_preview(no_link))
+
+    def test_refreshing_saves_the_card_and_tells_everyone(self):
+        from chat import link_previews
+
+        message = Message.objects.create(conversation=self.group, sender=self.alice, text='https://example.com')
+        card = {'url': 'https://example.com', 'title': 'T', 'description': None,
+                'image_url': None, 'site_name': 'example.com'}
+
+        with mock.patch.object(link_previews, 'fetch_preview', return_value=card), \
+                mock.patch('chat.services.broadcast_message_updated') as broadcast:
+            link_previews.refresh_preview(message.pk)
+
+        message.refresh_from_db()
+        self.assertEqual(message.link_preview, card)
+        broadcast.assert_called_once()
+
+    def test_a_refused_link_leaves_no_card_and_sends_nothing(self):
+        from chat import link_previews
+
+        message = Message.objects.create(conversation=self.group, sender=self.alice, text='http://localhost/')
+        with mock.patch.object(link_previews, 'fetch_preview', side_effect=link_previews.UnsafeLink('internal')), \
+                mock.patch('chat.services.broadcast_message_updated') as broadcast:
+            link_previews.refresh_preview(message.pk)
+
+        message.refresh_from_db()
+        self.assertIsNone(message.link_preview)
+        broadcast.assert_not_called()
+
+    def test_sending_a_message_schedules_its_card(self):
+        with mock.patch('chat.link_previews.schedule_link_preview') as scheduled:
+            create_message(self.group, self.alice, text='look https://example.com')
+        scheduled.assert_called_once()
+
+    def test_a_deleted_message_does_not_show_its_card(self):
+        from django.utils import timezone
+        from chat.serializers import MessageSerializer
+
+        message = Message.objects.create(
+            conversation=self.group, sender=self.alice, text='https://example.com',
+            link_preview={'url': 'https://example.com', 'title': 'T'},
+        )
+        self.assertEqual(MessageSerializer(message).data['link_preview']['title'], 'T')
+
+        message.deleted_at = timezone.now()
+        message.save(update_fields=['deleted_at'])
+        self.assertIsNone(MessageSerializer(message).data['link_preview'])
+
+
+class YouTubeLinkPreviewTests(APITestCase):
+    """YouTube's card comes from oEmbed: its page puts the tags past the read cap."""
+
+    def fetch(self, url, pages):
+        from chat import link_previews
+
+        with mock.patch('chat.link_previews.socket.getaddrinfo',
+                        side_effect=lambda *a, **k: _resolves_to('142.250.66.78')), \
+                mock.patch('chat.link_previews.requests.get', side_effect=pages) as get:
+            return link_previews.fetch_preview(url), get
+
+    def answer(self, **data):
+        import json
+
+        return _FakePage(headers={'Content-Type': 'application/json'},
+                         body=json.dumps(data).encode())
+
+    def test_a_youtube_link_is_asked_of_oembed_not_read_from_the_page(self):
+        link = 'https://www.youtube.com/watch?v=7h-ygnzJek0&list=RDMM7h-ygnzJek0&start_radio=1'
+        card, get = self.fetch(link, [self.answer(
+            title='Fallen (Live at The Cozy Cove) - Lola Amour',
+            author_name='Nine Degrees North',
+            provider_name='YouTube',
+            thumbnail_url='https://i.ytimg.com/vi/7h-ygnzJek0/hqdefault.jpg',
+        )])
+
+        requested = get.call_args.args[0]
+        self.assertTrue(requested.startswith('https://www.youtube.com/oembed?'))
+        self.assertIn('url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D7h-ygnzJek0', requested)
+        self.assertEqual(card, {
+            'url': link,
+            'title': 'Fallen (Live at The Cozy Cove) - Lola Amour',
+            'description': 'Nine Degrees North',
+            'image_url': 'https://i.ytimg.com/vi/7h-ygnzJek0/hqdefault.jpg',
+            'site_name': 'YouTube',
+        })
+
+    def test_short_and_mobile_links_are_asked_too(self):
+        for link in ('https://youtu.be/7h-ygnzJek0', 'https://m.youtube.com/watch?v=7h-ygnzJek0'):
+            with self.subTest(link=link):
+                card, get = self.fetch(link, [self.answer(title='T', provider_name='YouTube')])
+                self.assertTrue(get.call_args.args[0].startswith('https://www.youtube.com/oembed?'))
+                self.assertEqual(card['title'], 'T')
+
+    def test_an_unavailable_video_has_no_card(self):
+        card, _ = self.fetch('https://www.youtube.com/watch?v=gone', [_FakePage(status=404)])
+        self.assertIsNone(card)
+
+    def test_an_http_thumbnail_is_not_kept(self):
+        card, _ = self.fetch('https://youtu.be/x', [self.answer(
+            title='T', thumbnail_url='http://i.ytimg.com/vi/x/hqdefault.jpg')])
+        self.assertIsNone(card['image_url'])
+
+    def test_other_sites_are_still_read_from_the_page(self):
+        body = b'<head><meta property="og:title" content="Page"></head>'
+        card, get = self.fetch('https://example.com/post',
+                               [_FakePage(headers={'Content-Type': 'text/html'}, body=body)])
+        self.assertEqual(get.call_args.args[0], 'https://example.com/post')
+        self.assertEqual(card['title'], 'Page')
+
+
+class _NeverReadPage(_FakePage):
+    """An image response whose body must not be downloaded."""
+
+    def iter_content(self, size):
+        raise AssertionError('the image body was read')
+
+
+class OtherLinkPreviewTests(APITestCase):
+    """Images, Google Images results and TikTok: links a page read cannot card."""
+
+    def fetch(self, url, pages, address='142.250.66.78'):
+        from chat import link_previews
+
+        resolve = address if callable(address) else (lambda *a, **k: _resolves_to(address))
+        with mock.patch('chat.link_previews.socket.getaddrinfo', side_effect=resolve), \
+                mock.patch('chat.link_previews.requests.get', side_effect=pages) as get:
+            return link_previews.fetch_preview(url), get
+
+    def test_a_link_to_an_image_is_a_card_of_the_picture_without_downloading_it(self):
+        link = 'https://i.ytimg.com/vi/7h-ygnzJek0/hqdefault.jpg'
+        card, _ = self.fetch(link, [_NeverReadPage(headers={'Content-Type': 'image/jpeg'})])
+
+        self.assertEqual(card, {'url': link, 'title': None, 'description': None,
+                                'image_url': link, 'site_name': 'i.ytimg.com'})
+
+    def test_an_http_image_link_has_no_card(self):
+        card, _ = self.fetch('http://example.com/photo.jpg',
+                             [_NeverReadPage(headers={'Content-Type': 'image/jpeg'})])
+        self.assertIsNone(card)
+
+    def test_a_google_images_result_is_a_card_of_the_picture_it_names(self):
+        image = 'https://i.ytimg.com/vi/7h-ygnzJek0/hqdefault.jpg'
+        link = ('https://www.google.com/imgres?imgurl=https%3A%2F%2Fi.ytimg.com%2Fvi%2F7h-ygnzJek0'
+                '%2Fhqdefault.jpg&imgrefurl=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D7h-ygnzJek0')
+        card, get = self.fetch(link, [_NeverReadPage(headers={'Content-Type': 'image/jpeg'})])
+
+        # Google's page is never fetched - only the picture, to confirm it.
+        self.assertEqual(get.call_args_list[0].args[0], image)
+        self.assertEqual((card['image_url'], card['site_name'], card['url']),
+                         (image, 'www.youtube.com', link))
+
+    def test_a_google_images_result_on_a_country_domain_counts(self):
+        link = 'https://www.google.com.ph/imgres?imgurl=https%3A%2F%2Fexample.com%2Fp.png'
+        card, _ = self.fetch(link, [_NeverReadPage(headers={'Content-Type': 'image/png'})])
+        self.assertEqual((card['image_url'], card['site_name']),
+                         ('https://example.com/p.png', 'Google Images'))
+
+    def test_a_google_images_result_that_is_not_really_an_image_has_no_card(self):
+        link = 'https://www.google.com/imgres?imgurl=https%3A%2F%2Fexample.com%2Fnot-an-image'
+        card, _ = self.fetch(link, [_FakePage(headers={'Content-Type': 'text/html'}, body=b'<html>')])
+        self.assertIsNone(card)
+
+    def test_a_google_images_result_naming_an_internal_address_is_refused(self):
+        from chat.link_previews import UnsafeLink
+
+        link = 'https://www.google.com/imgres?imgurl=http%3A%2F%2F169.254.169.254%2Flatest%2F'
+        with self.assertRaises(UnsafeLink):
+            self.fetch(link, [], address='169.254.169.254')
+
+    def test_a_tiktok_link_is_asked_of_oembed(self):
+        import json
+
+        link = 'https://www.tiktok.com/@scout2015/video/6718335390845095173'
+        answer = _FakePage(headers={'Content-Type': 'application/json'}, body=json.dumps({
+            'title': 'A video', 'author_name': 'Scout', 'provider_name': 'TikTok',
+            'thumbnail_url': 'https://p16.tiktokcdn.com/x.jpeg',
+        }).encode())
+        card, get = self.fetch(link, [answer])
+
+        self.assertTrue(get.call_args.args[0].startswith('https://www.tiktok.com/oembed?'))
+        self.assertEqual((card['title'], card['description'], card['site_name']),
+                         ('A video', 'Scout', 'TikTok'))

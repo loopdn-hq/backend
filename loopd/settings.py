@@ -157,6 +157,8 @@ INSTALLED_APPS = [
     'user',
     'otp',
     'chat',
+    # The activity feed. Its rows point at chat's conversations and messages.
+    'notification',
     'sms',
     # `mail`, not `email`: a top-level app called `email` would shadow the
     # standard library module for everything on the path.
