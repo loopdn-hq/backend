@@ -1,0 +1,13 @@
+Loopd'n e-receipt
+
+Thanks for your purchase. Your {{ billing_kind }} has been processed.
+
+Item: {{ item_name }}
+Amount paid: {{ amount_display }}
+Currency: {{ currency|upper }}
+Receipt reference: {{ invoice_reference }}
+Purchased at: {{ purchased_at }}
+
+{% if invoice_url %}Open full receipt: {{ invoice_url }}
+
+{% endif %}Need help with billing? Contact {{ support_address }}.

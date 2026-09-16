@@ -155,6 +155,21 @@ UNSUBSCRIBED = EmailTemplate(
     context_keys=('group_name', 'app_url'),
 )
 
+# Sent after Stripe confirms a plan checkout or credit top-up checkout.
+BILLING_CHECKOUT_SUCCESS = EmailTemplate(
+    slug='billing_checkout_success',
+    context_keys=(
+        'billing_kind',
+        'item_name',
+        'amount_display',
+        'currency',
+        'invoice_reference',
+        'invoice_url',
+        'purchased_at',
+    ),
+)
+
+
 CATALOGUE = {
     template.slug: template
     for template in (
@@ -162,6 +177,7 @@ CATALOGUE = {
         GROUP_INVITATION,
         GROUP_MESSAGE,
         UNSUBSCRIBED,
+        BILLING_CHECKOUT_SUCCESS,
     )
 }
 

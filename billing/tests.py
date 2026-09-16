@@ -117,18 +117,74 @@ class StripeWebhookTests(TestCase):
         package = CreditPackage.objects.create(
             name='Test Package', price_cents=1000, credit_cents=1000,
         )
+        self.user.email = 'dave@example.com'
+        self.user.save(update_fields=['email'])
         event = {
             'id': 'evt_2', 'type': 'checkout.session.completed',
             'data': {'object': {
                 'id': 'cs_2', 'mode': 'payment', 'client_reference_id': str(self.user.pk),
                 'metadata': {'credit_package_id': str(package.pk)},
                 'payment_intent': 'pi_2',
+                'amount_total': 1000,
+                'currency': 'usd',
             }},
         }
-        response = self._post_event(event)
+        with mock.patch('billing.webhooks.send_templated_email') as mocked_email:
+            response = self._post_event(event)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         wallet = Wallet.objects.get(user=self.user)
         self.assertEqual(wallet.balance_cents, 1000)
+        mocked_email.assert_called_once()
+        context = mocked_email.call_args.kwargs['context']
+        self.assertEqual(context['billing_kind'], 'credit top-up')
+        self.assertEqual(context['item_name'], 'Test Package')
+
+    def test_checkout_completed_subscription_sends_receipt_email(self):
+        self.user.email = 'dave@example.com'
+        self.user.save(update_fields=['email'])
+
+        premium_price = 'price_premium_email'
+        Plan.objects.filter(code=Plan.Code.PREMIUM).update(stripe_price_id=premium_price)
+
+        subscription = services.get_or_create_subscription(self.user)
+        subscription.stripe_customer_id = 'cus_1'
+        subscription.save(update_fields=['stripe_customer_id', 'updated_at'])
+
+        stripe_subscription = {
+            'id': 'sub_checkout_1',
+            'customer': 'cus_1',
+            'status': 'active',
+            'cancel_at_period_end': False,
+            'current_period_end': int(timezone.now().timestamp()),
+            'items': {'data': [{'price': {'id': premium_price}}]},
+        }
+
+        event = {
+            'id': 'evt_sub_checkout_1',
+            'type': 'checkout.session.completed',
+            'data': {'object': {
+                'id': 'cs_sub_1',
+                'mode': 'subscription',
+                'client_reference_id': str(self.user.pk),
+                'subscription': 'sub_checkout_1',
+                'amount_total': 999,
+                'currency': 'usd',
+                'metadata': {'user_id': str(self.user.pk)},
+            }},
+        }
+
+        stripe_subscription_obj = mock.Mock()
+        stripe_subscription_obj.to_dict.return_value = stripe_subscription
+
+        with mock.patch('stripe.Subscription.retrieve', return_value=stripe_subscription_obj), \
+             mock.patch('billing.webhooks.send_templated_email') as mocked_email:
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mocked_email.assert_called_once()
+        context = mocked_email.call_args.kwargs['context']
+        self.assertEqual(context['billing_kind'], 'plan subscription')
+        self.assertEqual(context['item_name'], 'Premium')
 
     def test_subscription_updated_activates_the_plan(self):
         premium_price = 'price_premium_test'

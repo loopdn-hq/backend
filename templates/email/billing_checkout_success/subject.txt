@@ -1,0 +1,1 @@
+Loopd'n e-receipt: {{ amount_display }} for {{ item_name }}
