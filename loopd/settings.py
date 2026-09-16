@@ -164,6 +164,9 @@ INSTALLED_APPS = [
     # standard library module for everything on the path.
     'mail',
     'billing',
+    # Custom-priced plans sold through the Plan Builder - a dynamic,
+    # catalog-driven configuration rather than billing's single plan code.
+    'enterprise',
 ]
 
 MIDDLEWARE = [
@@ -740,6 +743,7 @@ REST_FRAMEWORK = {
         # running up Stripe API usage or tripping Stripe's own abuse controls.
         'billing_checkout': '10/hour',
         'billing_portal': '20/hour',
+        'enterprise_checkout': '10/hour',
     },
 }
 
