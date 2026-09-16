@@ -1308,6 +1308,26 @@ class AppMembersReceiveTextsTests(TestCase):
             self.deliveries()[bob.pk].reason, 'sms disabled account-wide'
         )
 
+    # --- "Send and receive Loop messages by text", off ------------------------
+
+    def test_texts_off_also_stops_notices(self):
+        # A notice about a Loop is a Loop message too.
+        bob = self.add_app_member('bob', '+639171111111')
+        bob.messaging_settings.sms_enabled = False
+        bob.messaging_settings.save(update_fields=['sms_enabled'])
+        row = Participant.objects.get(conversation=self.group, user=bob)
+
+        notice = outbound.send_notice(self.group, row, 'You are an admin now')
+
+        self.assertEqual(notice.status, SmsDelivery.Status.SKIPPED)
+        self.assertEqual(notice.reason, 'sms disabled account-wide')
+
+    def test_texts_off_is_never_retried(self):
+        # The person's own choice: retrying would text them anyway.
+        from sms.maintenance import PERMANENT_REASONS
+
+        self.assertIn('sms disabled account-wide', PERMANENT_REASONS)
+
 
 class BuyingANumberTests(TestCase):
     """Ordering a number from the provider.
@@ -2513,13 +2533,12 @@ class GroupSmsSettingsTests(TransactionTestCase):
 
 
 class GroupConsentTests(TestCase):
-    """YES and NO answer one group. START and STOP answer for all of LoopD'n.
+    """YES, NO, STOP and START each answer for ONE group: the one texted.
 
-    The distinction is the point. Somebody tired of one noisy group should not
-    have to leave every group to quieten it, and a product that makes them do
-    that loses a channel it was allowed to use. It also has to hold in the
-    other direction: STOP is carrier-mandated and must silence everything,
-    whatever any single group has been told.
+    YES and NO answer that group's invitation. STOP opts the number out of that
+    group in both directions - it neither texts them nor takes their texts -
+    until START to the same number. Somebody tired of one noisy group should not
+    lose every other group to quieten it.
     """
 
     def setUp(self):
@@ -2594,47 +2613,82 @@ class GroupConsentTests(TestCase):
             sms_consent_of(work_row), ChannelConsent.Status.OPTED_IN
         )
 
-    def test_stop_reaches_every_group_this_number_is_in(self):
-        # The carrier's word, and the assertion that matters. It used to read
-        # `assertFalse(work_row.user_id and ...)`, which is vacuously true for
-        # a phone-only row - the test passed while STOP was silencing Family
-        # and leaving Work free to carry on texting the same person.
-        self.invite_to(self.family)
+    def test_stop_only_reaches_the_group_it_was_sent_to(self):
+        family_row = self.invite_to(self.family)
         work_row = self.invite_to(self.work)
+        self.send(self.family, 'YES')
         self.send(self.work, 'YES')
 
         self.send(self.family, 'STOP')
 
+        family_row.refresh_from_db()
         work_row.refresh_from_db()
-        self.assertFalse(work_row.sms_enabled)
+        self.assertFalse(family_row.sms_enabled)
+        self.assertEqual(sms_consent_of(family_row), ChannelConsent.Status.OPTED_OUT)
+        self.assertTrue(work_row.sms_enabled)
+        self.assertEqual(sms_consent_of(work_row), ChannelConsent.Status.OPTED_IN)
 
     def test_and_the_delivery_engine_agrees(self):
-        # Through the ladder rather than the column, because the column only
+        # Through the ladder rather than the columns, because a column only
         # matters if something reads it.
         from chat import delivery
 
-        self.invite_to(self.family)
+        family_row = self.invite_to(self.family)
         work_row = self.invite_to(self.work)
+        self.send(self.family, 'YES')
         self.send(self.work, 'YES')
 
         self.send(self.family, 'STOP')
 
+        family_row.refresh_from_db()
         work_row.refresh_from_db()
-        self.assertEqual(
-            delivery.refusal_reason(work_row, ChannelConsent.Channel.SMS),
-            'sms disabled for this group',
+        self.assertIsNotNone(
+            delivery.refusal_reason(family_row, ChannelConsent.Channel.SMS)
         )
+        self.assertIsNone(delivery.refusal_reason(work_row, ChannelConsent.Channel.SMS))
 
-    def test_start_brings_every_group_back(self):
-        self.invite_to(self.family)
+    def test_start_only_brings_that_group_back(self):
+        family_row = self.invite_to(self.family)
         work_row = self.invite_to(self.work)
-        self.send(self.work, 'YES')
         self.send(self.family, 'STOP')
+        self.send(self.work, 'STOP')
 
         self.send(self.family, 'START')
 
-        work_row.refresh_from_db()
-        self.assertTrue(work_row.sms_enabled)
+        self.assertEqual(sms_consent_of(family_row), ChannelConsent.Status.OPTED_IN)
+        self.assertEqual(sms_consent_of(work_row), ChannelConsent.Status.OPTED_OUT)
+
+    # --- after STOP, the group takes nothing from that number ---------------
+
+    def test_a_number_that_stopped_a_group_cannot_post_to_it(self):
+        self.invite_to(self.family)
+        self.send(self.family, 'YES')
+        self.send(self.family, 'STOP')
+
+        result = self.send(self.family, 'Running late')
+
+        self.assertEqual(result.action, 'ignored_opted_out')
+        self.assertIsNone(result.reply)
+        self.assertEqual(self.family.messages.count(), 0)
+
+    def test_but_help_and_start_still_work(self):
+        self.invite_to(self.family)
+        self.send(self.family, 'STOP')
+
+        self.assertEqual(self.send(self.family, 'HELP').action, 'help')
+        self.assertEqual(self.send(self.family, 'START').action, 'opted_in')
+
+    def test_stopping_one_group_still_lets_them_post_to_another(self):
+        self.invite_to(self.family)
+        self.invite_to(self.work)
+        self.send(self.family, 'YES')
+        self.send(self.work, 'YES')
+        self.send(self.family, 'STOP')
+
+        result = self.send(self.work, 'See you at 9')
+
+        self.assertEqual(result.action, 'posted')
+        self.assertEqual(self.work.messages.count(), 1)
 
     def test_start_does_not_resurrect_a_group_they_declined(self):
         # STOP moved a switch, not an answer. Restoring the switch must not
@@ -2701,85 +2755,56 @@ class GroupConsentTests(TestCase):
         self.assertEqual(sms_consent_of(mom), ChannelConsent.Status.OPTED_IN)
         self.assertEqual(self.family.messages.count(), 0)
 
-    # --- STOP is about the NUMBER, not about which row answered -------------
+    # --- an account's own switch, "Send and receive Loop messages by text" ---
 
-    def test_stop_from_an_account_row_silences_their_phone_only_rows(self):
-        # One human, two kinds of row, one number. The sweep used to ask which
-        # kind had answered and only sweep the matching kind, so this
-        # arrangement left Work texting a number that had just said STOP.
-        self.alice.profile.phone_number = self.number
-        self.alice.profile.phone_no_verified = True
-        self.alice.profile.save()
-        work_row = self.invite_to(self.work)
-        self.send(self.work, 'YES')
-
-        # Alice answers from her own (account) row in Family.
-        self.send(self.family, 'STOP')
-
-        work_row.refresh_from_db()
-        self.assertFalse(work_row.sms_enabled)
-
-    def test_stop_from_a_phone_only_row_silences_the_account_too(self):
-        # The mirror. The profile write used to be guarded on the answering
-        # row having an account, so a phone-only STOP never reached it - and
-        # the account's own groups are gated on the profile switch.
+    def account_member_of(self, *conversations):
+        """A verified account on this number, opted in to texts in each group."""
         bob = User.objects.create_user(username='bob', password='x')
         bob.profile.phone_number = self.number
         bob.profile.phone_no_verified = True
         bob.profile.save()
-        self.invite_to(self.family)
+        rows = []
+        for conversation in conversations:
+            conversation.add_participant(bob)
+            row = Participant.objects.get(conversation=conversation, user=bob)
+            membership.set_channel_consent(
+                row, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
+            )
+            rows.append(row)
+        return bob, rows
+
+    def test_stop_from_an_account_leaves_its_switch_and_other_groups_alone(self):
+        bob, (family_row, work_row) = self.account_member_of(self.family, self.work)
 
         self.send(self.family, 'STOP')
-
-        switches = MessagingSettings.objects.get(user=bob)
-        self.assertFalse(switches.sms_enabled)
-        self.assertIsNotNone(switches.sms_opt_out_at)
-
-    def test_stop_sticks_even_for_an_account_with_no_settings_row(self):
-        # Every account gets its row at sign-up, but an opt-out must not lean
-        # on that: with the row missing, the sweep creates it already off.
-        bob = User.objects.create_user(username='bob', password='x')
-        bob.profile.phone_number = self.number
-        bob.profile.phone_no_verified = True
-        bob.profile.save()
-        self.invite_to(self.family)
-        MessagingSettings.objects.filter(user=bob).delete()
-
-        self.send(self.family, 'STOP')
-
-        switches = MessagingSettings.objects.get(user=bob)
-        self.assertFalse(switches.sms_enabled)
-        self.assertIsNotNone(switches.sms_opt_out_at)
-
-    def test_start_brings_the_account_back_too(self):
-        bob = User.objects.create_user(username='bob', password='x')
-        bob.profile.phone_number = self.number
-        bob.profile.phone_no_verified = True
-        bob.profile.save()
-        self.invite_to(self.family)
-        self.send(self.family, 'STOP')
-
-        self.send(self.family, 'START')
 
         self.assertTrue(MessagingSettings.objects.get(user=bob).sms_enabled)
+        self.assertEqual(sms_consent_of(family_row), ChannelConsent.Status.OPTED_OUT)
+        self.assertEqual(sms_consent_of(work_row), ChannelConsent.Status.OPTED_IN)
 
-    def test_the_delivery_engine_agrees_across_both_kinds(self):
-        # Through the ladder rather than the columns, because a column only
-        # matters if something reads it.
-        from chat import delivery
+    def test_with_texts_off_their_texts_are_ignored_silently(self):
+        bob, _ = self.account_member_of(self.family)
+        MessagingSettings.objects.filter(user=bob).update(sms_enabled=False)
 
-        self.alice.profile.phone_number = self.number
-        self.alice.profile.phone_no_verified = True
-        self.alice.profile.save()
-        work_row = self.invite_to(self.work)
-        self.send(self.work, 'YES')
+        result = self.send(self.family, 'Running late')
 
-        self.send(self.family, 'STOP')
+        self.assertEqual(result.action, 'ignored_sms_off')
+        self.assertIsNone(result.reply)
+        self.assertEqual(self.family.messages.count(), 0)
 
-        work_row.refresh_from_db()
-        self.assertIsNotNone(
-            delivery.refusal_reason(work_row, ChannelConsent.Channel.SMS)
-        )
+    def test_with_texts_off_stop_and_start_still_work(self):
+        bob, (row,) = self.account_member_of(self.family)
+        MessagingSettings.objects.filter(user=bob).update(sms_enabled=False)
+
+        self.assertEqual(self.send(self.family, 'STOP').action, 'opted_out')
+        self.assertEqual(sms_consent_of(row), ChannelConsent.Status.OPTED_OUT)
+
+        result = self.send(self.family, 'START')
+        self.assertEqual(result.action, 'opted_in')
+        # Back on for the group, but the account still sends nothing - and the
+        # reply says so rather than promising texts.
+        self.assertIn('texts are off', result.reply)
+        self.assertFalse(MessagingSettings.objects.get(user=bob).sms_enabled)
 
     # --- silence while pending ----------------------------------------------
 

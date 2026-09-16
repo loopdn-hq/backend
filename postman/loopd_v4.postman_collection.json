@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Loopd'n API v4",
-    "description": "# Loopd'n API v4\n\nEvery reply is wrapped in the same envelope:\n\n```json\n{ \"code\": 1, \"message\": \"...\", \"data\": { } }\n```\n\n`code` is `1` for success and `-1` for failure; the HTTP status stays meaningful. `data` is the payload, or the field errors on a failure.\n\n## Start here\n1. **Register**, then **Verify email** (the code is in the server log when `DEBUG` is on).\n2. **Login** - stores your tokens automatically.\n3. **Request phone code** then **Verify phone** - without a verified number your account can never receive a group text.\n4. **Create group** - stores `conversation_id` and gives the group its own phone number.\n\n## What is new since v3\n- **`9. Billing`** - the four platform plans (Free, Premium, Business, Enterprise), Pay-As-You-Go Communication Credit packages, a billing summary, Stripe Checkout for both a plan subscription and a credit top-up, the Stripe billing portal, and the Stripe webhook that keeps `Subscription` and the wallet in sync.\n- **Plan limits are enforced.** *Create group* and *Add members* now return `403` once a Free/Premium/Business plan's `max_groups` or `max_members_per_group` would be exceeded - see *List plans*.\n\n## What was new in v3\n- **Every URL now ends in a slash.** v1 and v2 stripped it, and Django answers a slash-less POST with a 301 that drops the body - so every write request in them silently did nothing.\n- **Payloads fixed**: `Register` and `Reset password` were missing `confirm_password`; `Google sign-in` sent `id_token` where the serializer wants `credential`; `Update my profile` sent an `sms_enabled` that no serializer declares.\n- **Runs top to bottom.** Verify email now precedes Login, the join code is fetched before it is used, and *Delete a group* moved to its own final folder instead of destroying the group halfway through.\n- **Forgot / reset / change password** were missing entirely.\n- **`GET .../participants/`** - the member list, paginated ten at a time. Conversation payloads no longer embed it.\n\n## What was new in v2\n- **Every group has its own phone number.** Bought on creation in the creator's country, never changes, deleted with the group.\n- **Membership has states** - active, pending, left, removed, blocked - and four join modes.\n- **Roles**: promote and demote admins.\n- **Broadcast groups** where only admins post.\n- **Members without accounts**, reachable only by SMS.\n- **Delivery settings** per group, and account-wide.\n- **The inbound SMS webhook.**\n\n## Two things that surprise people\n**404 means \"not yours\".** Access control is the database query, not a check bolted on top - so a conversation you are not in is indistinguishable from one that does not exist. That is deliberate.\n\n**Two SMS switches.** `MessagingSettings.sms_enabled` (account-wide) and `Participant.sms_enabled` (this group). Both must be on, plus a verified number, plus consent for members with no account.",
+    "description": "# Loopd'n API v4\n\nEvery reply is wrapped in the same envelope:\n\n```json\n{ \"code\": 1, \"message\": \"...\", \"data\": { } }\n```\n\n`code` is `1` for success and `-1` for failure; the HTTP status stays meaningful. `data` is the payload, or the field errors on a failure.\n\n## Start here\n1. **Register**, then **Verify email** (the code is in the server log when `DEBUG` is on).\n2. **Login** - stores your tokens automatically.\n3. **Request phone code** then **Verify phone** - without a verified number your account can never receive a group text.\n4. **Create group** - stores `conversation_id` and gives the group its own phone number.\n\n## What is new since v3\n- **`9. Billing`** - the four platform plans (Free, Premium, Business, Enterprise), Pay-As-You-Go Communication Credit packages, a billing summary, Stripe Checkout for both a plan subscription and a credit top-up, the Stripe billing portal, and the Stripe webhook that keeps `Subscription` and the wallet in sync.\n- **Plan limits are enforced.** *Create group* and *Add members* now return `403` once a Free/Premium/Business plan's `max_groups` or `max_members_per_group` would be exceeded - see *List plans*.\n\n## What was new in v3\n- **Every URL now ends in a slash.** v1 and v2 stripped it, and Django answers a slash-less POST with a 301 that drops the body - so every write request in them silently did nothing.\n- **Payloads fixed**: `Register` and `Reset password` were missing `confirm_password`; `Google sign-in` sent `id_token` where the serializer wants `credential`; `Update my profile` sent an `sms_enabled` that no serializer declares.\n- **Runs top to bottom.** Verify email now precedes Login, the join code is fetched before it is used, and *Delete a group* moved to its own final folder instead of destroying the group halfway through.\n- **Forgot / reset / change password** were missing entirely.\n- **`GET .../participants/`** - the member list, paginated ten at a time. Conversation payloads no longer embed it.\n\n## What was new in v2\n- **Every group has its own phone number.** Bought on creation in the creator's country, never changes, deleted with the group.\n- **Membership has states** - active, pending, left, removed, blocked - and four join modes.\n- **Roles**: promote and demote admins.\n- **Broadcast groups** where only admins post.\n- **Members without accounts**, reachable only by SMS.\n- **Delivery settings** per group, and account-wide.\n- **The inbound SMS webhook.**\n\n## Two things that surprise people\n**404 means \"not yours\".** Access control is the database query, not a check bolted on top - so a conversation you are not in is indistinguishable from one that does not exist. That is deliberate.\n\n**Two SMS switches.** `MessagingSettings.sms_enabled` (the account's own, every group) and `Participant.sms_enabled` (this group - STOP and START to its number move it). Both must be on, plus a verified number, plus consent for that group.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -61,6 +61,10 @@
     },
     {
       "key": "credit_package_id",
+      "value": ""
+    },
+    {
+      "key": "push_endpoint",
       "value": ""
     }
   ],
@@ -586,7 +590,7 @@
                 ""
               ]
             },
-            "description": "Display name, avatar, phone number, and whether the number and email are verified.\n\n**`sms_enabled` is not in this payload**, despite being a real column on the profile. It is on no serializer, so a client reading `data.sms_enabled` gets `undefined` rather than the switch it expects - see *Update my profile* for what actually sets it."
+            "description": "Display name, avatar, phone number, whether the number and email are verified, and `email_enabled`.\n\n**`sms_enabled` is not in this payload.** \"Send and receive Loop messages by text\" lives on *Get my settings*, under `messaging`."
           }
         },
         {
@@ -613,7 +617,7 @@
                 ""
               ]
             },
-            "description": "Setting `phone_number` here clears `phone_no_verified` - a number is only trusted once proved, and an unverified number is never texted. Send `avatar` as form-data to set a photo.\n\n**The two SMS switches, and why neither is set here:**\n\n| Switch | Set by | Meaning |\n| --- | --- | --- |\n| `MessagingSettings.sms_enabled` | **texting STOP** - no endpoint | **all** texts, every group. A master off switch. |\n| `Participant.sms_enabled` | *Delivery settings* | whether **one group** texts you. |\n\nBoth must be on for a text to go out.\n\n`sms_enabled` is **not a field on this endpoint**, and sending it here does nothing: DRF drops keys a serializer does not declare, so the request returns 200 and the switch is unchanged. The account-wide switch is currently only reachable by replying STOP to a message - worth knowing before building a settings toggle against it.",
+            "description": "Setting `phone_number` here clears `phone_no_verified` - a number is only trusted once proved, and an unverified number is never texted. Send `avatar` as form-data to set a photo.\n\n**The two SMS switches, and why neither is set here:**\n\n| Switch | Set by | Meaning |\n| --- | --- | --- |\n| `MessagingSettings.sms_enabled` | *Update a settings screen* (`messaging`) | \"Send and receive Loop messages by text\": **every** group, both ways. |\n| `Participant.sms_enabled` | *Delivery settings*, or **texting STOP / START** to that group's number | whether **one group** texts you - and, after STOP, takes your texts. |\n\nBoth must be on for a text to go out.\n\n`sms_enabled` is **not a field on this endpoint**, and sending it here does nothing: DRF drops keys a serializer does not declare, so the request returns 200 and the switch is unchanged.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"display_name\": \"Yul\",\n  \"bio\": \"Manila\"\n}",
@@ -695,7 +699,7 @@
                 ""
               ]
             },
-            "description": "Send only the fields you are changing; the answer is the whole screen. An unknown choice is 400 with the field named. PUT is 405.\n\n**Shown but never written here** - if sent they are ignored and the request still returns 200:\n\n- `messaging.sms_enabled` - only a carrier STOP or START changes it.\n- `security.two_factor_enabled` / `two_factor_method` - turning two-factor on must prove the phone or email first, and that flow does not exist yet.\n\n`messaging.email_enabled` is the same switch as `email_enabled` on *Update my profile*.",
+            "description": "Send only the fields you are changing; the answer is the whole screen. An unknown choice is 400 with the field named. PUT is 405.\n\n**Shown but never written here** - if sent they are ignored and the request still returns 200:\n\n- `security.two_factor_enabled` / `two_factor_method` - turning two-factor on must prove the phone or email first, and that flow does not exist yet.\n\n`messaging.sms_enabled` is \"Send and receive Loop messages by text\" for every group, both ways; a STOP to one group's number is separate and lives on that membership. `messaging.email_enabled` is the same switch as `email_enabled` on *Update my profile*.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"theme\": \"dark\"\n}",
@@ -1589,10 +1593,10 @@
                 ""
               ]
             },
-            "description": "**`client_id` makes a retry safe.** It is your own id for this message. A send that times out - or a websocket that drops mid-send - leaves you unable to tell whether it landed; retrying with the SAME `client_id` returns the message already stored instead of posting a second one. Without it, a retry creates a second row with a different id that no client-side dedupe can collapse, and schedules a **second billed SMS fan-out to every member's phone**.\n\nOptional, scoped per conversation, and echoed back on the message so you can match it to the entry you rendered optimistically. `{{$guid}}` is a Postman variable that generates a fresh one per send.\n\nPost to the conversation. Text, attachments, or both - but not neither.\n\nThe message goes to app members over the websocket immediately, and is **fanned out by SMS** to every member who should receive it - excluding you. Who that is depends on their delivery settings, their consent, and whether their number is verified; every decision not to send is recorded with a reason.\n\nIn a `broadcast` group a non-admin gets `403`.",
+            "description": "**`client_id` makes a retry safe.** It is your own id for this message. A send that times out - or a websocket that drops mid-send - leaves you unable to tell whether it landed; retrying with the SAME `client_id` returns the message already stored instead of posting a second one. Without it, a retry creates a second row with a different id that no client-side dedupe can collapse, and schedules a **second billed SMS fan-out to every member's phone**.\n\nOptional, scoped per conversation, and echoed back on the message so you can match it to the entry you rendered optimistically. `{{$guid}}` is a Postman variable that generates a fresh one per send.\n\nPost to the conversation. Text, attachments, or both - but not neither.\n\nThe message goes to app members over the websocket immediately, and is **fanned out by SMS** to every member who should receive it - excluding you. Who that is depends on their delivery settings, their consent, and whether their number is verified; every decision not to send is recorded with a reason.\n\nIn a `broadcast` group a non-admin gets `403`.\n\n**`mentions` are PARTICIPANT ids, not names.** Most members have no handle to parse - they are a number with a display name, and two of them can be called \"Mum\" - so the composer sends the ids it offered and the words stay plain, which is what makes the SMS and email copies read as written. An id that is not an ACTIVE member of THIS conversation is dropped silently rather than refusing the message. `mention_everyone` is the `@everyone` flag, usable by any member.\n\nSomebody who is mentioned, or whose message is replied to, is notified even when they have turned group messages off - unless they muted the group, which silences everything.",
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"text\": \"Dinner at 7\",\n  \"client_id\": \"{{$guid}}\"\n}",
+              "raw": "{\n  \"text\": \"@Bob dinner at 7\",\n  \"client_id\": \"{{$guid}}\",\n  \"mentions\": [\n    \"{{member_participant_id}}\"\n  ],\n  \"mention_everyone\": false\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -1947,7 +1951,104 @@
       ]
     },
     {
-      "name": "9. Cleanup (destructive)",
+      "name": "9. Web push",
+      "item": [
+        {
+          "name": "Get the VAPID public key",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/push/key/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "push",
+                "key",
+                ""
+              ]
+            },
+            "description": "The application server key a browser subscribes with.\n\nServed rather than configured into the web app: the frontend is a static export, so a build-time value could not be rotated without a rebuild and would sit in every cached bundle. The private half never leaves the server.\n\n`enabled` is false when no key pair is configured, so a client can say so instead of offering a switch that does nothing."
+          }
+        },
+        {
+          "name": "Register this browser",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/push/subscriptions/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "push",
+                "subscriptions",
+                ""
+              ]
+            },
+            "description": "Remember this browser, so it can be notified when the app is closed. Send exactly what `subscription.toJSON()` gives you.\n\n**Keyed on the endpoint, not on the account.** The same browser signing in as somebody else MOVES the row to that account - otherwise a shared laptop shows one person's messages, with the sender and the words, to whoever sits down next.\n\nOne row per browser: a laptop and a phone both get notified, because a notification that arrived on only one of them looks like it worked.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"endpoint\": \"{{push_endpoint}}\",\n  \"keys\": {\n    \"p256dh\": \"BPu...\",\n    \"auth\": \"k9...\"\n  },\n  \"user_agent\": \"Mozilla/5.0\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Forget this browser",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/push/subscriptions/remove/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "push",
+                "subscriptions",
+                "remove",
+                ""
+              ]
+            },
+            "description": "Turn notifications off for this browser. The web app also calls this on sign-out.\n\nScoped to your own rows, so an endpoint somebody else registered cannot be removed by guessing it - an endpoint is a URL, and URLs get pasted into places. Silent when there is nothing to delete: \"they were already off\" is not an error anybody can act on.\n\nA browser that has been wiped needs no call at all - the push service answers 404 or 410 and the row is deleted at the first refusal.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"endpoint\": \"{{push_endpoint}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. Cleanup (destructive)",
       "item": [
         {
           "name": "Delete a group",

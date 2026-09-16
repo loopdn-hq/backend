@@ -422,7 +422,10 @@ class ConversationViewSet(
             Participant.objects.filter(
                 conversation=conversation, status=Participant.Status.ACTIVE
             )
-            .select_related('user__profile')
+            # privacy_settings too: the serializer asks each member whether
+            # their read receipts may be shown, and without this that is a
+            # query per row.
+            .select_related('user__profile', 'user__privacy_settings')
             .order_by('joined_at', 'pk')
         )
 
@@ -931,6 +934,21 @@ class ConversationViewSet(
             message.link_preview = None
             fields.append('link_preview')
         message.save(update_fields=fields)
+
+        # The edited words name whoever the edited words name. Only when the
+        # client says so: an older client that sends just `text` leaves the
+        # existing mentions alone rather than silently clearing them.
+        if 'mentions' in serializer.validated_data or (
+            'mention_everyone' in serializer.validated_data
+        ):
+            from chat.mentions import set_mentions
+
+            set_mentions(
+                message,
+                serializer.validated_data.get('mentions'),
+                everyone=serializer.validated_data.get('mention_everyone', False),
+            )
+
         if first_link(message.text) != previous_link:
             schedule_link_preview(message)
         return self._message_response(message)

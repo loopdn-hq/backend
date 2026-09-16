@@ -94,3 +94,17 @@ def _push(notification):
             'notification': NotificationSerializer(notification).data,
         },
     )
+
+    # And to their browsers, for the kinds of event they asked to be told
+    # about - see notification/push/rules.py. Caught here: the socket frame
+    # above has already gone out, and a push failing must not undo it or
+    # bubble into whatever created the notification.
+    #
+    # A function-local import because push reads this app's models and the
+    # user's settings, which are not ready at module import time.
+    from notification.push.outbound import schedule_notification
+
+    try:
+        schedule_notification(notification)
+    except Exception:
+        logger.exception('Push failed for notification %s', notification.pk)

@@ -28,6 +28,7 @@ default stays safe and the slow path costs one extra query on a miss.
 """
 from django.contrib.auth.models import User
 
+from user import privacy
 from user.blocks import blocked_user_ids
 
 # Below this, a search is a directory dump rather than a lookup.
@@ -38,10 +39,24 @@ def active_users():
     return User.objects.select_related('profile').filter(is_active=True)
 
 
-def find_user(identifier, exclude=None, *, apply_blocks=True):
+def find_user(identifier, exclude=None, *, apply_blocks=True,
+              respect_discoverability=True):
     """Resolve a username, an email address or a phone number to one user.
 
     Returns None if nothing matches.
+
+    THE NUMBER AND ADDRESS BRANCHES OBEY Settings → Privacy. Somebody who
+    turned "Find me using my phone number" or "…my email" off is not returned
+    by that branch, here or in `search_users` - so they cannot be direct-
+    messaged, added or invited by that identifier. Their @username still finds
+    them: these two switches are about the identifiers people hand out, not a
+    way to disappear.
+
+    `respect_discoverability=False` has exactly one caller, and it is not a
+    hole: `chat/membership.py:invite_by_email` asks a second time, after the
+    ordinary lookup has already missed, only to find out whether the address
+    belongs to a hidden account - so it can decline to email an invitation
+    that could never be claimed. It never returns that user to anybody.
 
     A leading '+' means the input is a phone number - the only form profiles
     store - so there is never any ambiguity with a numeric username.
@@ -77,16 +92,22 @@ def find_user(identifier, exclude=None, *, apply_blocks=True):
             queryset = queryset.exclude(pk__in=blocked_user_ids(exclude))
 
     if identifier.startswith('+'):
-        return queryset.filter(
+        by_number = queryset.filter(
             profile__phone_number=identifier, profile__phone_no_verified=True
-        ).first()
+        )
+        if respect_discoverability:
+            by_number = by_number.filter(privacy.discoverable_by('discoverable_by_phone'))
+        return by_number.first()
 
     if '@' in identifier:
         by_email = queryset.filter(
             email__iexact=identifier, profile__email_verified=True
-        ).first()
-        if by_email is not None:
-            return by_email
+        )
+        if respect_discoverability:
+            by_email = by_email.filter(privacy.discoverable_by('discoverable_by_email'))
+        found = by_email.first()
+        if found is not None:
+            return found
 
     return queryset.filter(username__iexact=identifier).first()
 
@@ -115,8 +136,15 @@ def search_users(term, exclude=None):
         queryset = queryset.exclude(pk__in=blocked_user_ids(exclude))
 
     if term.startswith('+'):
-        return queryset.filter(
-            profile__phone_number=term, profile__phone_no_verified=True
-        ).order_by('username')
+        # And "Find me using my phone number", for the same reason `find_user`
+        # obeys it: hiding somebody there while search still returned them
+        # would make the switch cosmetic.
+        return (
+            queryset.filter(
+                profile__phone_number=term, profile__phone_no_verified=True
+            )
+            .filter(privacy.discoverable_by('discoverable_by_phone'))
+            .order_by('username')
+        )
 
     return queryset.filter(username__istartswith=term).order_by('username')

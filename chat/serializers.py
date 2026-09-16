@@ -22,6 +22,7 @@ from chat.services import (
     create_message,
     subscribe_to_conversation,
 )
+from user import privacy
 from user.blocks import has_blocked
 from user.lookups import find_user
 from user.models import phone_number_validator
@@ -74,7 +75,13 @@ MESSAGE_SELECT_RELATED = (
     'reply_to__sender',
     'reply_to__sender_participant__user__profile',
 )
-MESSAGE_PREFETCH_RELATED = ('attachments', 'reactions__user')
+MESSAGE_PREFETCH_RELATED = (
+    'attachments',
+    'reactions__user',
+    # Who the message names. The profile is joined because a mention renders as
+    # a display label, which for an account holder lives on the profile.
+    'mentions__participant__user__profile',
+)
 
 
 # What a deleted message says in its place. One string in one place, so the
@@ -97,6 +104,7 @@ class MessageSerializer(serializers.ModelSerializer):
     attachments = serializers.SerializerMethodField()
     reply_to = serializers.SerializerMethodField()
     reactions = serializers.SerializerMethodField()
+    mentions = serializers.SerializerMethodField()
     forwarded = serializers.SerializerMethodField()
     link_preview = serializers.SerializerMethodField()
 
@@ -121,6 +129,11 @@ class MessageSerializer(serializers.ModelSerializer):
             # busy message is a handful of pills, and sending the rows would
             # make every client group them itself, differently.
             'reactions',
+            # Who the message names, and whether it named the whole group.
+            # The client highlights them in the text it already has; the words
+            # themselves carry no markup - see chat/mentions.py.
+            'mentions',
+            'mentions_everyone',
             # A bare flag, never who it came from. See create_message.
             'forwarded',
             'link_preview',
@@ -174,6 +187,41 @@ class MessageSerializer(serializers.ModelSerializer):
         return [
             {'emoji': emoji, 'count': len(usernames), 'usernames': usernames}
             for emoji, usernames in grouped.items()
+        ]
+
+    def get_mentions(self, obj):
+        """Who this message names: the membership, the account, the label.
+
+        `participant_id` is what a client matches against its own member list,
+        `username` is how a reader recognises THEMSELVES in it - usernames
+        rather than a `mentions_me` flag, for the same reason `reactions`
+        carries them: this payload is also what the broadcast sends, and a
+        broadcast has no request and so no "me" to compute against.
+        `display_label` is the name to highlight in the text.
+
+        Withheld from a deleted message along with the text: the mention is
+        part of what was deleted, and leaving it would keep a highlight under a
+        message whose words are gone.
+
+        Reads the prefetch - without `mentions__participant__user__profile` on
+        the queryset this is two queries per message.
+        """
+        if obj.is_deleted:
+            return []
+
+        return [
+            {
+                'participant_id': row.participant_id,
+                'user_id': row.participant.user_id,
+                # Null for a phone-only member, who is reading nothing.
+                'username': (
+                    row.participant.user.username
+                    if row.participant.user_id is not None
+                    else None
+                ),
+                'display_label': row.participant.display_label,
+            }
+            for row in obj.mentions.all()
         ]
 
     def get_reply_to(self, obj):
@@ -254,6 +302,15 @@ class MessageCreateSerializer(serializers.Serializer):
     reply_to = serializers.IntegerField(
         required=False, allow_null=True, write_only=True
     )
+    # Who the sender picked out of the member list, as membership ids. Ids
+    # rather than names because most members have no handle to parse - see
+    # chat/mentions.py - and ids that do not belong here are dropped there.
+    mentions = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        write_only=True,
+    )
+    mention_everyone = serializers.BooleanField(required=False, write_only=True)
     # Pass a message along to THIS conversation. Posted to the destination, not
     # to the source, so every check that already guards a normal send - the
     # queryset that proves membership, the broadcast-mode rule, the block list
@@ -375,6 +432,17 @@ class MessageCreateSerializer(serializers.Serializer):
             copy_attachments=(
                 original.attachments.all() if original is not None else None
             ),
+            # A forward carries the original's words but not its mentions: the
+            # people it named are in the conversation it came from, and this is
+            # a different room.
+            mentions=(
+                validated_data.get('mentions') if original is None else None
+            ),
+            mention_everyone=(
+                validated_data.get('mention_everyone', False)
+                if original is None
+                else False
+            ),
         )
 
 
@@ -387,6 +455,15 @@ class MessageEditSerializer(serializers.Serializer):
     """
 
     text = serializers.CharField(allow_blank=False, trim_whitespace=True)
+    # An edit re-states who the message names, for the same reason it re-states
+    # the words: taking "@Bob" out of the sentence has to take Bob out of the
+    # mentions, or he keeps a highlight on a message that no longer names him.
+    mentions = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        write_only=True,
+    )
+    mention_everyone = serializers.BooleanField(required=False, write_only=True)
 
 
 class MessageReactionSerializer(serializers.Serializer):
@@ -445,6 +522,39 @@ class ParticipantSerializer(serializers.ModelSerializer):
 
         consent = consent_for(obj, ChannelConsent.Channel.EMAIL)
         return bool(consent and consent.allows_delivery)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if data.get('last_read_message') is not None and not self._receipts_shown(
+            instance
+        ):
+            data['last_read_message'] = None
+        return data
+
+    def _receipts_shown(self, participant):
+        """Whether this member's read position may be shown to the viewer.
+
+        Settings → Privacy → Read receipts, and it is a two-way bargain: with
+        theirs off nobody sees their reads, and with the VIEWER's off they see
+        nobody's. A viewer always sees their own row, which is what clears
+        their own badge rather than a receipt about anybody.
+        """
+        viewer = getattr(self.context.get('request'), 'user', None)
+        if participant.user_id is None or (
+            viewer is not None and viewer.pk == participant.user_id
+        ):
+            return True
+
+        if not self._viewer_shows_receipts(viewer):
+            return False
+        return privacy.shows_read_receipts(participant.user)
+
+    def _viewer_shows_receipts(self, viewer):
+        # Cached on the serializer, which is shared across a page of members,
+        # so a list of twenty costs one lookup rather than twenty.
+        if not hasattr(self, '_viewer_receipts'):
+            self._viewer_receipts = privacy.shows_read_receipts(viewer)
+        return self._viewer_receipts
 
 
 class GroupSettingsFieldsSerializer(serializers.Serializer):
@@ -885,10 +995,24 @@ class DirectConversationSerializer(serializers.Serializer):
     #: What everybody else is told, blocked or simply mistyped.
     NOT_FOUND = 'No user found with that username or number.'
 
+    #: What somebody is told when the other person's Privacy settings refuse.
+    #: Plain, unlike the block wording above: a privacy setting is not a secret.
+    REFUSED = privacy.DIRECT_MESSAGES_REFUSED
+
     def validate_identifier(self, value):
         viewer = self.context['request'].user
         other = find_user(value, exclude=viewer)
         if other is not None:
+            # "Who can send me direct messages", from Settings → Privacy. Only
+            # STARTING one is refused: a thread they already have carries on,
+            # because stranding a conversation somebody is in is what blocking
+            # is for, not a setting about who may open a new one.
+            if not privacy.allows_direct_message(other, viewer) and not (
+                Conversation.objects.filter(
+                    direct_key=Conversation.direct_key_for(viewer, other)
+                ).exists()
+            ):
+                raise serializers.ValidationError(self.REFUSED)
             self.other = other
             return value
 
@@ -980,7 +1104,17 @@ class GroupCreateSerializer(serializers.Serializer):
         return validate_group_image(value)
 
     def validate_members(self, values):
-        return resolve_members(values, exclude=self.context['request'].user)
+        creator = self.context['request'].user
+        members = resolve_members(values, exclude=creator)
+        # "Who can add me to groups", from Settings → Privacy. All or none: an
+        # admin told only that somebody refused cannot finish the job, so the
+        # refusal names them and they can be taken off the list.
+        refused = [
+            user for user in members if not privacy.allows_group_add(user, creator)
+        ]
+        if refused:
+            raise serializers.ValidationError(privacy.group_add_refusal(refused))
+        return members
 
     def create(self, validated_data):
         creator = self.context['request'].user
@@ -1053,9 +1187,11 @@ class GroupCreateSerializer(serializers.Serializer):
         invited = []
         for address in addresses:
             try:
-                invited.append(
-                    membership.invite_by_email(conversation, address, creator)
-                )
+                # None when the address belongs to somebody who hid it in
+                # Settings → Privacy: nothing added, nothing emailed.
+                row = membership.invite_by_email(conversation, address, creator)
+                if row is not None:
+                    invited.append(row)
             except Exception:
                 logger.exception(
                     'Could not invite %s to conversation %s',
@@ -1175,6 +1311,18 @@ class AddMembersSerializer(serializers.Serializer):
         adder = getattr(request, 'user', None)
         for user in resolved:
             membership._refuse_blocked_invite(adder, user)
+
+        # And their own "Who can add me to groups". Somebody already in the
+        # group is exempt: re-adding them is a no-op, and refusing it would
+        # make an admin's harmless repeat look like a rejection.
+        conversation = self.context.get('conversation')
+        refused = [
+            user for user in resolved
+            if not privacy.allows_group_add(user, adder)
+            and not (conversation and conversation.has_participant(user))
+        ]
+        if refused:
+            raise serializers.ValidationError(privacy.group_add_refusal(refused))
 
         return resolved
 
@@ -1355,9 +1503,11 @@ class DeliveryPreferenceSerializer(serializers.Serializer):
       sms_enabled   whether SMS is one of this group's channels for them at all.
                     On by default; off means app-only.
       email_enabled the same question for email. Off is what the unsubscribe
-                    link in every group email writes - and this endpoint is the
-                    only thing that can turn it back ON, because nothing
-                    reachable from an emailed token may add.
+                    link and a STOP EMAILS reply write, and it works both ways:
+                    the group neither emails them nor takes their email
+                    replies. This endpoint is the only thing that can turn it
+                    back ON, because nothing reachable from an emailed token
+                    may add.
 
     All optional, so a client changing one does not have to know the others.
     """

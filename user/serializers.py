@@ -131,9 +131,11 @@ class ProfileSerializer(serializers.ModelSerializer):
         profile = super().update(instance, validated_data)
         if email_enabled is not None:
             switches = MessagingSettings.for_user(profile.user)
-            if switches.email_enabled != email_enabled:
-                switches.email_enabled = email_enabled
-                switches.save(update_fields=['email_enabled', 'updated_at'])
+            changed = switches.switch_email(
+                email_enabled, reason=MessagingSettings.EmailOptOutReason.PERSON
+            )
+            if changed:
+                switches.save(update_fields=[*changed, 'updated_at'])
         return profile
 
 
@@ -783,11 +785,12 @@ class AppearanceSettingsSerializer(UserSettingsSerializer):
 class MessagingSettingsSerializer(UserSettingsSerializer):
     """Settings → Messaging.
 
-    `sms_enabled` is shown but never written here. Only a carrier STOP or
-    START changes it (sms/inbound.py): an API that could switch it back on
-    would undo somebody's STOP. `email_enabled` is writable, and is the same
+    `sms_enabled` is "Send and receive Loop messages by text", the person's
+    own switch for every Loop. A STOP is not in here: it is per group, and
+    lives on that membership. `email_enabled` is writable, and is the same
     column PATCH /users/me/profile/ writes for the web client that uses it
-    today. The SMS consent timestamps are records, not settings, and stay out.
+    today. The SMS and email opt-out records are records, not settings, and
+    stay out.
     """
 
     class Meta(UserSettingsSerializer.Meta):
@@ -797,12 +800,20 @@ class MessagingSettingsSerializer(UserSettingsSerializer):
             'email_enabled',
             'enter_to_send',
             'link_previews_enabled',
-            'default_external_contact_method',
-            'sms_to_loopd_users_enabled',
-            'media_auto_download',
             'updated_at',
         ]
-        read_only_fields = [*UserSettingsSerializer.Meta.read_only_fields, 'sms_enabled']
+
+    def update(self, instance, validated_data):
+        # Both switches go through the model, so turning one off records when
+        # (and for email, why). The generic update below then saves the row.
+        if 'sms_enabled' in validated_data:
+            instance.switch_sms(validated_data.pop('sms_enabled'))
+        if 'email_enabled' in validated_data:
+            instance.switch_email(
+                validated_data.pop('email_enabled'),
+                reason=MessagingSettings.EmailOptOutReason.PERSON,
+            )
+        return super().update(instance, validated_data)
 
 
 class NotificationSettingsSerializer(UserSettingsSerializer):

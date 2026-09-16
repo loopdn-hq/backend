@@ -103,6 +103,8 @@ def _address_reason(participant):
         # unverified number is a string somebody typed, and texting it would
         # send this group's messages to whoever really owns it.
         profile = getattr(participant.user, 'profile', None)
+        # "Send and receive Loop messages by text", off in the app. A STOP is
+        # not this: it is per group, and the delivery ladder already refused it.
         if profile is None or not MessagingSettings.of(participant.user).sms_enabled:
             return 'sms disabled account-wide'
         if not profile.phone_no_verified or not profile.phone_number:
@@ -576,9 +578,8 @@ def send_notice(conversation, participant, text, *, kind='notice'):
 
     # The delivery switches, as well as the answer. This used to read consent
     # alone, which meant the two could disagree and the notice would believe
-    # the wrong one: an admin who switched SMS off for a member, or a STOP that
-    # set the switch on every group this number belongs to, left a consent row
-    # still saying opted in - and a membership notice went out to somebody who
+    # the wrong one: an admin who switched SMS off for a member left a consent
+    # row still saying opted in - and a membership notice went out to somebody who
     # should not have been texted at all.
     if not participant.sms_enabled:
         return _record_notice(
@@ -586,6 +587,8 @@ def send_notice(conversation, participant, text, *, kind='notice'):
             reason='sms disabled for this group',
         )
 
+    # "Send and receive Loop messages by text", off in the app: a notice about
+    # a Loop is a Loop message too.
     if participant.user_id and not MessagingSettings.of(participant.user).sms_enabled:
         return _record_notice(
             conversation, participant, SmsDelivery.Status.SKIPPED,
