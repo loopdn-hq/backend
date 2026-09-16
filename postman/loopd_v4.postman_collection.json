@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Loopd'n API v4",
-    "description": "# Loopd'n API v4\n\nEvery reply is wrapped in the same envelope:\n\n```json\n{ \"code\": 1, \"message\": \"...\", \"data\": { } }\n```\n\n`code` is `1` for success and `-1` for failure; the HTTP status stays meaningful. `data` is the payload, or the field errors on a failure.\n\n## Start here\n1. **Register**, then **Verify email** (the code is in the server log when `DEBUG` is on).\n2. **Login** - stores your tokens automatically.\n3. **Request phone code** then **Verify phone** - without a verified number your account can never receive a group text.\n4. **Create group** - stores `conversation_id` and gives the group its own phone number.\n\n## What is new since v3\n- **`9. Billing`** - the four platform plans (Free, Premium, Business, Enterprise), Pay-As-You-Go Communication Credit packages, a billing summary, Stripe Checkout for both a plan subscription and a credit top-up, the Stripe billing portal, and the Stripe webhook that keeps `Subscription` and the wallet in sync.\n- **Plan limits are enforced.** *Create group* and *Add members* now return `403` once a Free/Premium/Business plan's `max_groups` or `max_members_per_group` would be exceeded - see *List plans*.\n\n## What was new in v3\n- **Every URL now ends in a slash.** v1 and v2 stripped it, and Django answers a slash-less POST with a 301 that drops the body - so every write request in them silently did nothing.\n- **Payloads fixed**: `Register` and `Reset password` were missing `confirm_password`; `Google sign-in` sent `id_token` where the serializer wants `credential`; `Update my profile` sent an `sms_enabled` that no serializer declares.\n- **Runs top to bottom.** Verify email now precedes Login, the join code is fetched before it is used, and *Delete a group* moved to its own final folder instead of destroying the group halfway through.\n- **Forgot / reset / change password** were missing entirely.\n- **`GET .../participants/`** - the member list, paginated ten at a time. Conversation payloads no longer embed it.\n\n## What was new in v2\n- **Every group has its own phone number.** Bought on creation in the creator's country, never changes, deleted with the group.\n- **Membership has states** - active, pending, left, removed, blocked - and four join modes.\n- **Roles**: promote and demote admins.\n- **Broadcast groups** where only admins post.\n- **Members without accounts**, reachable only by SMS.\n- **Delivery settings** per group, and account-wide.\n- **The inbound SMS webhook.**\n\n## Two things that surprise people\n**404 means \"not yours\".** Access control is the database query, not a check bolted on top - so a conversation you are not in is indistinguishable from one that does not exist. That is deliberate.\n\n**Two SMS switches.** `MessagingSettings.sms_enabled` (the account's own, every group) and `Participant.sms_enabled` (this group - STOP and START to its number move it). Both must be on, plus a verified number, plus consent for that group.",
+    "description": "# Loopd'n API v4\n\nEvery reply is wrapped in the same envelope:\n\n```json\n{ \"code\": 1, \"message\": \"...\", \"data\": { } }\n```\n\n`code` is `1` for success and `-1` for failure; the HTTP status stays meaningful. `data` is the payload, or the field errors on a failure.\n\n## Start here\n1. **Register**, then **Verify email** (the code is in the server log when `DEBUG` is on).\n2. **Login** - stores your tokens automatically.\n3. **Request phone code** then **Verify phone** - without a verified number your account can never receive a group text.\n4. **Create group** - stores `conversation_id` and gives the group its own phone number.\n\n## What is new since v3\n- **`10. Enterprise`** - the Plan Builder's own catalog-driven flow: a public pricing catalog, drafts (anonymous-allowed, attachable to an account on login), checkout into a frozen `EnterpriseContract` with a line-itemized Stripe invoice, billing status, and the message-credit ledger. Shares the Billing folder's Stripe webhook endpoint rather than adding a second one.\n- **`9. Web push`** - the VAPID public key, registering/forgetting a browser subscription so it can be notified while the app is closed.\n- **`8. Billing`** - the four platform plans (Free, Premium, Business, Enterprise), Pay-As-You-Go Communication Credit packages, a billing summary, Stripe Checkout for both a plan subscription and a credit top-up, the Stripe billing portal, and the Stripe webhook that keeps `Subscription` and the wallet in sync.\n- **Plan limits are enforced.** *Create group* and *Add members* now return `403` once a Free/Premium/Business plan's `max_groups` or `max_members_per_group` would be exceeded - see *List plans*.\n\n## What was new in v3\n- **Every URL now ends in a slash.** v1 and v2 stripped it, and Django answers a slash-less POST with a 301 that drops the body - so every write request in them silently did nothing.\n- **Payloads fixed**: `Register` and `Reset password` were missing `confirm_password`; `Google sign-in` sent `id_token` where the serializer wants `credential`; `Update my profile` sent an `sms_enabled` that no serializer declares.\n- **Runs top to bottom.** Verify email now precedes Login, the join code is fetched before it is used, and *Delete a group* moved to its own final folder instead of destroying the group halfway through.\n- **Forgot / reset / change password** were missing entirely.\n- **`GET .../participants/`** - the member list, paginated ten at a time. Conversation payloads no longer embed it.\n\n## What was new in v2\n- **Every group has its own phone number.** Bought on creation in the creator's country, never changes, deleted with the group.\n- **Membership has states** - active, pending, left, removed, blocked - and four join modes.\n- **Roles**: promote and demote admins.\n- **Broadcast groups** where only admins post.\n- **Members without accounts**, reachable only by SMS.\n- **Delivery settings** per group, and account-wide.\n- **The inbound SMS webhook.**\n\n## Two things that surprise people\n**404 means \"not yours\".** Access control is the database query, not a check bolted on top - so a conversation you are not in is indistinguishable from one that does not exist. That is deliberate.\n\n**Two SMS switches.** `MessagingSettings.sms_enabled` (account-wide) and `Participant.sms_enabled` (this group). Both must be on, plus a verified number, plus consent for members with no account.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -65,6 +65,14 @@
     },
     {
       "key": "push_endpoint",
+      "value": ""
+    },
+    {
+      "key": "draft_id",
+      "value": ""
+    },
+    {
+      "key": "contract_id",
       "value": ""
     }
   ],
@@ -1778,7 +1786,7 @@
                 ""
               ]
             },
-            "description": "What the caller is on right now: their `subscription` (plan, status, renewal date) and their `wallet` (balance, auto-recharge).\n\nEvery user has both from the moment they sign up - a fresh account is on the Free plan with a zero-balance wallet, not a missing row, so a client never has to special-case \"no subscription yet\"."
+            "description": "What the caller is on right now: their `subscription` (plan, status, renewal date), their `wallet` (balance, auto-recharge), and - if they have one - `enterprise_credits`.\n\nEvery user has both a subscription and a wallet from the moment they sign up - a fresh account is on the Free plan with a zero-balance wallet, not a missing row, so a client never has to special-case \"no subscription yet\".\n\n`enterprise_credits` is `null` unless the caller has an active or past-due Enterprise contract (see `9. Enterprise`); when present it carries `contract_number`, `status`, `balance` and `monthly_allowance`, all counted in messages, not cents - a separate figure from `wallet.balance_cents`, which is the pay-as-you-go SMS wallet. Once checkout completes, `subscription.plan` also switches from Free to a Plan mirroring the contract's own limits and features, so this one response is enough to show what the caller's account can do without a second, Enterprise-specific call."
           }
         },
         {
@@ -2048,7 +2056,288 @@
       ]
     },
     {
-      "name": "10. Cleanup (destructive)",
+      "name": "10. Enterprise",
+      "item": [
+        {
+          "name": "Pricing catalog",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/enterprise/pricing/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "enterprise",
+                "pricing",
+                ""
+              ]
+            },
+            "description": "Everything the Plan Builder needs to price a configuration client-side: the base fee, each limit tier (`max_groups`, `max_members_per_group`, `max_admins_per_group`, `storage_gb`), the four toggleable features, the analytics tiers, the Communication Credit packages, and the billing intervals with their period discounts.\n\nPublic, so the builder can quote a price before anyone signs up. Everything here is database-driven (`PricingCatalogVersion`) - a price change is a new catalog version, never an edit to a live one, so a plan someone already checked out never moves under them.",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Save a plan configuration draft",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/enterprise/drafts/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "enterprise",
+                "drafts",
+                ""
+              ]
+            },
+            "description": "Prices `configuration` against the active catalog and upserts a draft. Omit `draft_id` to create one (returned as `data.draft_id`, format `ent_draft_<12 hex chars>`); include it to update that same draft again.\n\n**Anonymous-allowed.** Called with no `Authorization` header, the draft is owned by the caller's session instead of an account - only that session (or, once *Attach a draft* is called, that account) can read it back. Called signed in, as this request is when it runs after *Login* earlier in this collection, the account is attached immediately - no separate attach step needed.\n\nEvery value in `limits`, `features` and `credits` is checked against the catalog's active options - an unknown or retired selection is rejected with a `400` and field errors under `data`, never silently clamped to the nearest valid one. The returned `pricing` block is always computed server-side; nothing about price is ever taken from this request body.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"configuration\": {\n    \"type\": \"plan\",\n    \"code\": \"enterprise\",\n    \"billing_interval\": \"annual\",\n    \"limits\": {\n      \"max_groups\": 500,\n      \"max_members_per_group\": 1000,\n      \"max_admins_per_group\": 20,\n      \"storage_gb\": 50\n    },\n    \"features\": {\n      \"extended_message_history\": false,\n      \"search\": false,\n      \"advanced_notifications\": false,\n      \"moderation_tools\": true,\n      \"analytics\": \"advanced\"\n    },\n    \"credits\": {\n      \"monthly_messages\": 100000\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.draft_id;",
+                  "if (value) {",
+                  "    pm.collectionVariables.set('draft_id', value);",
+                  "    console.log('Stored draft_id =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get a draft",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/enterprise/drafts/{{draft_id}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "enterprise",
+                "drafts",
+                "{{draft_id}}",
+                ""
+              ]
+            },
+            "description": "Owner-scoped read of one draft - by account if signed in, by the anonymous session that created it otherwise. The `draft_id` alone is never enough: a guessed or shared id from someone else's session returns `404`, the same \"not yours looks like it doesn't exist\" rule the rest of this API uses."
+          }
+        },
+        {
+          "name": "Attach a draft to my account",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/enterprise/drafts/{{draft_id}}/attach/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "enterprise",
+                "drafts",
+                "{{draft_id}}",
+                "attach",
+                ""
+              ]
+            },
+            "description": "Links an anonymous draft to the now-signed-in caller's account - the step a client calls right after login/signup when it already has a `draft_id` from configuring the plan while logged out. Leaves `status` as `\"draft\"`.\n\nSince *Save a plan configuration draft* above already ran signed in, this draft is already attached to this account - calling it again here is idempotent and just confirms that. Attaching a draft already linked to a **different** account returns `403`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Checkout a draft",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/enterprise/drafts/{{draft_id}}/checkout/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "enterprise",
+                "drafts",
+                "{{draft_id}}",
+                "checkout",
+                ""
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"success_url\": \"https://loopdn.com/enterprise/builder/?checkout=success\",\n  \"cancel_url\": \"https://loopdn.com/enterprise/builder/?checkout=cancelled\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Revalidates the draft against the **current** active catalog (it may have changed since it was saved), freezes the result into a new `EnterpriseContract` (`contract_number`, e.g. `ENT-2026-000042`), and opens a Stripe Checkout Session for it - one line item per priced selection (base fee first), plus a coupon for the interval discount.\n\n`success_url`/`cancel_url` are required, same as *Subscribe to a plan* in `8. Billing` - Stripe redirects the browser there when the customer finishes or abandons Checkout, and both are checked against `BILLING_ALLOWED_REDIRECT_ORIGINS` (a `400` names the field if the origin isn't trusted).\n\nReturns both the `invoice` breakdown (for a confirmation modal) and `checkout_url` - nothing is charged until the customer completes Checkout, so showing the invoice first and redirecting only on explicit confirmation is safe.\n\nIf a selection is no longer active in the catalog at all (not just repriced), this returns `409` with a message safe to show inline, asking the caller to reconfigure and save again rather than silently billing whatever still happens to validate."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.contract_id;",
+                  "if (value !== undefined && value !== null) {",
+                  "    pm.collectionVariables.set('contract_id', value);",
+                  "    console.log('Stored contract_id =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Enterprise billing status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/enterprise/billing/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "enterprise",
+                "billing",
+                ""
+              ]
+            },
+            "description": "The caller's current Enterprise contract, if they have one: `contract_number`, `billing_interval`, `status` (`pending` -> `active` -> `past_due`/`canceled`), the frozen `pricing` snapshot (including its `line_items`), and the underlying Stripe subscription status. `data.contract` is `null` if the caller has never checked out an Enterprise plan.\n\nSame idea as *Billing summary* in `8. Billing`, but for a catalog-driven Enterprise contract instead of a single Plan code."
+          }
+        },
+        {
+          "name": "Enterprise credit ledger",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/enterprise/credits/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "enterprise",
+                "credits",
+                ""
+              ]
+            },
+            "description": "Current message-credit balance (`data.balance`) plus the paginated ledger behind it (`data.ledger.results`): one row per `allocation` (checkout, or a renewal replenishing the period - no rollover, the balance is replaced, not added to), `usage`, `adjustment`, `expiration` or `refund`.\n\n`data.contract`-less callers (no Enterprise contract yet) get a zero balance and an empty ledger rather than a `404` - there is nothing wrong with the request, there is just nothing to show yet."
+          }
+        },
+        {
+          "name": "Stripe webhook: enterprise checkout completed (provider callback)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/billing/webhooks/stripe/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "billing",
+                "webhooks",
+                "stripe",
+                ""
+              ]
+            },
+            "description": "**Called by Stripe, not by a client** - the exact same endpoint as *Stripe webhook (provider callback)* in `8. Billing`, not a separate route. Included so the Enterprise shape of `checkout.session.completed` is documented alongside the Plan/credits one: `metadata.kind = \"enterprise_contract\"` and `metadata.contract_id` are what route this event to Enterprise's own activation logic (mark the contract active, create its entitlements from the frozen configuration snapshot, and write the initial credit-ledger allocation) instead of the Plan-subscription sync.\n\nSame signature verification, status-code contract and de-duplication (by event `id`) as the Billing webhook - running this as written returns `400`, since Postman cannot mint a valid `Stripe-Signature`. Only a real event or `stripe trigger ...` can.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"evt_ent_1\",\n  \"type\": \"checkout.session.completed\",\n  \"data\": {\n    \"object\": {\n      \"id\": \"cs_ent_1\",\n      \"mode\": \"subscription\",\n      \"customer\": \"cus_ent_1\",\n      \"subscription\": \"sub_ent_1\",\n      \"client_reference_id\": \"{{user_id}}\",\n      \"metadata\": {\n        \"kind\": \"enterprise_contract\",\n        \"contract_id\": \"{{contract_id}}\"\n      }\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. Cleanup (destructive)",
       "item": [
         {
           "name": "Delete a group",

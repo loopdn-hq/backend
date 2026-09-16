@@ -57,6 +57,7 @@ urlpatterns = [
     path('api/v1/push/', include('notification.push.urls')),
 
     path('api/v1/billing/', include('billing.urls')),
+    path('api/v1/enterprise/', include('enterprise.urls')),
 
     # Deliberately NOT under /api/v1/. This URL is printed into email and lives
     # in a mailbox for as long as the mail does; an unsubscribe link that dies

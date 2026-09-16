@@ -29,13 +29,23 @@ logger = logging.getLogger(__name__)
 
 
 class PlanListView(APIView):
-    """The pricing page's data - public, so a logged-out visitor can see it."""
+    """The pricing page's data - public, so a logged-out visitor can see it.
+
+    Excludes every custom-priced row, not just the seeded Enterprise
+    placeholder: `enterprise.services._sync_account_plan` mints one
+    `Plan(code=<contract_number>, is_custom_pricing=True)` per Enterprise
+    contract purely so `Subscription.plan` has somewhere to point that
+    carries that contract's limits - those are per-customer bookkeeping,
+    never something to advertise on the public pricing page. Enterprise
+    itself is quoted through the Plan Builder (`enterprise` app), not
+    self-serve checkout.
+    """
 
     authentication_classes = []
     permission_classes = []
 
     def get(self, request):
-        plans = Plan.objects.filter(active=True)
+        plans = Plan.objects.filter(active=True, is_custom_pricing=False)
         return Response(PlanSerializer(plans, many=True).data)
 
 
@@ -49,7 +59,8 @@ class CreditPackageListView(APIView):
 
 
 class BillingSummaryView(APIView):
-    """What the caller is on right now: their plan and their wallet balance."""
+    """What the caller is on right now: their plan, their wallet balance, and
+    (if they have one) their Enterprise contract's message-credit balance."""
 
     permission_classes = [IsAuthenticated]
 
@@ -59,7 +70,27 @@ class BillingSummaryView(APIView):
         return Response({
             'subscription': SubscriptionSerializer(subscription).data,
             'wallet': WalletSerializer(wallet).data,
+            'enterprise_credits': self._enterprise_credits(request.user),
         })
+
+    def _enterprise_credits(self, user):
+        # Deferred: `enterprise.services` imports `billing.services` at
+        # module level, so importing it back at this module's top level
+        # would be circular. Kept separate from `wallet` - a message-count
+        # allowance bundled into an Enterprise subscription, not the cents-
+        # denominated PAYG SMS wallet - rather than converted into one.
+        from enterprise import services as enterprise_services
+
+        contract = enterprise_services.get_current_contract(user)
+        if contract is None or contract.status not in ('active', 'past_due'):
+            return None
+
+        return {
+            'contract_number': contract.contract_number,
+            'status': contract.status,
+            'balance': enterprise_services.current_balance(contract),
+            'monthly_allowance': contract.configuration_snapshot['credits']['monthly_messages'],
+        }
 
 
 class BillingAnalyticsView(APIView):

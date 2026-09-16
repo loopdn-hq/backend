@@ -108,6 +108,12 @@ class StripeWebhook(APIView):
             self._handle_subscription_updated(data_object)
         elif event_type == 'customer.subscription.deleted':
             self._handle_subscription_deleted(data_object)
+        elif event_type == 'invoice.paid':
+            self._handle_invoice_paid(data_object)
+        elif event_type == 'invoice.payment_failed':
+            self._handle_invoice_payment_failed(data_object)
+        elif event_type == 'charge.refunded':
+            self._handle_charge_refunded(data_object)
         elif event_type == 'product.deleted':
             self._handle_product_deactivated(data_object, source_event='product.deleted')
         elif event_type == 'product.updated' and self._is_product_archived(data_object):
@@ -481,6 +487,15 @@ class StripeWebhook(APIView):
         return None
 
     def _handle_checkout_completed(self, session):
+        from enterprise import services as enterprise_services
+
+        if enterprise_services.is_enterprise_checkout(session):
+            # A dynamic, catalog-driven configuration, not a single Plan
+            # price - entirely its own entitlement/credit model, so it does
+            # not go through the Plan-subscription sync below.
+            enterprise_services.handle_checkout_completed(session)
+            return
+
         user = self._user_for(
             client_reference_id=session.get('client_reference_id'),
             metadata=session.get('metadata'),
@@ -628,6 +643,12 @@ class StripeWebhook(APIView):
         return f'${amount_cents / 100:.2f} {normalized_currency}'
 
     def _handle_subscription_updated(self, stripe_subscription):
+        from enterprise import services as enterprise_services
+
+        if enterprise_services.is_enterprise_subscription(stripe_subscription.get('id')):
+            enterprise_services.handle_subscription_updated(stripe_subscription)
+            return
+
         user = self._user_for(customer_id=stripe_subscription.get('customer'))
         if user is None:
             logger.error('Stripe subscription event with no resolvable user: %s',
@@ -636,12 +657,30 @@ class StripeWebhook(APIView):
         self._sync_subscription(user, stripe_subscription)
 
     def _handle_subscription_deleted(self, stripe_subscription):
+        from enterprise import services as enterprise_services
+
+        if enterprise_services.is_enterprise_subscription(stripe_subscription.get('id')):
+            enterprise_services.handle_subscription_deleted(stripe_subscription)
+            return
+
         user = self._user_for(customer_id=stripe_subscription.get('customer'))
         if user is None:
             logger.error('Stripe subscription.deleted with no resolvable user: %s',
                          stripe_subscription.get('id'))
             return
         services.downgrade_to_free(user)
+
+    def _handle_invoice_paid(self, invoice):
+        from enterprise import services as enterprise_services
+        enterprise_services.handle_invoice_paid(invoice)
+
+    def _handle_invoice_payment_failed(self, invoice):
+        from enterprise import services as enterprise_services
+        enterprise_services.handle_invoice_payment_failed(invoice)
+
+    def _handle_charge_refunded(self, charge):
+        from enterprise import services as enterprise_services
+        enterprise_services.handle_charge_refunded(charge)
 
     def _sync_subscription(self, user, stripe_subscription):
         price_id = stripe_subscription['items']['data'][0]['price']['id']
