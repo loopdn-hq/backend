@@ -2280,3 +2280,102 @@ class ReceiptTests(APITestCase):
         with capture_sent() as sent:
             self.assertEqual(maintenance.retry_failed_deliveries(), 0)
         self.assertEqual(sent, [])
+
+
+class EmailFailureAlertTests(TestCase):
+    """Giving up on an email tells whoever wrote the message.
+
+    The mirror of the retry sweep: what that sweep will never pick up again is
+    exactly what this one announces. One alert per message, however many
+    addresses failed - see notification/delivery_alerts.py.
+    """
+
+    def setUp(self):
+        from chat.models import Conversation
+
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.message = create_message(self.group, self.alice, text='Dinner at 7')
+
+    def failed(self, **kwargs):
+        from mail.models import EmailDelivery
+
+        values = {
+            'direction': EmailDelivery.Direction.OUTBOUND,
+            'conversation': self.group,
+            'message': self.message,
+            'status': EmailDelivery.Status.FAILED,
+            'reason': 'provider rejected the message',
+            'attempts': 1,
+        }
+        values.update(kwargs)
+        return EmailDelivery.objects.create(**values)
+
+    def announce(self):
+        from mail.maintenance import announce_failed_deliveries
+
+        return announce_failed_deliveries()
+
+    def alerts(self):
+        from notification.models import Notification
+
+        return Notification.objects.filter(
+            type=Notification.Type.EMAIL_SEND_FAILED
+        )
+
+    def test_a_permanent_failure_is_announced(self):
+        self.failed()
+
+        self.assertEqual(self.announce(), 1)
+        self.assertEqual(self.alerts().get().data['count'], 1)
+
+    def test_several_addresses_are_one_alert_with_a_count(self):
+        self.failed()
+        self.failed()
+        self.failed()
+
+        self.announce()
+
+        self.assertEqual(self.alerts().count(), 1)
+        self.assertEqual(self.alerts().get().data['count'], 3)
+
+    def test_a_failure_still_worth_retrying_says_nothing(self):
+        """The retry sweep fixes most of these minutes later."""
+        self.failed(reason='provider unavailable', attempts=1)
+
+        self.assertEqual(self.announce(), 0)
+        self.assertEqual(self.alerts().count(), 0)
+
+    def test_spent_attempts_are_announced(self):
+        self.failed(
+            reason='provider unavailable',
+            attempts=settings.MAIL_MAX_DELIVERY_ATTEMPTS,
+        )
+
+        self.assertEqual(self.announce(), 1)
+
+    def test_a_bounce_is_announced(self):
+        """The provider's own verdict; no retry can change it."""
+        from mail.models import EmailDelivery
+
+        self.failed(status=EmailDelivery.Status.BOUNCED, reason='bounced')
+
+        self.assertEqual(self.announce(), 1)
+
+    def test_a_skip_is_not_a_failure(self):
+        """Muted, opted out, no address - decisions, not failures."""
+        from mail.models import EmailDelivery
+
+        self.failed(status=EmailDelivery.Status.SKIPPED, reason='muted')
+
+        self.assertEqual(self.announce(), 0)
+
+    def test_sweeping_twice_does_not_announce_twice(self):
+        self.failed()
+
+        self.announce()
+        self.announce()
+
+        self.assertEqual(self.alerts().count(), 1)

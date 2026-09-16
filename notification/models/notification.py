@@ -44,18 +44,28 @@ class Notification(models.Model):
         SMS_SEND_FAILED = 'sms.send_failed', 'A message did not reach everyone'
         SMS_INVITE_PENDING = 'sms.invite_pending', 'An invitation is unanswered'
 
+        # Email, the same question asked of the other channel.
+        EMAIL_SEND_FAILED = (
+            'email.send_failed', 'A message did not reach everyone by email'
+        )
+
         GENERAL = 'general', 'General'
 
-    # The filter chips a client offers - Groups, Invites, SMS, Account -
+    # The filter chips a client offers - Groups, Invites, Delivery, Account -
     # are the dot prefix of the type, so a new type joins the right chip
     # without anybody maintaining a second mapping that can disagree.
+    #
+    # `sms` and `email` share the DELIVERY chip (2026-09-16, Yul's call): both
+    # answer the same question - did my message get out - and a chip per
+    # channel would grow with every channel we add.
     CATEGORY_BY_PREFIX = {
         'member': 'groups',
         'role': 'groups',
         'group': 'groups',
         'join': 'invites',
         'invite': 'invites',
-        'sms': 'sms',
+        'sms': 'delivery',
+        'email': 'delivery',
         'account': 'account',
         'security': 'account',
     }

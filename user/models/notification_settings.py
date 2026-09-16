@@ -77,8 +77,13 @@ class NotificationSettings(UserSettings):
     # "Group invitations"
     #   On  - an alert when the person is invited to or added to a Loop.
     #   Off - no alert.
-    # Today: real, for push - `Notification.Type.MEMBER_ADDED`. The Activity
-    # feed still lists being added either way; this is only the interruption.
+    # Covers the three events about getting into a Loop (Yul, 2026-09-16):
+    # being added (`MEMBER_ADDED`), a join request of yours being approved
+    # (`JOIN_APPROVED`), and - for an admin - somebody asking to join
+    # (`JOIN_REQUESTED`). The map is
+    # notification/push/rules.py:SETTING_BY_NOTIFICATION_TYPE.
+    # Today: real, for push. The Activity feed still lists all of them either
+    # way; this is only the interruption.
     group_invitations = models.BooleanField(default=True, db_default=True)
 
     # --- Calls -----------------------------------------------------------------
@@ -100,17 +105,23 @@ class NotificationSettings(UserSettings):
     # "SMS delivery failures"
     #   On  - an alert when a message the person sent could not reach somebody
     #         by text.
-    #   Off - no alert.
-    # Today: saved, but changes nothing - no such alert is sent yet. (The
-    # activity feed has a type for it, `Notification.Type.SMS_SEND_FAILED`,
-    # but nothing creates one.)
+    #   Off - no alert. The activity feed still records it.
+    # ONE alert per message, not per person: "4 people did not get your
+    # message". Raised only once the channel has given up - a permanent
+    # reason, the attempts spent, or the retry window closed - because the
+    # retry sweep quietly fixes most failures minutes later. Written by
+    # sms/maintenance.py:announce_failed_deliveries through
+    # notification/delivery_alerts.py.
+    # Today: real, for push.
     sms_delivery_failures = models.BooleanField(default=True, db_default=True)
 
     # "Email delivery failures"
     #   On  - an alert when a message the person sent could not reach somebody
     #         by email.
-    #   Off - no alert.
-    # Today: saved, but changes nothing - no such alert is sent yet.
+    #   Off - no alert. The activity feed still records it.
+    # The same shape as the SMS row above, plus the provider's own verdicts: a
+    # bounce and a complaint are failures no retry can change.
+    # Today: real, for push.
     email_delivery_failures = models.BooleanField(default=True, db_default=True)
 
     # --- Notification preview --------------------------------------------------

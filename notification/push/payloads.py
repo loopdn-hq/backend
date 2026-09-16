@@ -11,6 +11,7 @@ The payload is JSON, encrypted to the browser's own keys, and read by
     {title, body, tag, silent, url, data: {conversation_id, message_id, kind}}
 """
 from chat.models import Conversation
+from notification.models import Notification
 from notification.push import rules
 
 #: Long enough to be worth reading, short enough that no platform truncates it
@@ -78,21 +79,67 @@ def for_message(message, participant, kind):
     }
 
 
-def for_notification(notification):
-    """One activity event - today, being added to a Loop.
+#: What each pushed event says: (with the preview on, with it off).
+#:
+#: One entry per type in `rules.SETTING_BY_NOTIFICATION_TYPE`, and a test holds
+#: the two in step - a type that is pushed with no words here would arrive as a
+#: blank notification, which is the one failure nobody would report because it
+#: looks like the feature simply did not fire.
+#:
+#: The withheld half names nobody and no group, for the phone face-up on a desk
+#: that a passer-by can read.
+EVENT_WORDS = {
+    Notification.Type.MEMBER_ADDED: (
+        '{actor} added you to {group}',
+        'You were added to a Loop',
+    ),
+    Notification.Type.JOIN_APPROVED: (
+        '{actor} approved your request to join {group}',
+        'Your request to join a Loop was approved',
+    ),
+    # This one goes to the group's ADMINS, not to the person asking - so it is
+    # written from the admin's side.
+    Notification.Type.JOIN_REQUESTED: (
+        '{actor} asked to join {group}',
+        'Somebody asked to join your Loop',
+    ),
+    # These two go to the SENDER, about their own message. `{people}` is
+    # "1 person" or "4 people" - see `_people`.
+    Notification.Type.SMS_SEND_FAILED: (
+        '{people} did not get your message to {group} by text',
+        'A message you sent did not reach everyone',
+    ),
+    Notification.Type.EMAIL_SEND_FAILED: (
+        '{people} did not get your message to {group} by email',
+        'A message you sent did not reach everyone',
+    ),
+}
 
-    The event's own words, not the message templates above: nothing was said,
-    somebody did something. `show_preview` still applies, because the name of a
-    Loop somebody was added to is as much theirs as a message is.
+
+def for_notification(notification):
+    """One activity event: getting into a Loop, or being asked about it.
+
+    The event's own words, not the message templates above - nothing was said,
+    somebody did something - so each type has its own sentence in EVENT_WORDS.
+    `show_preview` still applies: the name of a Loop, and who put you in it, is
+    as much somebody's business as a message is.
+
+    A type with no entry cannot arrive here: `rules.notification_alert` refuses
+    anything that is not in its map, and the two are held in step by a test.
     """
     conversation = notification.conversation
     group_name = (getattr(conversation, 'name', '') or '').strip() or 'a Loop'
     actor = _actor_label(notification)
 
+    shown, withheld = EVENT_WORDS[notification.type]
     if rules.shows_preview(notification.to_user):
-        body = f'{actor} added you to {group_name}'
+        body = shown.format(
+            actor=actor,
+            group=group_name,
+            people=_people((notification.data or {}).get('count', 0)),
+        )
     else:
-        body = 'You were added to a Loop'
+        body = withheld
 
     return {
         'title': PRODUCT,
@@ -143,6 +190,11 @@ def _actor_label(notification):
         return 'Somebody'
     profile = getattr(actor, 'profile', None)
     return getattr(profile, 'display_label', None) or actor.username
+
+
+def _people(count):
+    """"1 person" or "4 people" - the difference somebody reads first."""
+    return '1 person' if count == 1 else f'{count} people'
 
 
 def _clip(text):

@@ -134,6 +134,8 @@ class ActivityNotificationTests(EnvelopeAssertions, APITestCase):
 
         self.assertEqual(self.types_for(self.bob, category='groups'),
                          ['role.granted'])
+        # 'sms' is no longer a chip: text and email failures share 'delivery'.
+        self.assertEqual(self.types_for(self.bob, category='delivery'), [])
         self.assertEqual(self.types_for(self.bob, category='sms'), [])
 
     def test_marking_everything_read(self):
@@ -464,18 +466,85 @@ class PushRulesTests(TestCase):
         self.assertFalse(allowed)
         self.assertIn('not a push', reason)
 
+    def test_getting_into_a_loop_is_pushed_three_ways(self):
+        """Added, let in after asking, and - for an admin - asked."""
+        for event in (
+            Notification.Type.MEMBER_ADDED,
+            Notification.Type.JOIN_APPROVED,
+            Notification.Type.JOIN_REQUESTED,
+        ):
+            row = Notification.objects.create(
+                to_user=self.bob,
+                from_user=self.alice,
+                type=event,
+                conversation=self.group,
+            )
+            self.assertEqual(
+                rules.notification_alert(row), (True, None), event
+            )
+
+    def test_every_pushed_event_has_words(self):
+        """A type that is pushed with no wording arrives blank - and a blank
+        notification is the one failure nobody reports, because it looks like
+        the feature simply did not fire."""
+        self.assertEqual(
+            set(rules.SETTING_BY_NOTIFICATION_TYPE),
+            set(payloads.EVENT_WORDS),
+        )
+
+    def test_each_event_reads_as_itself(self):
+        cases = {
+            Notification.Type.MEMBER_ADDED: 'added you to Family',
+            Notification.Type.JOIN_APPROVED: 'approved your request to join',
+            Notification.Type.JOIN_REQUESTED: 'asked to join Family',
+        }
+        for event, expected in cases.items():
+            row = Notification.objects.create(
+                to_user=self.bob,
+                from_user=self.alice,
+                type=event,
+                conversation=self.group,
+            )
+            self.assertIn(expected, payloads.for_notification(row)['body'])
+
+    def test_the_preview_switch_covers_events_too(self):
+        # `self.prefs`, not a fresh for_user(): the notification below carries
+        # this very User object, which already has its settings cached on it.
+        # A fan-out re-reads the row (dispatch_notification select_relates it),
+        # so only a test can see the stale copy.
+        self.prefs.show_preview = False
+        self.prefs.save()
+
+        row = Notification.objects.create(
+            to_user=self.bob,
+            from_user=self.alice,
+            type=Notification.Type.JOIN_REQUESTED,
+            conversation=self.group,
+        )
+        body = payloads.for_notification(row)['body']
+        self.assertNotIn('Family', body)
+        self.assertNotIn('alice', body.lower())
+
     def test_group_invitations_off_silences_being_added(self):
         self.prefs.group_invitations = False
         self.prefs.save()
 
-        added = Notification.objects.create(
-            to_user=self.bob,
-            type=Notification.Type.MEMBER_ADDED,
-            conversation=self.group,
-        )
-        self.assertEqual(
-            rules.notification_alert(added), (False, 'group_invitations off')
-        )
+        invitations = [
+            event
+            for event, field in rules.SETTING_BY_NOTIFICATION_TYPE.items()
+            if field == 'group_invitations'
+        ]
+        self.assertEqual(len(invitations), 3)
+
+        for event in invitations:
+            row = Notification.objects.create(
+                to_user=self.bob, type=event, conversation=self.group
+            )
+            self.assertEqual(
+                rules.notification_alert(row),
+                (False, 'group_invitations off'),
+                event,
+            )
 
     # --- what it says ------------------------------------------------------
 
@@ -819,3 +888,109 @@ class DeadSubscriptionTests(TestCase):
 
         self.subscription.refresh_from_db()
         self.assertIsNotNone(self.subscription.last_used_at)
+
+
+@PUSH_ON
+class DeliveryAlertTests(TestCase):
+    """"Your message did not reach everyone."
+
+    `captureOnCommitCallbacks` where a push is expected: the alert is pushed
+    from `transaction.on_commit`, which a plain TestCase never reaches.
+
+    One alert per message per channel, told to the SENDER - see
+    notification/delivery_alerts.py for why it is not one per person.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.message = create_message(self.group, self.alice, text='Dinner at 7')
+        subscribe(self.alice)
+
+    def announce(self, count, type=Notification.Type.SMS_SEND_FAILED):
+        from notification.delivery_alerts import announce_failure
+
+        return announce_failure(self.message, type, count)
+
+    def test_the_sender_is_told_how_many_missed_it(self):
+        row = self.announce(4)
+
+        self.assertEqual(row.to_user, self.alice)
+        self.assertEqual(row.data['count'], 4)
+        self.assertIsNone(row.from_user)
+
+    def test_more_failures_update_the_same_alert(self):
+        """A second buzz about one message says nothing new."""
+        first = self.announce(2)
+        again = self.announce(5)
+
+        self.assertEqual(Notification.objects.filter(message=self.message).count(), 1)
+        self.assertEqual(again.pk, first.pk)
+        self.assertEqual(again.data['count'], 5)
+
+    def test_nothing_to_tell_when_the_sender_has_no_account(self):
+        texted_in = create_message(
+            self.group, None, text='From a handset',
+            participant=Participant.objects.get(
+                conversation=self.group, user=self.bob
+            ),
+        )
+        from notification.delivery_alerts import announce_failure
+
+        self.assertIsNone(
+            announce_failure(
+                texted_in, Notification.Type.SMS_SEND_FAILED, 3
+            )
+        )
+
+    def test_a_count_of_zero_is_not_an_alert(self):
+        self.assertIsNone(self.announce(0))
+
+    def test_it_reaches_the_sender_as_a_push(self):
+        with capture_push() as sent, self.captureOnCommitCallbacks(execute=True):
+            self.announce(2)
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn('2 people did not get your message', sent[0][1]['body'])
+        self.assertIn('Family', sent[0][1]['body'])
+
+    def test_one_person_reads_as_one_person(self):
+        with capture_push() as sent, self.captureOnCommitCallbacks(execute=True):
+            self.announce(1)
+
+        self.assertIn('1 person did not get your message', sent[0][1]['body'])
+
+    def test_the_switch_silences_it(self):
+        prefs = NotificationSettings.for_user(self.alice)
+        prefs.sms_delivery_failures = False
+        prefs.save()
+
+        with capture_push() as sent, self.captureOnCommitCallbacks(execute=True):
+            self.announce(2)
+
+        self.assertEqual(sent, [])
+        # Still recorded in the feed: the switch is about the interruption.
+        self.assertEqual(
+            Notification.objects.filter(message=self.message).count(), 1
+        )
+
+    def test_each_channel_has_its_own_switch(self):
+        prefs = NotificationSettings.for_user(self.alice)
+        prefs.sms_delivery_failures = False
+        prefs.save()
+
+        with capture_push() as sent, self.captureOnCommitCallbacks(execute=True):
+            self.announce(2, Notification.Type.EMAIL_SEND_FAILED)
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn('by email', sent[0][1]['body'])
+
+    def test_both_channels_share_the_delivery_chip(self):
+        for type in (
+            Notification.Type.SMS_SEND_FAILED,
+            Notification.Type.EMAIL_SEND_FAILED,
+        ):
+            row = Notification(to_user=self.alice, type=type)
+            self.assertEqual(row.category, 'delivery')
