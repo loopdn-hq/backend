@@ -87,20 +87,14 @@ def list_id_for(conversation):
 
 
 def body_for(message):
-    """What the recipient reads. Attachments are described, never attached."""
-    text = (message.text or '').strip()
-    if text:
-        return text
-    return _attachment_summary(message)
+    """What the recipient reads. Attachments are described, never attached.
 
-
-def _attachment_summary(message):
-    count = message.attachments.count()
-    if count == 0:
-        return '(no message)'
-    if count == 1:
-        return '(sent a photo or file - open Loopd to see it)'
-    return f'(sent {count} photos or files - open Loopd to see them)'
+    One line, because the rule moved to `Message.preview_text` when push needed
+    the same sentence on a lock screen. Kept as a name here: this module's
+    other functions read as a set, and `body_for(message)` beside
+    `address_for(participant)` says what it is for.
+    """
+    return message.preview_text
 
 
 def address_for(participant):

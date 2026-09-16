@@ -30,9 +30,9 @@ LEAVE = 'leave'
 STOP = 'stop'
 START = 'start'
 # Group-level, and deliberately not the same thing as START/STOP. YES and NO
-# answer "do you want THIS group by text"; START and STOP are the carrier's
-# words and are about LoopD'n as a whole. Somebody who declines one group
-# still hears from the others.
+# answer a group's invitation; START and STOP are the carrier's words, and opt
+# a number in and out of the group whose number received them. All four are
+# about that one group - every other group carries on.
 YES = 'yes'
 NO = 'no'
 
@@ -42,8 +42,8 @@ NO = 'no'
 _STOP_WORDS = {'STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT'}
 # The matching opt-in words, same reason. YES is NOT among them: a carrier
 # audit tests START and UNSTOP, while YES is the answer to a group's own
-# invitation - and treating it as a global opt-in would let answering one
-# group's question quietly change a setting for every other.
+# invitation - and treating it as an opt-in would let answering that question
+# quietly undo a STOP.
 _START_WORDS = {'START', 'UNSTOP'}
 _HELP_WORDS = {'HELP', 'INFO'}
 

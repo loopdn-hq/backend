@@ -426,9 +426,18 @@ class Conversation(models.Model):
         #
         # The row is left behind rather than claimed: dormant, granting
         # nothing, and not re-creatable by a second invitation.
+        from user import privacy
         from user.blocks import blocks_between
 
         if phone_row.added_by_id and blocks_between(user, phone_row.added_by):
+            return None
+
+        # And "Who can add me to groups", from Settings → Privacy, read here
+        # for the same reason: until this moment the row was a number, and a
+        # number has no settings to ask about.
+        if phone_row.added_by_id and not privacy.allows_group_add(
+            user, phone_row.added_by
+        ):
             return None
 
         existing = Participant.objects.filter(conversation=self, user=user).first()
@@ -973,6 +982,14 @@ class Message(models.Model):
     # after the message is saved, by chat/link_previews.py - never by a client.
     link_preview = models.JSONField(null=True, blank=True)
 
+    # Whether this message names the whole group.
+    #
+    # A column rather than a row per member in MessageMention: "@everyone" is
+    # one fact about the message, and spelling it out as a row per member would
+    # make the cost of a mention grow with the size of the group - and would
+    # then be wrong for anybody who joined a minute later.
+    mentions_everyone = models.BooleanField(default=False, db_default=False)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1002,6 +1019,30 @@ class Message(models.Model):
     def __str__(self):
         preview = self.text[:40] or '(attachment)'
         return f'{self.sender_label}: {preview}'
+
+    @property
+    def preview_text(self):
+        """What this message says where only one line fits, files described.
+
+        ONE definition for every channel that has to summarise a message
+        without showing it - the email body and the push notification, today.
+        A message that is nothing but photos has no text at all, and each
+        channel inventing its own phrase for that is how the same message came
+        out as "(no message)" in one place and as a blank line in another.
+
+        Counts attachments, so a caller looping over messages should prefetch
+        them.
+        """
+        text = (self.text or '').strip()
+        if text:
+            return text
+
+        count = self.attachments.count()
+        if count == 0:
+            return '(no message)'
+        if count == 1:
+            return '(sent a photo or file - open Loopd to see it)'
+        return f'(sent {count} photos or files - open Loopd to see them)'
 
     @property
     def sender_label(self):
@@ -1080,6 +1121,52 @@ class MessageReaction(models.Model):
 
     def __str__(self):
         return f'{self.user.username} {self.emoji} #{self.message_id}'
+
+
+class MessageMention(models.Model):
+    """One person a message names.
+
+    Keyed on PARTICIPANT, not User, unlike MessageReaction - and that is the
+    whole reason this table exists rather than a list of usernames in the text.
+    Most members of most groups have no account: they are a phone number with a
+    display name, and there is no handle to write down or to parse back out.
+    A membership row is the one identity every member has.
+
+    A row is created only for somebody who was an ACTIVE member of the
+    conversation when the message was written (chat/mentions.py decides), so a
+    mention can never point across conversations - which would otherwise make
+    "who is in that group" answerable by anyone who can send a message.
+
+    `Message.mentions_everyone` carries "@everyone" instead of a row per
+    member; see the comment on that field.
+    """
+
+    message = models.ForeignKey(
+        Message, on_delete=models.CASCADE, related_name='mentions'
+    )
+    participant = models.ForeignKey(
+        Participant, on_delete=models.CASCADE, related_name='+'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # Naming somebody twice in one message is one mention. Without
+            # this, a client repeating an id would notify them twice.
+            models.UniqueConstraint(
+                fields=['message', 'participant'],
+                name='one_mention_per_person_per_message',
+            ),
+        ]
+        ordering = ['id']
+        indexes = [
+            # The read path: every mention on a page of messages, in one
+            # prefetch rather than a query per bubble.
+            models.Index(fields=['message']),
+        ]
+
+    def __str__(self):
+        return f'@{self.participant.display_label} #{self.message_id}'
 
 
 class Attachment(models.Model):

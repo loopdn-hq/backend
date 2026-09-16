@@ -1246,6 +1246,26 @@ class EmailPreferenceTests(EnvelopeAssertions, APITestCase):
 
         self.assertTrue(data['email_enabled'])
 
+    def test_turning_it_off_records_when_and_that_they_did_it(self):
+        self.assertSuccess(self.client.patch(self.url(), {'email_enabled': False}))
+
+        switches = MessagingSettings.objects.get(user=self.user)
+        self.assertIsNotNone(switches.email_opt_out_at)
+        self.assertEqual(
+            switches.email_opt_out_reason, MessagingSettings.EmailOptOutReason.PERSON
+        )
+
+    def test_turning_it_back_on_keeps_the_record(self):
+        # "Opted out, then back in" is a different fact from "never opted out".
+        self.client.patch(self.url(), {'email_enabled': False})
+        turned_off_at = MessagingSettings.objects.get(user=self.user).email_opt_out_at
+
+        self.client.patch(self.url(), {'email_enabled': True})
+
+        switches = MessagingSettings.objects.get(user=self.user)
+        self.assertTrue(switches.email_enabled)
+        self.assertEqual(switches.email_opt_out_at, turned_off_at)
+
     def test_it_does_not_disturb_anything_else(self):
         self.assertSuccess(
             self.client.patch(self.url(), {'email_enabled': False})
@@ -1296,16 +1316,79 @@ class UserAdminTests(TestCase):
         self.client.force_login(staff)
         self.alice = User.objects.create_user(username='alice', password='x')
 
-    def test_it_shows_the_delivery_switches_with_sms_view_only(self):
+    def test_it_shows_both_delivery_switches_for_staff_to_change(self):
         # The switches left Profile in user/0009, so without their own inline
-        # they would vanish from this page. Staff may switch group email either
-        # way; SMS is only ever moved by the person texting STOP or START, so
-        # here it is shown and not offered as a checkbox.
+        # they would vanish from this page. Staff may switch texts and group
+        # email either way; the records of when each went off are view-only.
+        # A STOP is per group and is not on this page at all.
         response = self.client.get(reverse('admin:auth_user_change', args=[self.alice.pk]))
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertContains(response, 'name="messaging_settings-0-sms_enabled"')
         self.assertContains(response, 'name="messaging_settings-0-email_enabled"')
-        self.assertNotContains(response, 'name="messaging_settings-0-sms_enabled"')
+        self.assertNotContains(response, 'name="messaging_settings-0-sms_opt_out_at"')
+
+    def test_it_labels_the_switches_in_the_settings_screens_words(self):
+        # Field names are older than the screen; staff should read the words
+        # the person reads.
+        response = self.client.get(reverse('admin:auth_user_change', args=[self.alice.pk]))
+
+        self.assertContains(response, 'Send and receive Loop messages by text')
+        self.assertContains(response, 'Send and receive Loop messages by email')
+        self.assertNotContains(response, 'Sms enabled')
+
+    def save_messaging_settings_as_staff(self, *unticked):
+        """Save the user page's Messaging settings as staff, every box ticked
+        except those named - through the admin's own inline formset and
+        save_formset, the path the page's Save button takes."""
+        from django.contrib import admin as django_admin
+        from django.test import RequestFactory
+
+        request = RequestFactory().post('/')
+        request.user = User.objects.get(username='staff')
+        model_admin = django_admin.site._registry[User]
+        inline = next(
+            instance for instance in model_admin.get_inline_instances(request, self.alice)
+            if instance.model is MessagingSettings
+        )
+        FormSet = inline.get_formset(request, self.alice)
+        prefix = FormSet.get_default_prefix()
+        switches = self.alice.messaging_settings
+        data = {
+            f'{prefix}-TOTAL_FORMS': '1',
+            f'{prefix}-INITIAL_FORMS': '1',
+            f'{prefix}-MIN_NUM_FORMS': '0',
+            f'{prefix}-MAX_NUM_FORMS': '1',
+            f'{prefix}-0-id': str(switches.pk),
+            f'{prefix}-0-user': str(self.alice.pk),
+        }
+        for box in ('sms_enabled', 'email_enabled', 'enter_to_send', 'link_previews_enabled'):
+            # An unticked box sends nothing at all.
+            if box not in unticked:
+                data[f'{prefix}-0-{box}'] = 'on'
+        formset = FormSet(data, instance=self.alice, prefix=prefix)
+        self.assertTrue(formset.is_valid(), formset.errors)
+
+        model_admin.save_formset(request, None, formset, change=True)
+
+        switches.refresh_from_db()
+        return switches
+
+    def test_staff_turning_texts_off_is_recorded(self):
+        switches = self.save_messaging_settings_as_staff('sms_enabled')
+
+        self.assertFalse(switches.sms_enabled)
+        self.assertIsNotNone(switches.sms_opt_out_at)
+        self.assertTrue(switches.email_enabled)
+
+    def test_staff_turning_group_email_off_is_recorded_as_staff(self):
+        switches = self.save_messaging_settings_as_staff('email_enabled')
+
+        self.assertFalse(switches.email_enabled)
+        self.assertIsNotNone(switches.email_opt_out_at)
+        self.assertEqual(
+            switches.email_opt_out_reason, MessagingSettings.EmailOptOutReason.STAFF
+        )
 
 
 class UserBlockTests(EnvelopeAssertions, APITestCase):
@@ -1553,13 +1636,7 @@ class SettingsModelTests(TestCase):
 
         messaging = MessagingSettings.for_user(self.user)
         self.assertTrue(messaging.enter_to_send)
-        self.assertEqual(
-            messaging.default_external_contact_method,
-            MessagingSettings.ExternalContactMethod.ASK,
-        )
-        self.assertEqual(messaging.media_auto_download, MessagingSettings.MediaAutoDownload.WIFI_ONLY)
-        # True is what the backend already does: account holders are texted.
-        self.assertTrue(messaging.sms_to_loopd_users_enabled)
+        self.assertTrue(messaging.sms_enabled)
 
         security = SecuritySettings.for_user(self.user)
         self.assertFalse(security.two_factor_enabled)
@@ -1776,15 +1853,18 @@ class SettingsApiTests(EnvelopeAssertions, APITestCase):
             status.HTTP_405_METHOD_NOT_ALLOWED,
         )
 
-    def test_sms_enabled_is_shown_but_cannot_be_written(self):
-        # Only a carrier STOP or START writes it; switching it back on over the
-        # API would undo a STOP.
-        MessagingSettings.objects.filter(user=self.user).update(sms_enabled=False)
-
-        data = self.assertSuccess(self.patch('messaging', {'sms_enabled': True}))
+    def test_sms_enabled_is_the_persons_to_change(self):
+        # "Send and receive Loop messages by text" - their own switch for every
+        # Loop. A STOP is per group and never shows up here.
+        data = self.assertSuccess(self.patch('messaging', {'sms_enabled': False}))
 
         self.assertFalse(data['sms_enabled'])
-        self.assertFalse(MessagingSettings.objects.get(user=self.user).sms_enabled)
+        switches = MessagingSettings.objects.get(user=self.user)
+        self.assertFalse(switches.sms_enabled)
+        self.assertIsNotNone(switches.sms_opt_out_at)
+
+        data = self.assertSuccess(self.patch('messaging', {'sms_enabled': True}))
+        self.assertTrue(data['sms_enabled'])
 
     def test_two_factor_cannot_be_switched_on_here(self):
         data = self.assertSuccess(self.patch('security', {
@@ -1796,6 +1876,21 @@ class SettingsApiTests(EnvelopeAssertions, APITestCase):
         self.assertFalse(data['two_factor_enabled'])
         self.assertEqual(data['two_factor_method'], '')
         self.assertTrue(data['login_alerts_email'])
+
+    def test_turning_email_off_here_records_when_and_why(self):
+        self.assertSuccess(self.patch('messaging', {'email_enabled': False}))
+        first = MessagingSettings.objects.get(user=self.user)
+        self.assertEqual(
+            first.email_opt_out_reason, MessagingSettings.EmailOptOutReason.PERSON
+        )
+        self.assertIsNotNone(first.email_opt_out_at)
+
+        # Off again while already off is not a second opt-out.
+        self.assertSuccess(self.patch('messaging', {'email_enabled': False}))
+        self.assertEqual(
+            MessagingSettings.objects.get(user=self.user).email_opt_out_at,
+            first.email_opt_out_at,
+        )
 
     def test_email_enabled_is_the_same_switch_the_profile_shows(self):
         self.assertSuccess(self.patch('messaging', {'email_enabled': False}))
@@ -1858,4 +1953,210 @@ class DeliverySwitchMigrationTests(TransactionTestCase):
         other = NewMessagingSettings.objects.get(user_id=untouched.pk)
         self.assertTrue(other.sms_enabled)
         self.assertTrue(other.email_enabled)
+
+
+class OldProfileColumnsDropTests(TransactionTestCase):
+    """user/0012 carries any stray opt-out off Profile, then drops the columns.
+
+    Against the real migration. The stray opt-outs it exists for were written
+    by old code straight into those columns, so they are set here the same way,
+    with raw SQL - the historical Profile model no longer has the fields.
+    """
+
+    before = [('user', '0011_email_opt_out_record')]
+    after = [('user', '0012_drop_old_profile_delivery_columns')]
+    OLD_COLUMNS = {'sms_enabled', 'sms_opt_out_at', 'sms_consent_at', 'email_enabled'}
+
+    def setUp(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.before)
+        self.executor.loader.build_graph()
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+
+    def account(self, username, **old_columns):
+        """An account with both rows, and these values in Profile's old columns."""
+        old = self.executor.loader.project_state(self.before).apps
+        user = old.get_model('auth', 'User').objects.create(username=username)
+        old.get_model('user', 'Profile').objects.create(user=user)
+        switches = old.get_model('user', 'MessagingSettings').objects.create(user=user)
+        if old_columns:
+            assignments = ', '.join(f'{name} = %s' for name in old_columns)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f'UPDATE user_profile SET {assignments} WHERE user_id = %s',
+                    [*old_columns.values(), user.pk],
+                )
+        return user, switches
+
+    def settings_after(self, user):
+        new = self.executor.loader.project_state(self.after).apps
+        return new.get_model('user', 'MessagingSettings').objects.get(user_id=user.pk)
+
+    def profile_columns(self):
+        with connection.cursor() as cursor:
+            description = connection.introspection.get_table_description(
+                cursor, 'user_profile'
+            )
+        return {column.name for column in description}
+
+    def test_stray_opt_outs_are_carried_over_and_the_columns_dropped(self):
+        stopped_at = (timezone.now() - timedelta(days=2)).replace(microsecond=0)
+        stray_stop, _ = self.account(
+            'stray-stop', sms_enabled=False, sms_opt_out_at=stopped_at
+        )
+        stray_email, _ = self.account('stray-email', email_enabled=False)
+        untouched, _ = self.account('untouched')
+
+        self.executor.migrate(self.after)
+
+        stop = self.settings_after(stray_stop)
+        self.assertFalse(stop.sms_enabled)
+        self.assertEqual(stop.sms_opt_out_at, stopped_at)
+
+        email = self.settings_after(stray_email)
+        self.assertFalse(email.email_enabled)
+        self.assertIsNotNone(email.email_opt_out_at)
+
+        other = self.settings_after(untouched)
+        self.assertTrue(other.sms_enabled)
+        self.assertTrue(other.email_enabled)
+
+        self.assertFalse(self.OLD_COLUMNS & self.profile_columns())
+
+    def test_a_start_since_the_old_stop_is_left_on(self):
+        # STOP before 0009, START after it: Profile still says off, and
+        # MessagingSettings is right to say on.
+        stopped_at = (timezone.now() - timedelta(days=2)).replace(microsecond=0)
+        user, switches = self.account(
+            'started-again', sms_enabled=False, sms_opt_out_at=stopped_at
+        )
+        switches.sms_consent_at = stopped_at + timedelta(days=1)
+        switches.save(update_fields=['sms_consent_at'])
+
+        self.executor.migrate(self.after)
+
+        self.assertTrue(self.settings_after(user).sms_enabled)
+
+    def test_rolling_back_puts_the_columns_back(self):
+        self.executor.migrate(self.after)
+        self.executor.loader.build_graph()
+
+        self.executor.migrate(self.before)
+
+        self.assertTrue(self.OLD_COLUMNS <= self.profile_columns())
+
+
+class SmsSwitchMigrationTests(TransactionTestCase):
+    """user/0013 makes `sms_enabled` the person's own switch.
+
+    What they chose in the app becomes the switch. An account that only a STOP
+    had switched off comes back on: the STOP is kept on the group it was sent to.
+    """
+
+    before = [('user', '0012_drop_old_profile_delivery_columns')]
+    after = [('user', '0013_sms_switch_is_the_persons')]
+
+    def setUp(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.before)
+        self.executor.loader.build_graph()
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+
+    def test_the_persons_choice_becomes_the_switch(self):
+        old = self.executor.loader.project_state(self.before).apps
+        OldUser = old.get_model('auth', 'User')
+        OldSettings = old.get_model('user', 'MessagingSettings')
+        app_only = OldUser.objects.create(username='app-only')
+        OldSettings.objects.create(user=app_only, sms_to_loopd_users_enabled=False)
+        stopped = OldUser.objects.create(username='stopped-somewhere')
+        OldSettings.objects.create(
+            user=stopped, sms_enabled=False, sms_opt_out_at=timezone.now()
+        )
+        untouched = OldUser.objects.create(username='untouched')
+        OldSettings.objects.create(user=untouched)
+
+        self.executor.migrate(self.after)
+        new = self.executor.loader.project_state(self.after).apps
+        NewSettings = new.get_model('user', 'MessagingSettings')
+
+        chose_app_only = NewSettings.objects.get(user_id=app_only.pk)
+        self.assertFalse(chose_app_only.sms_enabled)
+        self.assertIsNotNone(chose_app_only.sms_opt_out_at)
+        self.assertTrue(NewSettings.objects.get(user_id=stopped.pk).sms_enabled)
+        self.assertTrue(NewSettings.objects.get(user_id=untouched.pk).sms_enabled)
+
+
+class DiscoverabilityTests(TestCase):
+    """Settings → Privacy → Find me using my phone number / my email.
+
+    Both switches are about the identifiers people hand out. Neither hides a
+    @username: somebody who types that still finds them.
+    """
+
+    def setUp(self):
+        self.hidden = User.objects.create_user(
+            username='hidden', email='hidden@example.com', password='x'
+        )
+        self.hidden.profile.phone_number = '+639171111111'
+        self.hidden.profile.phone_no_verified = True
+        self.hidden.profile.email_verified = True
+        self.hidden.profile.save()
+        self.seeker = User.objects.create_user(username='seeker', password='x')
+
+    def hide(self, **flags):
+        row = PrivacySettings.for_user(self.hidden)
+        for field, value in flags.items():
+            setattr(row, field, value)
+        row.save(update_fields=list(flags))
+
+    def test_by_default_the_number_and_the_address_both_find_them(self):
+        from user.lookups import find_user
+
+        self.assertEqual(find_user('+639171111111', exclude=self.seeker), self.hidden)
+        self.assertEqual(
+            find_user('hidden@example.com', exclude=self.seeker), self.hidden
+        )
+
+    def test_a_hidden_number_finds_nobody(self):
+        from user.lookups import find_user, search_users
+
+        self.hide(discoverable_by_phone=False)
+
+        self.assertIsNone(find_user('+639171111111', exclude=self.seeker))
+        self.assertEqual(
+            list(search_users('+639171111111', exclude=self.seeker)), []
+        )
+
+    def test_a_hidden_address_finds_nobody(self):
+        from user.lookups import find_user
+
+        self.hide(discoverable_by_email=False)
+
+        self.assertIsNone(find_user('hidden@example.com', exclude=self.seeker))
+
+    def test_their_username_still_finds_them(self):
+        from user.lookups import find_user, search_users
+
+        self.hide(discoverable_by_phone=False, discoverable_by_email=False)
+
+        self.assertEqual(find_user('hidden', exclude=self.seeker), self.hidden)
+        self.assertIn(self.hidden, search_users('hid', exclude=self.seeker))
+
+    def test_the_one_caller_that_may_look_past_it_is_the_email_invite(self):
+        # chat/membership.py:invite_by_email asks a second time, only to avoid
+        # emailing an invitation that could never be claimed.
+        from user.lookups import find_user
+
+        self.hide(discoverable_by_email=False)
+
+        self.assertEqual(
+            find_user('hidden@example.com', respect_discoverability=False),
+            self.hidden,
+        )
 

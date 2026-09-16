@@ -148,7 +148,15 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         # create_message broadcasts to the conversation group, which this
         # socket is part of - so the sender's own echo arrives that way too.
         await self.store_message(
-            conversation, text, client_id=client_id, reply_to=reply_to
+            conversation,
+            text,
+            client_id=client_id,
+            reply_to=reply_to,
+            # Membership ids the composer offered. Not trusted here: they are
+            # checked against this conversation's ACTIVE members in
+            # chat/mentions.py, the same place the REST path checks them.
+            mentions=content.get('mentions'),
+            mention_everyone=bool(content.get('mention_everyone')),
         )
 
     async def handle_typing(self, content):
@@ -184,6 +192,7 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         """
         from chat.models import Conversation, Participant
         from user.blocks import blocks_between
+
 
         if conversation.kind != Conversation.Kind.DIRECT:
             return False
@@ -300,7 +309,15 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         Arrives on the conversation's group, so everyone in it hears. The
         reader's own client ignores it - it already knows - and the senders use
         it to mark their messages seen.
+
+        Withheld from anybody who turned their own Read receipts off: the
+        bargain is two-way, so somebody who shows none is shown none. Asked per
+        frame rather than cached at connect, because a socket can be open for
+        hours and the setting must not take that long to take effect.
         """
+        if event['user_id'] != self.user.pk and not await self.sees_read_receipts():
+            return
+
         await self.send_json(
             {
                 'type': 'conversation.read.by',
@@ -322,6 +339,17 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         )
 
     # -- database ---------------------------------------------------------
+
+    @database_sync_to_async
+    def sees_read_receipts(self):
+        """Whether this socket's account is shown other people's read receipts.
+
+        Their own Read receipts switch: the bargain is two-way, so somebody who
+        shows none is shown none (user/privacy.py).
+        """
+        from user import privacy
+
+        return privacy.shows_read_receipts(self.user)
 
     @database_sync_to_async
     def conversation_ids(self):
@@ -360,7 +388,8 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         return parent if parent is not None else False
 
     @database_sync_to_async
-    def store_message(self, conversation, text, client_id='', reply_to=None):
+    def store_message(self, conversation, text, client_id='', reply_to=None,
+                      mentions=None, mention_everyone=False):
         return serialize_message(
             create_message(
                 conversation,
@@ -368,5 +397,7 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
                 text=text,
                 client_id=client_id,
                 reply_to=reply_to,
+                mentions=mentions,
+                mention_everyone=mention_everyone,
             )
         )

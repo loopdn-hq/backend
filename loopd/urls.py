@@ -50,6 +50,12 @@ urlpatterns = [
     # contract - signature, not a token. See mail/webhooks.py.
     path('api/v1/mail/', include('mail.urls')),
 
+    # Registering a browser for notifications, and the public VAPID key it
+    # needs to do so. Called only by our own web app. The app is
+    # `notification` - push is how the notification app reaches a closed
+    # browser - but the address says what it is for.
+    path('api/v1/push/', include('notification.push.urls')),
+
     path('api/v1/billing/', include('billing.urls')),
 
     # Deliberately NOT under /api/v1/. This URL is printed into email and lives

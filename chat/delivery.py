@@ -59,6 +59,29 @@ from chat.models import ChannelConsent, Conversation, Participant
 logger = logging.getLogger(__name__)
 
 
+def membership_reason(participant):
+    """Why this member must not be told about anything here, or None.
+
+    The rungs that are about the MEMBER rather than about a channel: are they
+    still in the group, and did they ask for silence. Split out of
+    `refusal_reason` because push needs exactly these two and none of the rest
+    - it has no consent row to read, since the browser permission prompt is the
+    consent - and a second copy of "active and not muted" is the kind of thing
+    that gets fixed in one place and not the other.
+
+    Mute is here, not in the channel half, deliberately: muting a Loop means no
+    interruptions from it by any means, and a mention that broke through would
+    make the switch a lie.
+    """
+    if participant.status != Participant.Status.ACTIVE:
+        return NOT_A_MEMBER
+
+    if participant.muted:
+        return MUTED
+
+    return None
+
+
 def refusal_reason(participant, channel):
     """Why this member must not be sent this channel, or None if they may be.
 
@@ -70,11 +93,9 @@ def refusal_reason(participant, channel):
     Answers only the membership question. Whether there is a usable address is
     the channel's own business - see the module docstring.
     """
-    if participant.status != Participant.Status.ACTIVE:
-        return NOT_A_MEMBER
-
-    if participant.muted:
-        return MUTED
+    reason = membership_reason(participant)
+    if reason is not None:
+        return reason
 
     if not _channel_enabled(participant, channel):
         return f'{channel} disabled for this group'
@@ -145,6 +166,34 @@ def conversation_reason(conversation):
     return None
 
 
+def audience(message, *, select_related=(), prefetch_related=()):
+    """Everybody who could be told about this message, and the block screen.
+
+    Returns `(rows, screen)`: the ACTIVE members of the conversation except the
+    sender, and the one screen the whole fan-out is judged against. Each caller
+    passes the joins ITS decision needs - consent rows for SMS and email, the
+    notification settings and browser subscriptions for push - so the shared
+    part is the part that is genuinely shared.
+
+    Two queries plus the screen, whatever the size of the group. The sender is
+    left out here rather than by each caller: texting somebody their own
+    message reads as an echo and bills for the privilege, and a caller that
+    forgot would be a caller that did it.
+    """
+    rows = (
+        Participant.objects.filter(
+            conversation=message.conversation,
+            status=Participant.Status.ACTIVE,
+        )
+        .exclude(pk=message.sender_participant_id)
+        .select_related(*select_related)
+        .prefetch_related(*prefetch_related)
+    )
+
+    # One query for the whole audience, before the loop. See screen_for_message.
+    return rows, screen_for_message(message)
+
+
 def eligible_for(message, channel):
     """Split a message's audience into who may be sent it and who may not.
 
@@ -163,22 +212,15 @@ def eligible_for(message, channel):
         # the one place that has to stay legible.
         return [], []
 
-    rows = (
-        Participant.objects.filter(
-            conversation=message.conversation,
-            status=Participant.Status.ACTIVE,
-        )
-        .exclude(pk=message.sender_participant_id)
-        .select_related('user__profile', 'user__messaging_settings')
-        .prefetch_related('channel_consents')
+    rows, screen = audience(
+        message,
+        select_related=('user__profile', 'user__messaging_settings'),
+        prefetch_related=('channel_consents',),
     )
-
-    # One query for the whole audience, before the loop. See screen_for_message.
-    screen = screen_for_message(message)
 
     send_to, skipped = [], []
     for row in rows:
-        reason = refusal_reason(row, channel) or _block_reason(row, screen)
+        reason = refusal_reason(row, channel) or block_reason(row, screen)
         if reason is None:
             send_to.append(row)
         else:
@@ -249,10 +291,10 @@ def sender_block_reason(participant, message):
     """
     if participant is None or message is None:
         return None
-    return _block_reason(participant, screen_for_message(message))
+    return block_reason(participant, screen_for_message(message))
 
 
-def _block_reason(participant, screen):
+def block_reason(participant, screen):
     """Whether this recipient is screened from that sender.
 
     WHY THIS IS NOT A RUNG IN `refusal_reason`. Every rung up there is a fact
@@ -339,16 +381,34 @@ def _consent_reason(consent):
 
 _channels = {}
 
+#: The channels that carry a DIRECT conversation too. Kept beside `_channels`
+#: rather than inside it so that a test patching `_channels` with a plain
+#: {name: scheduler} dict still works; a name that is not in here is
+#: group-shaped, which is the safe default.
+_carries_direct = set()
 
-def register_channel(name, scheduler):
+
+def register_channel(name, scheduler, *, groups_only=True):
     """Announce that this channel wants a copy of every new message.
 
     `scheduler` is called with the Message and is responsible for queueing its
     own fan-out after the transaction commits - never for sending anything
     inline. Registering the same name twice replaces it, which is what keeps a
     reloaded AppConfig from doubling the fan-out.
+
+    `groups_only` is what ONLY A GROUP GOES OUT (see the module docstring)
+    actually means: SMS and email are shaped for a group - the name in the
+    From line, the group's number, the footer for leaving it - and have
+    nothing to say about a direct message. Push is not shaped that way. It goes
+    to the person's own device, about a conversation they are already in, so it
+    carries a direct message as naturally as a group one and registers with
+    `groups_only=False`.
     """
     _channels[name] = scheduler
+    if groups_only:
+        _carries_direct.discard(name)
+    else:
+        _carries_direct.add(name)
 
 
 def registered_channels():
@@ -366,13 +426,14 @@ def schedule_all(message):
     channel rather than around the whole thing.
     """
     reason = conversation_reason(message.conversation)
-    if reason is not None:
-        logger.debug(
-            'Message %s not offered to any channel: %s', message.pk, reason
-        )
-        return
 
     for name, scheduler in list(_channels.items()):
+        if reason is not None and name not in _carries_direct:
+            logger.debug(
+                'Message %s not offered to %s: %s', message.pk, name, reason
+            )
+            continue
+
         try:
             scheduler(message)
         except Exception:

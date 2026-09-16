@@ -41,7 +41,8 @@ def send_to_group(group, payload):
 @transaction.atomic
 def create_message(conversation, sender=None, text='', uploads=None, *,
                    source=Message.Source.APP, participant=None, client_id='',
-                   reply_to=None, forwarded_from=None, copy_attachments=None):
+                   reply_to=None, forwarded_from=None, copy_attachments=None,
+                   mentions=None, mention_everyone=False):
     """Store a message with its attachments and touch the conversation.
 
     `sender` is the account that sent it, or None when the sender has no
@@ -146,6 +147,15 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
             width=original.width,
             height=original.height,
         )
+
+    # Who the message names, stored BEFORE anything is broadcast or scheduled:
+    # the socket frame carries the mentions, and the push fan-out below decides
+    # who to alert by reading them. Written after the row exists because they
+    # point at it. See chat/mentions.py for why they are ids and not words.
+    if mentions or mention_everyone:
+        from chat.mentions import set_mentions
+
+        set_mentions(message, mentions, everyone=mention_everyone)
 
     # Moves the conversation to the top of everyone's list. auto_now fills
     # in the value.
@@ -378,6 +388,15 @@ def broadcast_conversation_read(conversation, user, message):
             'last_read_message_id': message.pk,
         },
     )
+
+    # The receipt half only, and only with their Read receipts on. Their own
+    # devices above are told either way: that frame clears a badge rather than
+    # telling anybody anything.
+    from user import privacy
+
+    if not privacy.shows_read_receipts(user):
+        return
+
     send_to_group(
         conversation_group(conversation.pk),
         {
