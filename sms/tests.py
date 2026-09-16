@@ -2841,3 +2841,74 @@ class GroupConsentTests(TestCase):
 
         self.assertEqual(self.family.messages.count(), 1)
         self.assertEqual(self.family.messages.first().text, 'On my way')
+
+
+class SmsFailureAlertTests(TestCase):
+    """Giving up on a text tells whoever wrote the message.
+
+    The email twin is mail/tests.py:EmailFailureAlertTests; both sweeps share
+    one announcer (notification/delivery_alerts.py), so what differs here is
+    only what SMS calls permanent.
+    """
+
+    def setUp(self):
+        from chat.models import Conversation
+        from chat.services import create_message
+
+        self.alice = User.objects.create_user(
+            username='alice', email='alice@example.com', password='a-strong-passphrase-42'
+        )
+        self.bob = User.objects.create_user(
+            username='bob', email='bob@example.com', password='a-strong-passphrase-42'
+        )
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.message = create_message(self.group, self.alice, text='Dinner at 7')
+
+    def failed(self, **kwargs):
+        from sms.models import SmsDelivery
+
+        values = {
+            'direction': SmsDelivery.Direction.OUTBOUND,
+            'conversation': self.group,
+            'message': self.message,
+            'status': SmsDelivery.Status.FAILED,
+            'reason': 'no verified number',
+            'attempts': 1,
+        }
+        values.update(kwargs)
+        return SmsDelivery.objects.create(**values)
+
+    def announce(self):
+        from sms.maintenance import announce_failed_deliveries
+
+        return announce_failed_deliveries()
+
+    def alerts(self):
+        from notification.models import Notification
+
+        return Notification.objects.filter(
+            type=Notification.Type.SMS_SEND_FAILED
+        )
+
+    def test_a_permanent_failure_is_announced_to_the_sender(self):
+        self.failed()
+
+        self.assertEqual(self.announce(), 1)
+        alert = self.alerts().get()
+        self.assertEqual(alert.to_user, self.alice)
+        self.assertEqual(alert.data['count'], 1)
+
+    def test_two_numbers_are_one_alert(self):
+        self.failed()
+        self.failed()
+
+        self.announce()
+
+        self.assertEqual(self.alerts().count(), 1)
+        self.assertEqual(self.alerts().get().data['count'], 2)
+
+    def test_a_carrier_having_a_bad_minute_says_nothing_yet(self):
+        self.failed(reason='carrier rejected the message', attempts=1)
+
+        self.assertEqual(self.announce(), 0)

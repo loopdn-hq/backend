@@ -920,6 +920,12 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'sms.provision_missing_numbers',
         'schedule': 900.0,
     },
+    # After the retry sweep, so nothing is announced that a retry was about to
+    # fix - see sms/maintenance.py:announce_failed_deliveries.
+    'sms-announce-failed-deliveries': {
+        'task': 'sms.announce_failed_deliveries',
+        'schedule': 300.0,
+    },
     'sms-purge-old-deliveries': {
         'task': 'sms.purge_old_deliveries',
         # Daily. Nothing here is urgent and it deletes rows.
@@ -937,6 +943,10 @@ CELERY_BEAT_SCHEDULE = {
     'mail-requeue-stalled-deliveries': {
         'task': 'mail.requeue_stalled_deliveries',
         'schedule': 600.0,
+    },
+    'mail-announce-failed-deliveries': {
+        'task': 'mail.announce_failed_deliveries',
+        'schedule': 300.0,
     },
     'mail-purge-old-deliveries': {
         'task': 'mail.purge_old_deliveries',

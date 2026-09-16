@@ -20,9 +20,11 @@ import logging
 from datetime import timedelta
 
 from django.conf import settings
+from django.db.models import Count, Q
 from django.utils import timezone
 
 from chat import delivery as delivery_rules
+from chat.models import Message
 from mail.models import EmailDelivery, EmailWebhookEvent
 
 logger = logging.getLogger(__name__)
@@ -100,6 +102,78 @@ def requeue_stalled_deliveries():
         # WARNING rather than INFO: something died.
         logger.warning('Marked %s stalled email deliveries as failed', count)
     return count
+
+
+def announce_failed_deliveries():
+    """Tell senders when email has given up on their message.
+
+    The mirror of `retry_failed_deliveries` above, and deliberately written
+    next to it: everything that sweep will NOT pick up again - a permanent
+    reason, the attempts spent, or the retry window closed. Plus the provider's own
+    verdicts - a bounce and a complaint - which are failures nobody here can
+    retry.
+
+    Bounded to the last day. An alert about a message from last week is
+    archaeology: it has been read, forgotten, or asked about in person.
+
+    One alert per MESSAGE, not per person - see notification/delivery_alerts.py.
+    """
+    from notification.delivery_alerts import announce_all
+    from notification.models import Notification
+
+    now = timezone.now()
+    retry_cutoff = now - timedelta(hours=settings.MAIL_RETRY_WINDOW_HOURS)
+
+    spent = Q(status=EmailDelivery.Status.FAILED) & (
+        Q(reason__in=PERMANENT_REASONS)
+        | Q(attempts__gte=settings.MAIL_MAX_DELIVERY_ATTEMPTS)
+        | Q(created_at__lt=retry_cutoff)
+    )
+
+    # The provider's verdict, which no retry can change.
+    refused = Q(
+        status__in=(
+            EmailDelivery.Status.BOUNCED,
+            EmailDelivery.Status.COMPLAINED,
+        )
+    )
+
+    counts = (
+        EmailDelivery.objects.filter(
+            direction=EmailDelivery.Direction.OUTBOUND,
+            created_at__gte=now - timedelta(days=1),
+            message__isnull=False,
+        )
+        .filter(spent | refused)
+        .values('message_id')
+        .annotate(failed=Count('id'))
+        # Ordering comes from Meta and would otherwise join its way into the
+        # GROUP BY, which makes the count per row rather than per message.
+        .order_by()[:200]
+    )
+
+    wanted = [row['message_id'] for row in counts]
+    if not wanted:
+        return 0
+
+    messages = {
+        message.pk: message
+        for message in Message.objects.filter(pk__in=wanted).select_related(
+            'conversation', 'sender'
+        )
+    }
+
+    announced = announce_all(
+        (
+            (messages[row['message_id']], row['failed'])
+            for row in counts
+            if row['message_id'] in messages
+        ),
+        Notification.Type.EMAIL_SEND_FAILED,
+    )
+    if announced:
+        logger.info('Announced email delivery failures on %s messages', announced)
+    return announced
 
 
 def purge_old_deliveries():

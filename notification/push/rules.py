@@ -38,11 +38,26 @@ logger = logging.getLogger(__name__)
 
 #: Which switch governs which activity event. A map rather than a chain of ifs
 #: so that a new notification type joins it in one line - and so that a type
-#: NOT in it is silently never pushed, which is the safe default for the eight
-#: types that have no switch on the screen (join requests, role changes, SMS
-#: opt-outs: all of them already appear in the activity feed).
+#: NOT in it is silently never pushed, which is the safe default for the types
+#: that have no switch on the screen (role changes, removals, SMS opt-outs:
+#: all of them still appear in the activity feed).
+#:
+#: All three are "getting into a Loop", which is what the Group invitations row
+#: is about (Yul, 2026-09-16). The third is the odd one: it reaches the ADMINS
+#: of a group rather than the person joining, so an admin of a busy open group
+#: gets one per request - if that turns out to be too much, it is this line
+#: that comes out, and nothing else changes.
+#:
+#: Every type here needs words in `payloads.EVENT_WORDS`; a test holds the two
+#: in step.
 SETTING_BY_NOTIFICATION_TYPE = {
     Notification.Type.MEMBER_ADDED: 'group_invitations',
+    Notification.Type.JOIN_APPROVED: 'group_invitations',
+    Notification.Type.JOIN_REQUESTED: 'group_invitations',
+    # "Your message did not reach everyone", one per message per channel -
+    # see notification/delivery_alerts.py for why it is not one per person.
+    Notification.Type.SMS_SEND_FAILED: 'sms_delivery_failures',
+    Notification.Type.EMAIL_SEND_FAILED: 'email_delivery_failures',
 }
 
 #: The kinds of message alert, which are also what the payload is built from.

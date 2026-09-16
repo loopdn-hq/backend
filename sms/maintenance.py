@@ -24,7 +24,7 @@ from django.db.models import Count, Q, Sum
 from django.utils import timezone
 
 from chat import delivery as delivery_rules
-from chat.models import Conversation
+from chat.models import Conversation, Message
 from sms.models import GroupNumber, SmsDelivery, SmsWebhookEvent
 
 logger = logging.getLogger(__name__)
@@ -151,6 +151,68 @@ def provision_missing_numbers():
     if provisioned:
         logger.info('Provisioned numbers for %s groups that had none', provisioned)
     return provisioned
+
+
+def announce_failed_deliveries():
+    """Tell senders when text has given up on their message.
+
+    The mirror of `retry_failed_deliveries` above, and deliberately written
+    next to it: everything that sweep will NOT pick up again - a permanent
+    reason, the attempts spent, or the retry window closed.
+
+    Bounded to the last day. An alert about a message from last week is
+    archaeology: it has been read, forgotten, or asked about in person.
+
+    One alert per MESSAGE, not per person - see notification/delivery_alerts.py.
+    """
+    from notification.delivery_alerts import announce_all
+    from notification.models import Notification
+
+    now = timezone.now()
+    retry_cutoff = now - timedelta(hours=settings.SMS_RETRY_WINDOW_HOURS)
+
+    spent = Q(status=SmsDelivery.Status.FAILED) & (
+        Q(reason__in=PERMANENT_REASONS)
+        | Q(attempts__gte=settings.SMS_MAX_DELIVERY_ATTEMPTS)
+        | Q(created_at__lt=retry_cutoff)
+    )
+
+    counts = (
+        SmsDelivery.objects.filter(
+            direction=SmsDelivery.Direction.OUTBOUND,
+            created_at__gte=now - timedelta(days=1),
+            message__isnull=False,
+        )
+        .filter(spent)
+        .values('message_id')
+        .annotate(failed=Count('id'))
+        # Ordering comes from Meta and would otherwise join its way into the
+        # GROUP BY, which makes the count per row rather than per message.
+        .order_by()[:200]
+    )
+
+    wanted = [row['message_id'] for row in counts]
+    if not wanted:
+        return 0
+
+    messages = {
+        message.pk: message
+        for message in Message.objects.filter(pk__in=wanted).select_related(
+            'conversation', 'sender'
+        )
+    }
+
+    announced = announce_all(
+        (
+            (messages[row['message_id']], row['failed'])
+            for row in counts
+            if row['message_id'] in messages
+        ),
+        Notification.Type.SMS_SEND_FAILED,
+    )
+    if announced:
+        logger.info('Announced text delivery failures on %s messages', announced)
+    return announced
 
 
 def purge_old_deliveries():

@@ -62,6 +62,13 @@ def provision_missing_numbers():
     return run()
 
 
+@shared_task(name='sms.announce_failed_deliveries')
+def announce_failed_deliveries():
+    from sms.maintenance import announce_failed_deliveries as run
+
+    return run()
+
+
 @shared_task(name='sms.purge_old_deliveries')
 def purge_old_deliveries():
     from sms.maintenance import purge_old_deliveries as run
