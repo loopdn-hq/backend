@@ -11,8 +11,8 @@ else's.
 
 PATCH only, no PUT: a screen saves one switch at a time, and a PUT that had to
 resend every field would let a stale tab overwrite a change made in another.
-A field a screen shows but may not write (`sms_enabled`, the two-factor pair)
-is ignored if sent, the same as `username` on /me/.
+A field a screen shows but may not write (the two-factor pair) is ignored if
+sent, the same as `username` on /me/.
 """
 from rest_framework import mixins, viewsets
 from rest_framework.exceptions import NotFound

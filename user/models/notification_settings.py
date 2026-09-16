@@ -8,11 +8,14 @@ from .base import UserSettings
 class NotificationSettings(UserSettings):
     """What a person is notified about, and how.
 
-    Account-wide switches. NOTHING READS THESE YET - the app sends no push
-    notifications, has no calls and plays no sounds, so there is nothing for
-    them to switch off. The web's Notifications screen does save them to the
-    account (PATCH /users/me/settings/notifications/), so a choice is kept for
-    when those exist.
+    Account-wide switches, read by ONE place: `notification/push/rules.py`, which turns
+    them into "does this person want to be told about this". Nothing else may
+    read them - the rule about how the switches combine is written there, once,
+    next to the reason.
+
+    The call and delivery-failure switches are still saved and still change
+    nothing: there are no calls in Loopd'n, and no alert is raised when a text
+    or an email fails. Each field's comment says what it does TODAY.
 
     NOT HERE, ON PURPOSE - these already exist:
 
@@ -37,11 +40,11 @@ class NotificationSettings(UserSettings):
 
     # --- Messages --------------------------------------------------------------
 
-    # "Messages" - meant as the main switch for new-message alerts, with
-    # "Group messages" and "Direct messages" below narrowing it down. How the
-    # three combine is decided when alerts are built; the screen shows them
-    # side by side and does not grey the two out.
-    # Today: saved, but changes nothing.
+    # "Messages" - the main switch for new-message alerts.
+    #   Off - no push about any message, group or direct, mention or not.
+    # The three below narrow it; see notification/push/rules.py for the order they are
+    # asked in.
+    # Today: real, for push.
     messages = models.BooleanField(default=True, db_default=True)
 
     # "Group messages"
@@ -49,27 +52,38 @@ class NotificationSettings(UserSettings):
     #   Off - no alert; the message still arrives and counts as unread.
     # A Loop the person has muted stays silent either way
     # (`chat.Participant.muted`).
-    # Today: saved, but changes nothing.
+    # Today: real, for push.
     group_messages = models.BooleanField(default=True, db_default=True)
 
     # "Direct messages"
     #   On  - an alert when somebody messages the person one to one.
     #   Off - no alert; the message still arrives and counts as unread.
-    # Today: saved, but changes nothing.
+    # Today: real, for push. This is the only channel that carries a direct
+    # message: a text or an email would arrive shaped like a group's
+    # (chat/delivery.py:conversation_reason).
     direct_messages = models.BooleanField(default=True, db_default=True)
 
     # "Mentions & replies"
     #   On  - an alert when somebody mentions the person or replies to one of
     #         their messages.
-    #   Off - no alert for those.
-    # Today: saved, but changes nothing.
+    #   Off - no special treatment; an ordinary message alert may still
+    #         arrive, if "Group messages" or "Direct messages" allows it.
+    # ON TOP of the two above, not under them: somebody who turned group
+    # messages off in a busy Loop is exactly who still wants to know when a
+    # message is addressed to them. Muting the Loop silences it all the same.
+    # Today: real, for push.
     mentions_replies = models.BooleanField(default=True, db_default=True)
 
     # "Group invitations"
     #   On  - an alert when the person is invited to or added to a Loop.
     #   Off - no alert.
-    # Today: saved, but changes nothing. The Activity feed still lists being
-    # added ("Added to a group", `notification.Notification`) either way.
+    # Covers the three events about getting into a Loop (Yul, 2026-09-16):
+    # being added (`MEMBER_ADDED`), a join request of yours being approved
+    # (`JOIN_APPROVED`), and - for an admin - somebody asking to join
+    # (`JOIN_REQUESTED`). The map is
+    # notification/push/rules.py:SETTING_BY_NOTIFICATION_TYPE.
+    # Today: real, for push. The Activity feed still lists all of them either
+    # way; this is only the interruption.
     group_invitations = models.BooleanField(default=True, db_default=True)
 
     # --- Calls -----------------------------------------------------------------
@@ -91,17 +105,23 @@ class NotificationSettings(UserSettings):
     # "SMS delivery failures"
     #   On  - an alert when a message the person sent could not reach somebody
     #         by text.
-    #   Off - no alert.
-    # Today: saved, but changes nothing - no such alert is sent yet. (The
-    # activity feed has a type for it, `Notification.Type.SMS_SEND_FAILED`,
-    # but nothing creates one.)
+    #   Off - no alert. The activity feed still records it.
+    # ONE alert per message, not per person: "4 people did not get your
+    # message". Raised only once the channel has given up - a permanent
+    # reason, the attempts spent, or the retry window closed - because the
+    # retry sweep quietly fixes most failures minutes later. Written by
+    # sms/maintenance.py:announce_failed_deliveries through
+    # notification/delivery_alerts.py.
+    # Today: real, for push.
     sms_delivery_failures = models.BooleanField(default=True, db_default=True)
 
     # "Email delivery failures"
     #   On  - an alert when a message the person sent could not reach somebody
     #         by email.
-    #   Off - no alert.
-    # Today: saved, but changes nothing - no such alert is sent yet.
+    #   Off - no alert. The activity feed still records it.
+    # The same shape as the SMS row above, plus the provider's own verdicts: a
+    # bounce and a complaint are failures no retry can change.
+    # Today: real, for push.
     email_delivery_failures = models.BooleanField(default=True, db_default=True)
 
     # --- Notification preview --------------------------------------------------
@@ -110,12 +130,16 @@ class NotificationSettings(UserSettings):
     #   On  - an alert shows who wrote and what they wrote.
     #   Off - it only says there is a new message, so nobody glancing at the
     #         screen can read it.
-    # Today: saved, but changes nothing.
+    # Today: real, for push - see notification/push/payloads.py, which is the only place
+    # that builds the words anybody reads.
     show_preview = models.BooleanField(default=True, db_default=True)
 
     # "Sound" - what plays when an alert arrives: "Loopd'n default", or "None"
     # for silence. More sounds can join the choices once there are sound files.
-    # Today: saved, but changes nothing - the app plays no sounds yet.
+    # Today: HALF real. A browser will not play a file of our choosing - the
+    # `sound` member of the Notification API is unimplemented everywhere - so
+    # "default" is whatever sound the operating system makes, and "None" is
+    # honoured as a silent notification.
     sound = models.CharField(
         max_length=8,
         choices=Sound.choices,

@@ -726,16 +726,30 @@ class EmailReplyTests(TestCase):
 
         self.assertEqual(self.reply().action, 'posted')
 
-    def test_a_member_who_declined_email_can_still_reply(self):
-        # Consent is about receiving. Somebody replying to an old email is
-        # still a member with something to say.
+    # --- what is refused, because they turned email off --------------------
+
+    def test_a_member_who_stopped_this_groups_email_cannot_reply_to_it(self):
+        # STOP EMAILS, or the footer link, stops this group in both directions:
+        # it no longer emails them, and no longer takes their replies.
         membership.set_channel_consent(
             self.bob_row,
             ChannelConsent.Channel.EMAIL,
             ChannelConsent.Status.DECLINED,
         )
 
-        self.assertEqual(self.reply().action, 'posted')
+        result = self.reply()
+
+        self.assertEqual(result.action, 'ignored_email_declined')
+        self.assertEqual(self.group.messages.count(), 0)
+
+    def test_a_member_with_email_off_cannot_reply_to_any_group(self):
+        # "Send and receive Loop messages by email", unticked in the app.
+        MessagingSettings.objects.filter(user=self.bob).update(email_enabled=False)
+
+        result = self.reply()
+
+        self.assertEqual(result.action, 'ignored_email_off')
+        self.assertEqual(self.group.messages.count(), 0)
 
 
 @override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, RESEND_WEBHOOK_SECRET='')
@@ -1549,14 +1563,33 @@ class EmailKeywordTests(TestCase):
             self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
         )
 
-    def test_they_can_still_reply_normally_afterwards(self):
-        # Consent is about receiving. Somebody who stopped the email still
-        # takes part.
+    def test_afterwards_that_group_takes_no_replies_from_them(self):
+        # Both directions: the group stops emailing them and stops taking
+        # their email replies. They can still take part in the app.
         self.reply('STOP EMAILS')
 
         result = self.reply('On my way')
 
+        self.assertEqual(result.action, 'ignored_email_declined')
+        self.assertEqual(self.family.messages.count(), 0)
+
+    def test_but_their_other_groups_still_do(self):
+        self.reply('STOP EMAILS')
+
+        result = self.reply('On my way', participant=self.bob_work)
+
         self.assertEqual(result.action, 'posted')
+        self.assertEqual(self.work.messages.count(), 1)
+
+    def test_the_keyword_still_works_with_email_off_everywhere(self):
+        MessagingSettings.objects.filter(user=self.bob).update(email_enabled=False)
+
+        result = self.reply('STOP EMAILS')
+
+        self.assertEqual(result.action, 'email_declined')
+        self.assertEqual(
+            self.email_consent(self.bob_family), ChannelConsent.Status.DECLINED
+        )
 
 
 class UnsubscribeConfirmationTests(TransactionTestCase):
@@ -2134,6 +2167,12 @@ class ReceiptTests(APITestCase):
     def email_switch(self):
         return MessagingSettings.objects.get(user=self.bob).email_enabled
 
+    def assertEmailTurnedOffFor(self, reason):
+        switches = MessagingSettings.objects.get(user=self.bob)
+        self.assertFalse(switches.email_enabled)
+        self.assertIsNotNone(switches.email_opt_out_at)
+        self.assertEqual(switches.email_opt_out_reason, reason)
+
     def test_delivered(self):
         response = self.receipt('email.delivered')
 
@@ -2149,7 +2188,7 @@ class ReceiptTests(APITestCase):
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, EmailDelivery.Status.BOUNCED)
         self.assertEqual(self.row.reason, 'bounced: Permanent General mailbox unavailable')
-        self.assertFalse(self.email_switch())
+        self.assertEmailTurnedOffFor(MessagingSettings.EmailOptOutReason.BOUNCE)
 
     def test_a_temporary_bounce_changes_only_the_row(self):
         self.receipt('email.bounced', bounce={'type': 'Temporary', 'subType': 'MailboxFull'})
@@ -2163,7 +2202,7 @@ class ReceiptTests(APITestCase):
 
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, EmailDelivery.Status.COMPLAINED)
-        self.assertFalse(self.email_switch())
+        self.assertEmailTurnedOffFor(MessagingSettings.EmailOptOutReason.COMPLAINT)
 
         # The switch is the same one Settings > Messaging shows, and the
         # fan-out reads it - so nothing more reaches them until they turn it on.
@@ -2180,7 +2219,19 @@ class ReceiptTests(APITestCase):
 
         self.receipt('email.complained')
 
-        self.assertFalse(self.email_switch())
+        self.assertEmailTurnedOffFor(MessagingSettings.EmailOptOutReason.COMPLAINT)
+
+    def test_an_account_already_off_keeps_the_first_reason(self):
+        # They turned it off themselves; a later complaint about an email sent
+        # before that does not rewrite why.
+        switches = MessagingSettings.objects.get(user=self.bob)
+        switches.save(update_fields=switches.switch_email(
+            False, reason=MessagingSettings.EmailOptOutReason.PERSON
+        ))
+
+        self.receipt('email.complained')
+
+        self.assertEmailTurnedOffFor(MessagingSettings.EmailOptOutReason.PERSON)
 
     def test_a_suppressed_send_is_a_permanent_failure(self):
         self.receipt('email.suppressed',
@@ -2229,3 +2280,102 @@ class ReceiptTests(APITestCase):
         with capture_sent() as sent:
             self.assertEqual(maintenance.retry_failed_deliveries(), 0)
         self.assertEqual(sent, [])
+
+
+class EmailFailureAlertTests(TestCase):
+    """Giving up on an email tells whoever wrote the message.
+
+    The mirror of the retry sweep: what that sweep will never pick up again is
+    exactly what this one announces. One alert per message, however many
+    addresses failed - see notification/delivery_alerts.py.
+    """
+
+    def setUp(self):
+        from chat.models import Conversation
+
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.message = create_message(self.group, self.alice, text='Dinner at 7')
+
+    def failed(self, **kwargs):
+        from mail.models import EmailDelivery
+
+        values = {
+            'direction': EmailDelivery.Direction.OUTBOUND,
+            'conversation': self.group,
+            'message': self.message,
+            'status': EmailDelivery.Status.FAILED,
+            'reason': 'provider rejected the message',
+            'attempts': 1,
+        }
+        values.update(kwargs)
+        return EmailDelivery.objects.create(**values)
+
+    def announce(self):
+        from mail.maintenance import announce_failed_deliveries
+
+        return announce_failed_deliveries()
+
+    def alerts(self):
+        from notification.models import Notification
+
+        return Notification.objects.filter(
+            type=Notification.Type.EMAIL_SEND_FAILED
+        )
+
+    def test_a_permanent_failure_is_announced(self):
+        self.failed()
+
+        self.assertEqual(self.announce(), 1)
+        self.assertEqual(self.alerts().get().data['count'], 1)
+
+    def test_several_addresses_are_one_alert_with_a_count(self):
+        self.failed()
+        self.failed()
+        self.failed()
+
+        self.announce()
+
+        self.assertEqual(self.alerts().count(), 1)
+        self.assertEqual(self.alerts().get().data['count'], 3)
+
+    def test_a_failure_still_worth_retrying_says_nothing(self):
+        """The retry sweep fixes most of these minutes later."""
+        self.failed(reason='provider unavailable', attempts=1)
+
+        self.assertEqual(self.announce(), 0)
+        self.assertEqual(self.alerts().count(), 0)
+
+    def test_spent_attempts_are_announced(self):
+        self.failed(
+            reason='provider unavailable',
+            attempts=settings.MAIL_MAX_DELIVERY_ATTEMPTS,
+        )
+
+        self.assertEqual(self.announce(), 1)
+
+    def test_a_bounce_is_announced(self):
+        """The provider's own verdict; no retry can change it."""
+        from mail.models import EmailDelivery
+
+        self.failed(status=EmailDelivery.Status.BOUNCED, reason='bounced')
+
+        self.assertEqual(self.announce(), 1)
+
+    def test_a_skip_is_not_a_failure(self):
+        """Muted, opted out, no address - decisions, not failures."""
+        from mail.models import EmailDelivery
+
+        self.failed(status=EmailDelivery.Status.SKIPPED, reason='muted')
+
+        self.assertEqual(self.announce(), 0)
+
+    def test_sweeping_twice_does_not_announce_twice(self):
+        self.failed()
+
+        self.announce()
+        self.announce()
+
+        self.assertEqual(self.alerts().count(), 1)

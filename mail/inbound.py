@@ -18,6 +18,7 @@ So the token says WHO to check and the checks below decide whether to accept:
     the account is not banned
     the receiving server vouches for the FROM address
     the FROM address is that member's own verified address
+    their email is on - for their account, and for this group
     the group takes messages at all
 
 The fourth and fifth do the real work, and only together. Whoever holds the
@@ -47,11 +48,12 @@ from django.conf import settings
 from django.db import transaction
 
 from chat import membership
-from chat.models import Message, Participant, PostingNotAllowed
+from chat.models import ChannelConsent, Message, Participant, PostingNotAllowed
 from chat.services import create_message
 from mail import authentication, autoreply, commands
 from mail.quoting import strip_quoted_reply
 from mail.tokens import participant_id_from
+from user.models import MessagingSettings
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +154,21 @@ def handle_inbound(to_address, from_address, body, *, headers, subject=''):
     if commands.is_stop_emails(text):
         return _stop_emails(participant)
 
+    # The account's own "Send and receive Loop messages by email". Off, no reply
+    # to any group is taken - silently, per the module docstring. Asked after
+    # STOP EMAILS above, so that still works whatever this says.
+    if not MessagingSettings.of(participant.user).email_enabled:
+        return InboundResult(action='ignored_email_off', participant=participant)
+
+    # They stopped this group's email - STOP EMAILS, or its footer link. Until
+    # they turn it back on for this group in the app, the group neither emails
+    # them nor takes their replies.
+    if membership.consent_status(participant, ChannelConsent.Channel.EMAIL) in (
+        ChannelConsent.Status.DECLINED,
+        ChannelConsent.Status.OPTED_OUT,
+    ):
+        return InboundResult(action='ignored_email_declined', participant=participant)
+
     try:
         message = create_message(
             conversation=participant.conversation,
@@ -219,6 +236,10 @@ def _address_only(value):
 
 def _stop_emails(participant):
     """A member replied STOP EMAILS. Stop this group, and say so.
+
+    In both directions: the group stops emailing them, and stops taking their
+    replies (the consent guard in `handle_inbound`), until they turn it back on
+    for this group in the app.
 
     One group, never the account: they may be in eight and only tired of one,
     and a product that makes somebody leave all eight to quieten one loses a

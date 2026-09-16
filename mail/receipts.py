@@ -64,7 +64,10 @@ def record(event):
             updated_at=now,
         )
         if event.permanent:
-            _stop_mailing(rows, 'the address bounced permanently')
+            _stop_mailing(
+                rows, 'the address bounced permanently',
+                MessagingSettings.EmailOptOutReason.BOUNCE,
+            )
         return touched
 
     if event.kind == provider.COMPLAINED:
@@ -73,7 +76,10 @@ def record(event):
             reason=_reason('marked as spam', event),
             updated_at=now,
         )
-        _stop_mailing(rows, 'they marked a group email as spam')
+        _stop_mailing(
+            rows, 'they marked a group email as spam',
+            MessagingSettings.EmailOptOutReason.COMPLAINT,
+        )
         return touched
 
     if event.kind == provider.SUPPRESSED:
@@ -97,14 +103,20 @@ def record(event):
     return 0
 
 
-def _stop_mailing(rows, why):
-    """Switch group email off for every account these rows were sent to."""
+def _stop_mailing(rows, why, reason):
+    """Switch group email off for every account these rows were sent to.
+
+    With the record of when and why (`MessagingSettings.email_off`). Only rows
+    still on are touched, so an account already off keeps the reason it was
+    first turned off for.
+    """
     user_ids = {user_id for user_id in rows.values_list('user_id', flat=True) if user_id}
     if not user_ids:
         return
+    off = MessagingSettings.email_off(reason)
     switched = MessagingSettings.objects.filter(
         user_id__in=user_ids, email_enabled=True
-    ).update(email_enabled=False, updated_at=timezone.now())
+    ).update(**off, updated_at=off['email_opt_out_at'])
 
     # Every account has a row, but the opt-out must stick even for one that
     # somehow does not - so create it, already off.
@@ -115,7 +127,7 @@ def _stop_mailing(rows, why):
     )
     if missing:
         MessagingSettings.objects.bulk_create(
-            [MessagingSettings(user_id=user_id, email_enabled=False) for user_id in missing],
+            [MessagingSettings(user_id=user_id, **off) for user_id in missing],
             ignore_conflicts=True,
         )
         switched += len(missing)

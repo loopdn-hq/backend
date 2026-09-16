@@ -12,7 +12,7 @@ from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TransactionTestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
 from django.urls import reverse
 from django.utils import timezone
@@ -22,6 +22,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from chat import delivery, membership
 from sms import inbound
+from chat.mentions import set_mentions
 from chat.models import (
     ChannelConsent,
     Attachment,
@@ -5408,3 +5409,489 @@ class OtherLinkPreviewTests(APITestCase):
         self.assertTrue(get.call_args.args[0].startswith('https://www.tiktok.com/oembed?'))
         self.assertEqual((card['title'], card['description'], card['site_name']),
                          ('A video', 'Scout', 'TikTok'))
+
+
+def set_privacy(user, **answers):
+    """One person's Settings → Privacy, as the API would have saved them."""
+    from user.models import PrivacySettings
+
+    row = PrivacySettings.for_user(user)
+    for field, value in answers.items():
+        setattr(row, field, value)
+    row.save(update_fields=list(answers))
+    return row
+
+
+class DirectMessagePrivacyTests(EnvelopeAssertions, APITestCase):
+    """"Who can send me direct messages", from Settings → Privacy.
+
+    Only STARTING one is refused. A thread the two already have carries on:
+    stranding a conversation somebody is in is what blocking is for.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+
+    def start(self, starter, identifier='alice'):
+        self.client.force_authenticate(starter)
+        return self.client.post(
+            reverse('chat:conversation-direct'), {'identifier': identifier},
+            format='json',
+        )
+
+    def assertStarted(self, response):
+        self.assertIn(
+            response.status_code,
+            (status.HTTP_200_OK, status.HTTP_201_CREATED),
+            response.json(),
+        )
+        self.assertEqual(response.json()['code'], 1)
+
+    def audience(self, name):
+        from user.models import PrivacySettings
+
+        return getattr(PrivacySettings.Audience, name)
+
+    def test_everyone_is_the_default(self):
+        self.assertStarted(self.start(self.bob))
+
+    def test_nobody_refuses_and_says_why(self):
+        set_privacy(self.alice, direct_messages_from=self.audience('NOBODY'))
+
+        body = self.assertFailure(self.start(self.bob))
+
+        self.assertIn("doesn't accept direct messages", body['message'])
+        self.assertEqual(
+            Conversation.objects.filter(kind=Conversation.Kind.DIRECT).count(), 0
+        )
+
+    def test_loops_refuses_somebody_with_no_group_in_common(self):
+        set_privacy(self.alice, direct_messages_from=self.audience('LOOPS'))
+
+        self.assertFailure(self.start(self.bob))
+
+    def test_loops_allows_somebody_from_a_shared_group(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        set_privacy(self.alice, direct_messages_from=self.audience('LOOPS'))
+
+        self.assertStarted(self.start(self.bob))
+
+    def test_a_thread_they_already_have_still_opens(self):
+        self.assertStarted(self.start(self.bob))
+        set_privacy(self.alice, direct_messages_from=self.audience('NOBODY'))
+
+        self.assertStarted(self.start(self.bob))
+
+    def test_their_own_setting_never_refuses_themselves(self):
+        # Alice writing to Bob is Bob's business, not Alice's own setting.
+        set_privacy(self.alice, direct_messages_from=self.audience('NOBODY'))
+
+        self.assertStarted(self.start(self.alice, identifier='bob'))
+
+
+class GroupAddPrivacyTests(EnvelopeAssertions, APITestCase):
+    """"Who can add me to groups", on every route that adds somebody."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.bob.profile.email_verified = True
+        self.bob.profile.save(update_fields=['email_verified'])
+
+    def audience(self, name):
+        from user.models import PrivacySettings
+
+        return getattr(PrivacySettings.Audience, name)
+
+    def create_group(self, members=None, **extra):
+        self.client.force_authenticate(self.alice)
+        payload = {'name': 'Trip', **extra}
+        if members:
+            payload['members'] = members
+        return self.client.post(
+            reverse('chat:conversation-group'), payload, format='json'
+        )
+
+    def add_members(self, group, members):
+        self.client.force_authenticate(self.alice)
+        return self.client.post(
+            reverse('chat:conversation-members', args=[group.id]),
+            {'members': members}, format='json',
+        )
+
+    def test_nobody_refuses_group_creation_and_names_them(self):
+        set_privacy(self.bob, group_adds_from=self.audience('NOBODY'))
+
+        body = self.assertFailure(self.create_group(members=['bob']))
+
+        self.assertIn('@bob', str(body['data']))
+        self.assertEqual(Conversation.objects.filter(name='Trip').count(), 0)
+
+    def test_nobody_refuses_add_members(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        set_privacy(self.bob, group_adds_from=self.audience('NOBODY'))
+
+        self.assertFailure(self.add_members(group, ['bob']))
+
+        self.assertFalse(group.has_participant(self.bob))
+
+    def test_loops_allows_somebody_from_a_shared_group(self):
+        shared = Conversation.start_group(self.alice, name='Family')
+        shared.add_participant(self.bob)
+        set_privacy(self.bob, group_adds_from=self.audience('LOOPS'))
+
+        self.assertSuccess(
+            self.create_group(members=['bob']), status.HTTP_201_CREATED
+        )
+
+    def test_somebody_already_in_the_group_is_not_refused(self):
+        # Re-adding a member is a no-op; refusing it would make an admin's
+        # harmless repeat look like a rejection.
+        group = Conversation.start_group(self.alice, name='Family')
+        group.add_participant(self.bob)
+        set_privacy(self.bob, group_adds_from=self.audience('NOBODY'))
+
+        self.assertSuccess(self.add_members(group, ['bob']))
+
+    def test_an_email_invitation_to_a_hidden_address_is_not_sent(self):
+        # Hidden by "Find me using my email": nothing added, nothing emailed,
+        # and no row left behind that could be claimed later.
+        set_privacy(self.bob, discoverable_by_email=False)
+        group = Conversation.start_group(self.alice, name='Family')
+
+        row = membership.invite_by_email(group, self.bob.email, self.alice)
+
+        self.assertIsNone(row)
+        self.assertFalse(
+            Participant.objects.filter(
+                conversation=group, email__iexact=self.bob.email
+            ).exists()
+        )
+        self.assertFalse(group.has_participant(self.bob))
+
+    def test_an_email_invitation_is_not_claimed_by_somebody_who_refuses_adds(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        membership.invite_by_email(group, 'mara@example.com', self.alice)
+        mara = make_user('mara')
+        mara.email = 'mara@example.com'
+        mara.save(update_fields=['email'])
+        mara.profile.email_verified = True
+        mara.profile.save(update_fields=['email_verified'])
+        set_privacy(mara, group_adds_from=self.audience('NOBODY'))
+
+        claimed = membership.claim_email_invitations(mara)
+
+        self.assertEqual(claimed, 0)
+        self.assertFalse(group.has_participant(mara))
+
+    def test_a_phone_invitation_is_not_claimed_by_somebody_who_refuses_adds(self):
+        group = Conversation.start_group(self.alice, name='Family')
+        number = '+639171234567'
+        group.add_phone_participant(number, display_name='Mom', added_by=self.alice)
+        mom = make_user('mom', number)
+        set_privacy(mom, group_adds_from=self.audience('NOBODY'))
+
+        self.assertIsNone(group._claim_phone_participant(mom))
+        self.assertFalse(group.has_participant(mom))
+
+
+class ReadReceiptPrivacyTests(EnvelopeAssertions, APITestCase):
+    """Settings → Privacy → Read receipts, which is a two-way bargain."""
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.message = create_message(self.group, self.alice, text='hello')
+
+    def bob_reads(self):
+        self.client.force_authenticate(self.bob)
+        return self.client.post(
+            reverse('chat:conversation-read', args=[self.group.id]), {},
+            format='json',
+        )
+
+    def row_for(self, viewer, username):
+        self.client.force_authenticate(viewer)
+        for row in members_of(self.client, self.group.id):
+            if (row.get('user') or {}).get('username') == username:
+                return row
+        return None
+
+    def test_a_read_is_visible_by_default(self):
+        self.bob_reads()
+
+        self.assertEqual(
+            self.row_for(self.alice, 'bob')['last_read_message'], self.message.pk
+        )
+
+    def test_with_their_receipts_off_nobody_sees_their_read(self):
+        set_privacy(self.bob, read_receipts_enabled=False)
+        self.bob_reads()
+
+        self.assertIsNone(self.row_for(self.alice, 'bob')['last_read_message'])
+
+    def test_with_your_own_receipts_off_you_see_nobody_elses(self):
+        # The bargain: showing none means being shown none.
+        self.bob_reads()
+        set_privacy(self.alice, read_receipts_enabled=False)
+
+        self.assertIsNone(self.row_for(self.alice, 'bob')['last_read_message'])
+
+    def test_your_own_read_is_always_your_own_to_see(self):
+        # It clears their own badge; it is not a receipt about anybody.
+        set_privacy(self.bob, read_receipts_enabled=False)
+        self.bob_reads()
+
+        self.assertEqual(
+            self.row_for(self.bob, 'bob')['last_read_message'], self.message.pk
+        )
+
+    def test_the_receipt_frame_is_not_broadcast_when_theirs_is_off(self):
+        set_privacy(self.bob, read_receipts_enabled=False)
+
+        with mock.patch('chat.services.send_to_group') as sent, \
+                self.captureOnCommitCallbacks(execute=True):
+            self.bob_reads()
+
+        frames = [call.args[1]['type'] for call in sent.call_args_list]
+        # Their own devices still hear, so a badge cleared here clears there.
+        self.assertIn('conversation.read', frames)
+        self.assertNotIn('conversation.read.by', frames)
+
+
+class MessageMentionApiTests(EnvelopeAssertions, APITestCase):
+    """Naming somebody, over the REST API a client really uses.
+
+    The service-level rules are in notification/tests.py:MentionTests - who may be
+    named, and who is silently dropped. This is the wire: what a client sends,
+    what comes back, and what an edit does to it.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.bob_row = Participant.objects.get(
+            conversation=self.group, user=self.bob
+        )
+        self.client.force_authenticate(self.alice)
+
+    def send(self, **extra):
+        return self.client.post(
+            reverse('chat:conversation-messages', args=[self.group.id]),
+            {'text': '@bob dinner?', **extra},
+            format='json',
+        )
+
+    def test_a_message_comes_back_with_who_it_names(self):
+        body = self.assertSuccess(self.send(mentions=[self.bob_row.pk]), 201)
+
+        self.assertEqual(
+            body['mentions'],
+            [
+                {
+                    'participant_id': self.bob_row.pk,
+                    'user_id': self.bob.pk,
+                    'username': 'bob',
+                    'display_label': self.bob.profile.display_label,
+                }
+            ],
+        )
+        self.assertFalse(body['mentions_everyone'])
+
+    def test_everyone_is_a_flag(self):
+        body = self.assertSuccess(self.send(mention_everyone=True), 201)
+
+        self.assertTrue(body['mentions_everyone'])
+        self.assertEqual(body['mentions'], [])
+
+    def test_the_words_carry_no_markup(self):
+        """What the SMS and email copies will read."""
+        body = self.assertSuccess(self.send(mentions=[self.bob_row.pk]), 201)
+
+        self.assertEqual(body['text'], '@bob dinner?')
+
+    def test_an_edit_restates_the_mentions(self):
+        message_id = self.assertSuccess(
+            self.send(mentions=[self.bob_row.pk]), 201
+        )['id']
+
+        body = self.assertSuccess(
+            self.client.patch(
+                reverse(
+                    'chat:conversation-message-detail',
+                    args=[self.group.id, message_id],
+                ),
+                {'text': 'dinner?', 'mentions': []},
+                format='json',
+            )
+        )
+        self.assertEqual(body['mentions'], [])
+
+    def test_an_edit_that_says_nothing_about_mentions_keeps_them(self):
+        """An older client sends only `text`; it must not clear them."""
+        message_id = self.assertSuccess(
+            self.send(mentions=[self.bob_row.pk]), 201
+        )['id']
+
+        body = self.assertSuccess(
+            self.client.patch(
+                reverse(
+                    'chat:conversation-message-detail',
+                    args=[self.group.id, message_id],
+                ),
+                {'text': '@bob dinner tonight?'},
+                format='json',
+            )
+        )
+        self.assertEqual(len(body['mentions']), 1)
+
+    def test_a_deleted_message_names_nobody(self):
+        message_id = self.assertSuccess(
+            self.send(mentions=[self.bob_row.pk]), 201
+        )['id']
+
+        self.client.delete(
+            reverse(
+                'chat:conversation-message-detail', args=[self.group.id, message_id]
+            )
+        )
+        listed = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-messages', args=[self.group.id])
+            )
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        self.assertEqual(rows[0]['mentions'], [])
+
+
+class MentionTests(TestCase):
+    """Who a message names - and, more importantly, who it may not name.
+
+    The service level: `chat/mentions.py` decides which ids may stand.
+    MessageMentionApiTests below is the same rules over the REST API.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.mallory = make_user('mallory')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.other = Conversation.start_group(self.mallory, name='Somewhere else')
+
+        self.bob_row = Participant.objects.get(
+            conversation=self.group, user=self.bob
+        )
+        self.outsider_row = Participant.objects.get(
+            conversation=self.other, user=self.mallory
+        )
+
+    def test_a_mention_is_stored_against_the_membership(self):
+        message = create_message(
+            self.group, self.alice, text='@bob dinner?',
+            mentions=[self.bob_row.pk],
+        )
+
+        self.assertEqual(
+            [row.participant_id for row in message.mentions.all()],
+            [self.bob_row.pk],
+        )
+
+    def test_a_membership_from_another_conversation_is_dropped(self):
+        """The security half: a mention must not point across conversations."""
+        message = create_message(
+            self.group, self.alice, text='@mallory',
+            mentions=[self.outsider_row.pk, self.bob_row.pk],
+        )
+
+        self.assertEqual(
+            [row.participant_id for row in message.mentions.all()],
+            [self.bob_row.pk],
+        )
+
+    def test_naming_yourself_is_not_a_mention(self):
+        alice_row = Participant.objects.get(
+            conversation=self.group, user=self.alice
+        )
+        message = create_message(
+            self.group, self.alice, text='@alice', mentions=[alice_row.pk]
+        )
+
+        self.assertEqual(message.mentions.count(), 0)
+
+    def test_a_member_who_left_is_dropped(self):
+        self.bob_row.status = Participant.Status.LEFT
+        self.bob_row.save(update_fields=['status'])
+
+        message = create_message(
+            self.group, self.alice, text='@bob', mentions=[self.bob_row.pk]
+        )
+        self.assertEqual(message.mentions.count(), 0)
+
+    def test_everyone_is_a_flag_not_a_row_per_member(self):
+        from chat.mentions import mentions_participant
+
+        message = create_message(
+            self.group, self.alice, text='@everyone dinner',
+            mention_everyone=True,
+        )
+
+        self.assertTrue(message.mentions_everyone)
+        self.assertEqual(message.mentions.count(), 0)
+        self.assertTrue(mentions_participant(message, self.bob_row))
+
+    def test_the_sender_is_not_mentioned_by_everyone(self):
+        from chat.mentions import mentions_participant
+
+        alice_row = Participant.objects.get(
+            conversation=self.group, user=self.alice
+        )
+        message = create_message(
+            self.group, self.alice, text='@everyone', mention_everyone=True
+        )
+
+        self.assertFalse(mentions_participant(message, alice_row))
+
+    def test_setting_mentions_again_replaces_them(self):
+        """An edit that drops a name has to drop the mention."""
+        message = create_message(
+            self.group, self.alice, text='@bob', mentions=[self.bob_row.pk]
+        )
+
+        set_mentions(message, [], everyone=False)
+        self.assertEqual(message.mentions.count(), 0)
+
+    def test_a_reply_names_the_person_it_answers(self):
+        from chat.mentions import is_reply_to
+
+        first = create_message(self.group, self.bob, text='I can host')
+        answer = create_message(
+            self.group, self.alice, text='Perfect', reply_to=first
+        )
+
+        self.assertTrue(is_reply_to(answer, self.bob_row))
+
+    def test_answering_yourself_tells_nobody(self):
+        from chat.mentions import is_reply_to
+
+        first = create_message(self.group, self.bob, text='I can host')
+        second = create_message(
+            self.group, self.bob, text='Actually, maybe not', reply_to=first
+        )
+
+        self.assertFalse(is_reply_to(second, self.bob_row))
+
+    def test_the_text_carries_no_markup(self):
+        """SMS and email copies read as a person wrote them."""
+        message = create_message(
+            self.group, self.alice, text='@Bob can you bring bread',
+            mentions=[self.bob_row.pk],
+        )
+
+        self.assertEqual(message.text, '@Bob can you bring bread')

@@ -50,6 +50,13 @@ def requeue_stalled_deliveries():
     return run()
 
 
+@shared_task(name='mail.announce_failed_deliveries')
+def announce_failed_deliveries():
+    from mail.maintenance import announce_failed_deliveries as run
+
+    return run()
+
+
 @shared_task(name='mail.purge_old_deliveries')
 def purge_old_deliveries():
     from mail.maintenance import purge_old_deliveries as run

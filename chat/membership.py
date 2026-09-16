@@ -223,7 +223,7 @@ def approve(participant, by):
     _tell_them(
         participant,
         f'You are in {participant.conversation.name}. '
-        'Text to post. HELP for commands, STOP to leave.',
+        'Text to post. HELP for commands, STOP to stop texts from this group.',
     )
     return participant
 
@@ -946,8 +946,12 @@ def invite_by_email(conversation, email, by):
       emailed. It becomes real membership when they verify that address, in
       `claim_email_invitations`. Until then they are in no group they can see.
 
-    Returns the Participant either way.
+    Returns the Participant, or None for an address whose owner hid it in
+    Settings → Privacy: nothing is added and nothing is emailed. Silence
+    rather than a refusal, because any other answer would say that the address
+    has an account behind it.
     """
+    from user import privacy
     from user.lookups import find_user
 
     if not conversation.may_add_members(by):
@@ -967,9 +971,19 @@ def invite_by_email(conversation, email, by):
     owner = find_user(address)
     if owner is not None:
         _refuse_blocked_invite(by, owner)
+        if not privacy.allows_group_add(owner, by):
+            raise JoinRefused(privacy.group_add_refusal([owner]))
         # A real account. add_participant carries the blocked checks and the
         # phone-row folding, so there is nothing to duplicate here.
         return conversation.add_participant(owner)
+
+    # Nobody the lookup would return - but the address may still belong to
+    # somebody who turned "Find me using my email" off. Emailing them an
+    # invitation would put mail in their inbox for a group they could never
+    # join: claiming happens on verifying the address, and theirs is verified
+    # already. So nothing is created and nothing is sent.
+    if find_user(address, respect_discoverability=False) is not None:
+        return None
 
     existing = Participant.objects.filter(
         conversation=conversation, email__iexact=address
@@ -1079,6 +1093,18 @@ def claim_email_invitations(user):
         if row.added_by_id and blocks_between(user, row.added_by):
             logger.info(
                 'Not claiming invitation %s: blocked between %s and %s',
+                row.pk, user.pk, row.added_by_id,
+            )
+            continue
+
+        # And their own "Who can add me to groups", read at the same moment
+        # and for the same reason: until now this row was an address, and an
+        # address has no settings to ask about.
+        from user import privacy
+
+        if row.added_by_id and not privacy.allows_group_add(user, row.added_by):
+            logger.info(
+                'Not claiming invitation %s: %s does not accept group adds from %s',
                 row.pk, user.pk, row.added_by_id,
             )
             continue

@@ -8,11 +8,15 @@ from .base import UserSettings
 class PrivacySettings(UserSettings):
     """Who can reach a person, who can find them, and what others can see.
 
-    NOTHING READS THESE YET. Until the backend does, choosing "Nobody" does not
-    stop a direct message, and switching discoverability off hides nobody. The
-    web's Privacy screen does save them to the account
-    (PATCH /users/me/settings/privacy/), so a choice is kept for when they are
-    enforced.
+    ENFORCED, except "Online status" - see its field. `user/privacy.py` is the
+    one place that reads them, the way `user/blocks.py` is the one place that
+    reads a block, and every refusal is asked there rather than copied into
+    each caller. The web's Privacy screen saves them with
+    PATCH /users/me/settings/privacy/.
+
+    A BLOCK IS ASKED FIRST AND ALWAYS WINS. It is a fact about a pair; these
+    are one person's standing answer to everybody, and their refusals say
+    plainly what they are - a block's wording deliberately reveals nothing.
 
     NOT HERE, ON PURPOSE - these already exist:
 
@@ -47,8 +51,10 @@ class PrivacySettings(UserSettings):
     #   Nobody             - nobody.
     # Somebody blocked in either direction never can, whatever this says
     # (`UserBlock`, already enforced).
-    # Today: saved, but changes nothing - anybody who finds the person can
-    # still start a direct message.
+    # Today: real. `chat/serializers.py:DirectConversationSerializer` refuses
+    # with "This person doesn't accept direct messages." Only STARTING one is
+    # refused: a thread the two already have carries on, because stranding a
+    # conversation somebody is in is what blocking is for.
     direct_messages_from = models.CharField(
         max_length=8,
         choices=Audience.choices,
@@ -60,8 +66,13 @@ class PrivacySettings(UserSettings):
     #   Everyone           - anybody adding members to a Loop.
     #   People in my Loops - only people who already share a Loop with them.
     #   Nobody             - nobody.
-    # Today: saved, but changes nothing - anybody who can add members to a Loop
-    # can still add the person.
+    # Today: real, on every route that adds somebody else: creating a group
+    # with members, the add-members endpoint, an email invitation to a verified
+    # account, and the moment a phone or email invitation is claimed - which is
+    # the first moment the row has an account to ask. The add is all-or-nothing
+    # and the refusal names who refused, so an admin can take them off the list.
+    # Joining by link, code or a join request is their own doing and is never
+    # refused by this.
     group_adds_from = models.CharField(
         max_length=8,
         choices=Audience.choices,
@@ -71,24 +82,28 @@ class PrivacySettings(UserSettings):
 
     # --- Discoverability -------------------------------------------------------
     #
-    # Enforcing these means gating `user/lookups.py:find_user` - which resolves
-    # an exact verified number or email when somebody starts a direct message
-    # or adds members - and not only GET /users/search/.
+    # Both are read by `user/lookups.py` - `find_user`, which resolves an exact
+    # verified number or address when somebody starts a direct message, adds
+    # members or invites by email, and `search_users` behind GET
+    # /users/search/. Neither hides a @username: these are about the
+    # identifiers people hand out.
 
     # "Find me using my phone number"
     #   On  - somebody who types the person's exact phone number - searching
     #         for people, starting a direct message, adding members - finds
     #         their account.
     #   Off - typing the number does not reveal the account.
-    # Today: saved, but changes nothing - a verified number still finds them.
+    # Today: real, in `find_user` and in search.
     discoverable_by_phone = models.BooleanField(default=True, db_default=True)
 
     # "Find me using my email"
     #   On  - somebody who types the person's exact email address - starting a
     #         direct message, adding members, inviting by email - finds their
     #         account.
-    #   Off - typing the address does not reveal the account.
-    # Today: saved, but changes nothing - a verified address still finds them.
+    #   Off - typing the address does not reveal the account. An invitation to
+    #         that address is not even emailed: it could never be claimed, and
+    #         `invite_by_email` returns None rather than say why.
+    # Today: real, in `find_user`.
     discoverable_by_email = models.BooleanField(default=True, db_default=True)
 
     # --- Activity --------------------------------------------------------------
@@ -96,16 +111,23 @@ class PrivacySettings(UserSettings):
     # "Read receipts"
     #   On  - other members can see when the person has read their messages
     #         (who has read it, in a message's info).
-    #   Off - other members are not shown that.
-    # Today: saved, but changes nothing - a message's info still shows who has
-    # read it (`chat.Participant.last_read_message`).
+    #   Off - other members are not shown that, AND they are not shown anybody
+    #         else's either. The bargain is two-way (Yul's call, 2026-09-16):
+    #         one-way would take receipts without giving any.
+    # Their own read position is always their own to see - it clears their own
+    # badge rather than telling anybody anything.
+    # Today: real, in both places it could leak: the member list
+    # (`ParticipantSerializer`) and the live `conversation.read.by` frame,
+    # which `chat/services.py` does not send and `chat/consumers.py` does not
+    # forward.
     read_receipts_enabled = models.BooleanField(default=True, db_default=True)
 
     # "Online status"
     #   On  - other members see a green dot while the person is online, and
     #         when they were last seen once they are not.
     #   Off - other members are shown neither.
-    # Today: saved, but changes nothing - a conversation's member list still
-    # shows the dot, and "last seen" on hover (`Profile.is_online` /
-    # `last_seen_at`).
+    # Today: THE ONLY ONE NOT ENFORCED, because there is nothing to hide yet:
+    # nothing ever sets `Profile.is_online` or `last_seen_at`, so everybody
+    # reads as offline. When presence is built, this is one check in
+    # `PublicProfileSerializer` plus whatever broadcasts it.
     online_status_visible = models.BooleanField(default=True, db_default=True)

@@ -157,7 +157,10 @@ INSTALLED_APPS = [
     'user',
     'otp',
     'chat',
-    # The activity feed. Its rows point at chat's conversations and messages.
+    # The activity feed, and web push - one app, because both are "tell this
+    # person that something happened". Push is the delivery channel that
+    # reaches a closed browser, and the only one that carries a direct
+    # message (chat/delivery.py:register_channel).
     'notification',
     'sms',
     # `mail`, not `email`: a top-level app called `email` would shadow the
@@ -375,6 +378,37 @@ EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMA
 MAIL_SENDING_ENABLED = os.environ.get('MAIL_SENDING_ENABLED', 'False').lower() in (
     '1', 'true', 'yes'
 )
+
+# --- web push -----------------------------------------------------------
+#
+# The third channel. Unlike SMS and email it costs nothing, sends no content
+# anywhere we do not control - the payload is encrypted to the browser's own
+# keys - and needs no account with a provider: a VAPID key pair is generated
+# once with `manage.py generate_vapid_keys` and identifies this server to
+# every browser push service.
+
+# Off by default, like email: a channel that starts notifying everybody the
+# moment it is deployed is a decision somebody should make on purpose.
+PUSH_SENDING_ENABLED = os.environ.get('PUSH_SENDING_ENABLED', 'False').lower() in (
+    '1', 'true', 'yes'
+)
+
+# The public half is handed to every browser (GET /api/v1/push/key/) and is not
+# secret. The private half signs every send and belongs in SSM. Changing either
+# unsubscribes everybody, so they are configuration rather than code.
+VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', '').strip()
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '').strip()
+
+# How a push service reaches a human about our sends. Mozilla refuses anything
+# that is not a mailto: or https:// URL - see notification/checks.py.
+VAPID_SUBJECT = os.environ.get(
+    'VAPID_SUBJECT', f'mailto:{EMAIL_SUPPORT_ADDRESS}'
+)
+
+# How long a push service should hold a notification for a browser that is
+# offline. Twelve hours: long enough for a laptop shut for the evening, short
+# enough that nobody is told about a message they read this morning.
+PUSH_TTL_SECONDS = int(os.environ.get('PUSH_TTL_SECONDS', 12 * 60 * 60))
 
 # The domain the inbound provider receives replies on, e.g. reply.loopdn.com.
 # It must NOT be the domain that receives ordinary mail for the company: every
@@ -890,6 +924,12 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'sms.provision_missing_numbers',
         'schedule': 900.0,
     },
+    # After the retry sweep, so nothing is announced that a retry was about to
+    # fix - see sms/maintenance.py:announce_failed_deliveries.
+    'sms-announce-failed-deliveries': {
+        'task': 'sms.announce_failed_deliveries',
+        'schedule': 300.0,
+    },
     'sms-purge-old-deliveries': {
         'task': 'sms.purge_old_deliveries',
         # Daily. Nothing here is urgent and it deletes rows.
@@ -907,6 +947,10 @@ CELERY_BEAT_SCHEDULE = {
     'mail-requeue-stalled-deliveries': {
         'task': 'mail.requeue_stalled_deliveries',
         'schedule': 600.0,
+    },
+    'mail-announce-failed-deliveries': {
+        'task': 'mail.announce_failed_deliveries',
+        'schedule': 300.0,
     },
     'mail-purge-old-deliveries': {
         'task': 'mail.purge_old_deliveries',

@@ -209,12 +209,10 @@ ME = [
         )),
     req('Get my profile', 'GET', '/api/v1/users/me/profile/',
         desc=(
-            'Display name, avatar, phone number, and whether the number and '
-            'email are verified.\n\n'
-            '**`sms_enabled` is not in this payload**, despite being a real '
-            'column on the profile. It is on no serializer, so a client reading '
-            '`data.sms_enabled` gets `undefined` rather than the switch it '
-            'expects - see *Update my profile* for what actually sets it.'
+            'Display name, avatar, phone number, whether the number and email '
+            'are verified, and `email_enabled`.\n\n'
+            '**`sms_enabled` is not in this payload.** "Send and receive Loop '
+            'messages by text" lives on *Get my settings*, under `messaging`.'
         )),
     req('Update my profile', 'PATCH', '/api/v1/users/me/profile/',
         body={'display_name': 'Yul', 'bio': 'Manila'},
@@ -225,17 +223,16 @@ ME = [
             '**The two SMS switches, and why neither is set here:**\n\n'
             '| Switch | Set by | Meaning |\n'
             '| --- | --- | --- |\n'
-            '| `MessagingSettings.sms_enabled` | **texting STOP** - no endpoint | **all** '
-            'texts, every group. A master off switch. |\n'
-            '| `Participant.sms_enabled` | *Delivery settings* | whether **one '
-            'group** texts you. |\n\n'
+            '| `MessagingSettings.sms_enabled` | *Update a settings screen* (`messaging`) '
+            '| "Send and receive Loop messages by text": **every** group, both '
+            'ways. |\n'
+            '| `Participant.sms_enabled` | *Delivery settings*, or **texting STOP / '
+            'START** to that group\'s number | whether **one group** texts you - '
+            'and, after STOP, takes your texts. |\n\n'
             'Both must be on for a text to go out.\n\n'
             '`sms_enabled` is **not a field on this endpoint**, and sending it '
             'here does nothing: DRF drops keys a serializer does not declare, '
-            'so the request returns 200 and the switch is unchanged. The '
-            'account-wide switch is currently only reachable by replying STOP '
-            'to a message - worth knowing before building a settings toggle '
-            'against it.'
+            'so the request returns 200 and the switch is unchanged.'
         )),
     req('Get my settings', 'GET', '/api/v1/users/me/settings/',
         desc=(
@@ -255,12 +252,13 @@ ME = [
             'screen. An unknown choice is 400 with the field named. PUT is 405.\n\n'
             '**Shown but never written here** - if sent they are ignored and the '
             'request still returns 200:\n\n'
-            '- `messaging.sms_enabled` - only a carrier STOP or START changes it.\n'
             '- `security.two_factor_enabled` / `two_factor_method` - turning '
             'two-factor on must prove the phone or email first, and that flow '
             'does not exist yet.\n\n'
-            '`messaging.email_enabled` is the same switch as `email_enabled` on '
-            '*Update my profile*.'
+            '`messaging.sms_enabled` is "Send and receive Loop messages by text" '
+            'for every group, both ways; a STOP to one group\'s number is separate '
+            'and lives on that membership. `messaging.email_enabled` is the same '
+            'switch as `email_enabled` on *Update my profile*.'
         )),
     req('Search people', 'GET', '/api/v1/users/search/',
         query=[{'key': 'q', 'value': 'bob'}],
@@ -586,7 +584,9 @@ MESSAGES = [
         )),
     req('Send a message', 'POST',
         '/api/v1/chat/conversations/{{conversation_id}}/messages/',
-        body={'text': 'Dinner at 7', 'client_id': '{{$guid}}'},
+        body={'text': '@Bob dinner at 7', 'client_id': '{{$guid}}',
+              'mentions': ['{{member_participant_id}}'],
+              'mention_everyone': False},
         desc=(
             '**`client_id` makes a retry safe.** It is your own id for this '
             'message. A send that times out - or a websocket that drops '
@@ -607,7 +607,18 @@ MESSAGES = [
             '- excluding you. Who that is depends on their delivery settings, '
             'their consent, and whether their number is verified; every '
             'decision not to send is recorded with a reason.\n\n'
-            'In a `broadcast` group a non-admin gets `403`.'
+            'In a `broadcast` group a non-admin gets `403`.\n\n'
+            '**`mentions` are PARTICIPANT ids, not names.** Most members have '
+            'no handle to parse - they are a number with a display name, and '
+            'two of them can be called "Mum" - so the composer sends the ids it '
+            'offered and the words stay plain, which is what makes the SMS and '
+            'email copies read as written. An id that is not an ACTIVE member '
+            'of THIS conversation is dropped silently rather than refusing the '
+            'message. `mention_everyone` is the `@everyone` flag, usable by any '
+            'member.\n\n'
+            'Somebody who is mentioned, or whose message is replied to, is '
+            'notified even when they have turned group messages off - unless '
+            'they muted the group, which silences everything.'
         )),
     req('Send with attachments', 'POST',
         '/api/v1/chat/conversations/{{conversation_id}}/messages/',
@@ -768,6 +779,48 @@ BILLING = [
         )),
 ]
 
+PUSH = [
+    req('Get the VAPID public key', 'GET', '/api/v1/push/key/',
+        desc=(
+            'The application server key a browser subscribes with.\n\n'
+            'Served rather than configured into the web app: the frontend is a '
+            'static export, so a build-time value could not be rotated without '
+            'a rebuild and would sit in every cached bundle. The private half '
+            'never leaves the server.\n\n'
+            '`enabled` is false when no key pair is configured, so a client can '
+            'say so instead of offering a switch that does nothing.'
+        )),
+    req('Register this browser', 'POST', '/api/v1/push/subscriptions/',
+        body={'endpoint': '{{push_endpoint}}',
+              'keys': {'p256dh': 'BPu...', 'auth': 'k9...'},
+              'user_agent': 'Mozilla/5.0'},
+        desc=(
+            'Remember this browser, so it can be notified when the app is '
+            'closed. Send exactly what `subscription.toJSON()` gives you.\n\n'
+            '**Keyed on the endpoint, not on the account.** The same browser '
+            'signing in as somebody else MOVES the row to that account - '
+            'otherwise a shared laptop shows one person\'s messages, with the '
+            'sender and the words, to whoever sits down next.\n\n'
+            'One row per browser: a laptop and a phone both get notified, '
+            'because a notification that arrived on only one of them looks '
+            'like it worked.'
+        )),
+    req('Forget this browser', 'POST', '/api/v1/push/subscriptions/remove/',
+        body={'endpoint': '{{push_endpoint}}'},
+        desc=(
+            'Turn notifications off for this browser. The web app also calls '
+            'this on sign-out.\n\n'
+            'Scoped to your own rows, so an endpoint somebody else registered '
+            'cannot be removed by guessing it - an endpoint is a URL, and URLs '
+            'get pasted into places. Silent when there is nothing to delete: '
+            '"they were already off" is not an error anybody can act on.\n\n'
+            'A browser that has been wiped needs no call at all - the push '
+            'service answers 404 or 410 and the row is deleted at the first '
+            'refusal.'
+        )),
+]
+
+
 CLEANUP = [
     req('Delete a group', 'DELETE', '/api/v1/chat/conversations/{{conversation_id}}/',
         desc=(
@@ -838,9 +891,10 @@ COLLECTION = {
             'not a check bolted on top - so a conversation you are not in is '
             'indistinguishable from one that does not exist. That is '
             'deliberate.\n\n'
-            '**Two SMS switches.** `MessagingSettings.sms_enabled` (account-wide) and '
-            '`Participant.sms_enabled` (this group). Both must be on, plus a '
-            'verified number, plus consent for members with no account.'
+            '**Two SMS switches.** `MessagingSettings.sms_enabled` (the account\'s '
+            'own, every group) and `Participant.sms_enabled` (this group - STOP and '
+            'START to its number move it). Both must be on, plus a verified number, '
+            'plus consent for that group.'
         ),
         'schema': 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json',
     },
@@ -859,6 +913,8 @@ COLLECTION = {
         {'key': 'otp_code', 'value': ''},
         {'key': 'phone_otp_code', 'value': ''},
         {'key': 'credit_package_id', 'value': ''},
+        # A browser's own push address, from `subscription.endpoint`.
+        {'key': 'push_endpoint', 'value': ''},
     ],
     'item': [
         {'name': '1. Auth & accounts', 'item': AUTH},
@@ -869,7 +925,8 @@ COLLECTION = {
         {'name': '6. Messages', 'item': MESSAGES},
         {'name': '7. SMS webhook (provider)', 'item': WEBHOOK},
         {'name': '8. Billing', 'item': BILLING},
-        {'name': '9. Cleanup (destructive)', 'item': CLEANUP},
+        {'name': '9. Web push', 'item': PUSH},
+        {'name': '10. Cleanup (destructive)', 'item': CLEANUP},
     ],
 }
 
