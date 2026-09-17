@@ -1,0 +1,1448 @@
+{
+  "info": {
+    "name": "Loopd'n API v2",
+    "description": "# Loopd'n API v2\n\nEvery reply is wrapped in the same envelope:\n\n```json\n{ \"code\": 1, \"message\": \"...\", \"data\": { } }\n```\n\n`code` is `1` for success and `-1` for failure; the HTTP status stays meaningful. `data` is the payload, or the field errors on a failure.\n\n## Start here\n1. **Register**, then **Verify email** (the code is in the server log when `DEBUG` is on).\n2. **Login** - stores your tokens automatically.\n3. **Request phone code** then **Verify phone** - without a verified number your account can never receive a group text.\n4. **Create group** - stores `conversation_id` and gives the group its own phone number.\n\n## What is new since v1\n- **Every group has its own phone number.** Bought on creation in the creator's country, never changes, deleted with the group.\n- **Membership has states** - active, pending, left, removed, blocked - and four join modes.\n- **Roles**: promote and demote admins.\n- **Broadcast groups** where only admins post.\n- **Members without accounts**, reachable only by SMS.\n- **Delivery settings** per group, and account-wide.\n- **The inbound SMS webhook.**\n\n## Two things that surprise people\n**404 means \"not yours\".** Access control is the database query, not a check bolted on top - so a conversation you are not in is indistinguishable from one that does not exist. That is deliberate.\n\n**Two SMS switches.** `Profile.sms_enabled` (account-wide) and `Participant.sms_enabled` (this group). Both must be on, plus a verified number, plus consent for members with no account.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{access_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8000"
+    },
+    {
+      "key": "access_token",
+      "value": ""
+    },
+    {
+      "key": "refresh_token",
+      "value": ""
+    },
+    {
+      "key": "user_id",
+      "value": ""
+    },
+    {
+      "key": "conversation_id",
+      "value": ""
+    },
+    {
+      "key": "participant_id",
+      "value": ""
+    },
+    {
+      "key": "join_code",
+      "value": ""
+    },
+    {
+      "key": "otp_code",
+      "value": ""
+    },
+    {
+      "key": "phone_otp_code",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Auth & accounts",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/register",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "register"
+              ]
+            },
+            "description": "Create an account.\n\n`phone_number` is **optional but load-bearing for SMS**: a group texts its members on the number they verified, so an account without one can take part in the app and can never be reached by text.\n\nReturns `201` with the account and a `verification` block. A delivery failure still returns `201` with `verification: null` - the account is already committed at that point, and failing the request would strand the user with an account they cannot use.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"yul\",\n  \"email\": \"yul@example.com\",\n  \"password\": \"correct-horse-battery\",\n  \"phone_number\": \"+639171234567\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/login",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "login"
+              ]
+            },
+            "description": "**Run this first.** The test script stores the token pair and `user_id`, which everything else authenticates with.\n\n`username` accepts a username **or** an email address.\n\n`401` is deliberately identical for \"no such user\" and \"wrong password\", so this cannot be used to discover which accounts exist.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"yul\",\n  \"password\": \"correct-horse-battery\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const tokens = body.data && body.data.tokens;",
+                  "if (tokens) {",
+                  "    pm.collectionVariables.set('access_token', tokens.access);",
+                  "    pm.collectionVariables.set('refresh_token', tokens.refresh);",
+                  "}",
+                  "if (body.data && body.data.user) {",
+                  "    pm.collectionVariables.set('user_id', body.data.user.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Verify email",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/verify-email",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "verify-email"
+              ]
+            },
+            "description": "Confirm the emailed code and receive tokens.\n\nThis sets `Profile.email_verified`, **not** `user.is_active`. The two are kept apart on purpose: `is_active` means \"an admin has not banned this account\", and a verification code must never be able to write it - otherwise a banned user could change their email and verify their way back in.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"yul@example.com\",\n  \"code\": \"{{otp_code}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const tokens = body.data && body.data.tokens;",
+                  "if (tokens) {",
+                  "    pm.collectionVariables.set('access_token', tokens.access);",
+                  "    pm.collectionVariables.set('refresh_token', tokens.refresh);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Resend code",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/resend-code",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "resend-code"
+              ]
+            },
+            "description": "Send a new email verification code. Rate limited per address and per account.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"yul@example.com\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Google sign-in",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/google",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "google"
+              ]
+            },
+            "description": "Sign in with a Google ID token, creating the account on first use.\n\nA Google account arrives with a verified email and **no phone number**, so it cannot receive group texts until one is added and verified under *Phone verification*.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id_token\": \"<google id token>\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Refresh token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/token/refresh",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "token",
+                "refresh"
+              ]
+            },
+            "description": "Exchange a refresh token for a new access token.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.access;",
+                  "if (value !== undefined && value !== null) {",
+                  "    pm.collectionVariables.set('access_token', value);",
+                  "    console.log('Stored access_token =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/logout",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "logout"
+              ]
+            },
+            "description": "Blacklist the refresh token. The access token stays valid until it expires.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Me & profile",
+      "item": [
+        {
+          "name": "Get my account",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me"
+              ]
+            },
+            "description": "Username, email and verification state."
+          }
+        },
+        {
+          "name": "Update my account",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me"
+              ]
+            },
+            "description": "Changing the email address clears `email_verified` and sends a new code - otherwise anybody could move a verified badge onto an address they do not own.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"new@example.com\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get my profile",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/profile",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "profile"
+              ]
+            },
+            "description": "Display name, avatar, phone number and **`sms_enabled`** - the account-wide switch for every text this account can receive, across every group."
+          }
+        },
+        {
+          "name": "Update my profile",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/profile",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "profile"
+              ]
+            },
+            "description": "Note the two SMS switches and which one this is.\n\n| Switch | Where | Meaning |\n| --- | --- | --- |\n| `Profile.sms_enabled` | here | **all** texts, every group. A master off switch. |\n| `Participant.sms_enabled` | *Delivery settings* | whether **one group** texts you. |\n\nBoth must be on for a text to go out. Setting `phone_number` here clears `phone_no_verified` - a number is only trusted once proved, and an unverified number is never texted.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"display_name\": \"Yul\",\n  \"bio\": \"Manila\",\n  \"sms_enabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Search people",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/search?q=bob",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "bob"
+                }
+              ]
+            },
+            "description": "Find somebody by username prefix, or by **exact** phone number.\n\nPhone matching is exact and requires the number to be **verified**. A prefix search would let anyone walk the directory a digit at a time, and an unverified match would hand back whoever merely typed someone else's number into their profile."
+          }
+        },
+        {
+          "name": "Get a user by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/{{user_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "{{user_id}}"
+              ]
+            },
+            "description": "Public view of another account. Never includes email or phone number."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Phone verification",
+      "item": [
+        {
+          "name": "Request phone code",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/phone/request-code",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "phone",
+                "request-code"
+              ]
+            },
+            "description": "Text a verification code.\n\n**This is what makes SMS work for you.** A group texts its members on the number they verified here; until this is done your account is app-only.\n\nOmit `phone_number` to re-send to the one already on the profile. Rate limited per account **and** per destination number - one account working through many numbers and many accounts hammering one number are different attacks, and counting only one misses the other.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone_number\": \"+639171234567\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Verify phone",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users/me/phone/verify",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "me",
+                "phone",
+                "verify"
+              ]
+            },
+            "description": "Confirm the code. Sets `phone_no_verified`, which is what every SMS path checks before texting you.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{phone_otp_code}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Conversations",
+      "item": [
+        {
+          "name": "List my conversations",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations"
+              ]
+            },
+            "description": "Every conversation you are an **active** member of, newest activity first.\n\nAccess control is the queryset itself: a conversation you are not in does not appear here and 404s everywhere else, so you cannot learn it exists. Members who left, were removed or are still pending are excluded."
+          }
+        },
+        {
+          "name": "Create group",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/group",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "group"
+              ]
+            },
+            "description": "Create a group. You become its admin.\n\n**The group is given its own phone number**, in the country of whoever created it, read from their verified number. That number never changes, and it is deleted when the group is.\n\nThe number comes back as `sms_number`, an object of `number`, `country`, `status` and `provider`. The whole object may be `null` for a moment: buying it is a call to the telecom provider, made after the group is committed, so a slow provider cannot turn \"create a group\" into \"create nothing\".\n\nAn **empty `provider`** means no provider is configured and the number is a placeholder - well-formed, but it belongs to nobody and texting it does nothing. Do not tell a user to text a number whose `provider` is empty.\n\n`members` takes usernames or **verified** `+E.164` numbers. Send an image by switching this request to form-data.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Family\",\n  \"description\": \"Home things\",\n  \"members\": [\n    \"bob\",\n    \"+639170000003\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.id;",
+                  "if (value !== undefined && value !== null) {",
+                  "    pm.collectionVariables.set('conversation_id', value);",
+                  "    console.log('Stored conversation_id =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get a conversation",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}"
+              ]
+            },
+            "description": "One conversation: its settings, its latest message and its `sms_number`.\n\n**No `participants`.** The member list is unbounded and every row nests a user and a profile, so a group of two hundred would put two hundred profiles in every fetch - and once per conversation on the list endpoint. Use *List members* instead.\n\n`sms_number` is read-only everywhere and for everybody. It is saved in members' phones as the group's name, so a number that could be reassigned would deliver a stranger's messages.\n\nFields: `number`, `country`, `status`, `provider`. An empty `provider` marks a placeholder that cannot actually receive text."
+          }
+        },
+        {
+          "name": "Delete a group",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}"
+              ]
+            },
+            "description": "Delete a group. **Admins only, and it releases the phone number.**\n\nReturns `204`. A plain member gets `403`; somebody who is not in the group gets `404` and is not told it exists. One-to-one conversations cannot be deleted - they belong to two people equally and neither can end it for both."
+          }
+        },
+        {
+          "name": "Edit group settings",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/settings",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "settings"
+              ]
+            },
+            "description": "Admins only. Every field optional.\n\nThe seven settings go **inside `settings`**, the same object `POST /group/` takes - there is one shape to learn. Sending them at the top level is silently ignored: DRF drops fields a serializer does not declare, so the request returns 200 and changes nothing.\n\nAll seven come back under `settings` on the conversation object, the same shape you sent - so a settings screen renders from one fetch and there is one shape to learn. `join_code` does not: it has its own admin-only endpoint.\n\n**`join_mode`** - how somebody who is not a member gets in:\n\n| Value | Meaning |\n| --- | --- |\n| `open` | anyone with the number or link joins immediately |\n| `code` | they must supply the group code |\n| `approval` | they ask; an admin approves or declines |\n| `invite` | nobody can ask; an admin adds them |\n\nNew groups default to `invite`, the only mode that cannot surprise anybody. Switching to `code` generates a code if the group has none.\n\n**`mode`** - `chat` (everybody posts) or `broadcast` (only admins post; members still read). Enforced on every route at once, including inbound SMS.\n\nEditing settings deliberately does **not** bump the group up everyone's conversation list. Only a message is activity.\n\nThe reply is the conversation - which carries no `participants` on any endpoint. Use *List members* for the member list.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Family\",\n  \"description\": \"Home things\",\n  \"settings\": {\n    \"mode\": \"chat\",\n    \"join_mode\": \"code\",\n    \"add_member_permission\": \"admins\",\n    \"edit_group_permission\": \"admins\",\n    \"sms_delivery_enabled\": true,\n    \"sms_replies_enabled\": true,\n    \"voice_messages_enabled\": true\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Start direct chat",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/direct",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "direct"
+              ]
+            },
+            "description": "Open the one-to-one conversation with somebody, creating it only once. Safe to call every time a name is tapped: the same pair always resolves to the same conversation.\n\n`identifier` is a username or a **verified** `+E.164` number. Direct conversations have no phone number - SMS is a group feature.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"identifier\": \"bob\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.id;",
+                  "if (value !== undefined && value !== null) {",
+                  "    pm.collectionVariables.set('conversation_id', value);",
+                  "    console.log('Stored conversation_id =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5. Membership & joining",
+      "item": [
+        {
+          "name": "List members",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/participants?page=1&page_size=10",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "participants"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "page_size",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": "Who is in this conversation, **ten at a time**.\n\nIts own endpoint rather than a field on every conversation reply: the member list is unbounded and each row carries a nested user and profile, so a group of two hundred made every fetch of the group carry two hundred profiles.\n\nReturns the standard page envelope inside `data`:\n\n```\n{ \"count\": 17, \"next\": \"...?page=2\", \"previous\": null,\n  \"results\": [ ...participants... ] }\n```\n\n`page_size` raises the page up to a maximum of 100. **Active members only** - somebody who left, was removed or is waiting on approval is not a member; pending requests have their own endpoint, *Join requests*.\n\nA non-member gets **404**, not 403 - access control here is the queryset, so an outsider cannot learn the conversation exists."
+          }
+        },
+        {
+          "name": "Add members",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/members",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "members"
+              ]
+            },
+            "description": "Admins only. Usernames or **verified** numbers of existing accounts.\n\nAll or nothing: if one identifier cannot be resolved, or one person is blocked, nobody is added. To add somebody who has **no account**, use *Invite by phone* instead.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"members\": [\n    \"bob\",\n    \"+639170000003\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Invite by phone",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/invite",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "invite"
+              ]
+            },
+            "description": "Add somebody who has **no LoopD account**, by their number. Admins only. This is the way into an `invite` group.\n\nA name is required - they never chose one, and without it the group would see a masked number.\n\n**They are texted an invitation and receive nothing from the group until they reply `YES`.** Somebody else putting your number into a group is not you agreeing to be texted. The exact wording sent is stored on the row, because that is what a consent complaint turns on.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone_number\": \"+639171111111\",\n  \"display_name\": \"Mom\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.id;",
+                  "if (value !== undefined && value !== null) {",
+                  "    pm.collectionVariables.set('participant_id', value);",
+                  "    console.log('Stored participant_id =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Join with a code",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/join",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "join"
+              ]
+            },
+            "description": "Join a group using the code from its shareable link.\n\nAlways by code, never by id - otherwise this endpoint would be a way to walk group ids and join every open group in the product.\n\nAn unknown code, an invite-only group and a group you are blocked from all return the **same** refusal, byte for byte. Any difference would confirm that a guessed code is real.\n\nOn an `approval` group the response is `{\"status\": \"pending\"}` and no conversation - you are not a member yet.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{join_code}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get / rotate the join code",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/join-code",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "join-code"
+              ]
+            },
+            "description": "**Admins only.** Deliberately not on the conversation payload: the code is what lets a stranger in, so handing it to every member on every fetch would spread it through logs, caches and screenshots far beyond the people who administer the group.\n\n`POST` to the same URL issues a new code, which is how a leaked one is revoked."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.join_code;",
+                  "if (value !== undefined && value !== null) {",
+                  "    pm.collectionVariables.set('join_code', value);",
+                  "    console.log('Stored join_code =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Rotate the join code",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/join-code",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "join-code"
+              ]
+            },
+            "description": "Issue a new code. The old one stops working immediately."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.join_code;",
+                  "if (value !== undefined && value !== null) {",
+                  "    pm.collectionVariables.set('join_code', value);",
+                  "    console.log('Stored join_code =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List pending requests",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/requests",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "requests"
+              ]
+            },
+            "description": "Admins only. Everybody waiting to be let into an `approval` group.\n\nAdmins are also pushed a `conversation.request` event over the websocket as requests arrive, so the queue does not have to be polled."
+          }
+        },
+        {
+          "name": "Approve or decline",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/requests",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "requests"
+              ]
+            },
+            "description": "Admins only. `decision` is `approve` or `decline`.\n\nSomebody with no account is **texted** either way, because they have no other way of finding out. Somebody with an account is not - they see it in the app, and texting them is a charge for something they already know.\n\nApproval re-checks identity across both a phone number and an account: a pending request can be the same person as a row blocked under their other identifier, and the queue does not show that.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"participant\": \"{{participant_id}}\",\n  \"decision\": \"approve\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Change a role",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/role",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "role"
+              ]
+            },
+            "description": "Promote a member to admin, or demote them. Admins only.\n\n**This is also how a group's only admin gets out.** Leaving and being removed both refuse to take the last admin, because a group with none has no route back to having one - so hand over first, then leave.\n\nSomebody with no account cannot be an admin: every admin action is an authenticated request, so the role would be unusable while still counting towards that guard.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"participant\": \"{{participant_id}}\",\n  \"role\": \"admin\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Rename a member",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/rename",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "rename"
+              ]
+            },
+            "description": "Give a member with **no account** a name. Admins only.\n\nSomebody who joined by texting `JOIN` never gave one, so the group sees a masked number until an admin puts a name to it. A member who has an account keeps their own name - otherwise an admin could relabel another person in the group.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"participant\": \"{{participant_id}}\",\n  \"display_name\": \"Mom\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Remove or block",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/remove",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "remove"
+              ]
+            },
+            "description": "Admins only. `block: true` also stops them rejoining by **any** route - the join code, an admin re-adding them, texting `JOIN`, or registering an account on a blocked number.\n\nAn admin cannot remove themselves (use *Leave*), and the last admin cannot be removed at all.\n\n**A block currently cannot be undone through the API.**",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"participant\": \"{{participant_id}}\",\n  \"block\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Leave",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/leave",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "leave"
+              ]
+            },
+            "description": "Take yourself out of a group. Your messages stay.\n\nRefused for the last admin - hand over with *Change a role* first. Refused on a one-to-one conversation, because there is no way back into one."
+          }
+        },
+        {
+          "name": "Delivery settings",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/delivery",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "delivery"
+              ]
+            },
+            "description": "How **this** conversation reaches **you**. Both fields optional; only what you send is written.\n\n| Field | Meaning |\n| --- | --- |\n| `muted` | silence this group on every channel. What texting `MUTE` sets. |\n| `sms_enabled` | whether texts are one of this group's channels for you. Off means app-only. |\n\nBoth default **on** - you verified a number so your groups could reach you on it. These are yours alone; an admin cannot set them for somebody else.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"muted\": false,\n  \"sms_enabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Messages",
+      "item": [
+        {
+          "name": "Get message history",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/messages",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "messages"
+              ]
+            },
+            "description": "Newest first, paginated.\n\nEach message carries a `source`: `app`, `sms` or `system`. There is **one message per message** however it arrived - a text sent from a handset and one typed in the app are the same row.\n\nA message sent by somebody with no account has `sender.id` and `sender.username` null, and their name in `sender.profile.display_label`. Render that field and both kinds work without branching."
+          }
+        },
+        {
+          "name": "Send a message",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/messages",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "messages"
+              ]
+            },
+            "description": "Post to the conversation. Text, attachments, or both - but not neither.\n\nThe message goes to app members over the websocket immediately, and is **fanned out by SMS** to every member who should receive it - excluding you. Who that is depends on their delivery settings, their consent, and whether their number is verified; every decision not to send is recorded with a reason.\n\nIn a `broadcast` group a non-admin gets `403`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"Dinner at 7\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Send with attachments",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/conversations/{{conversation_id}}/messages",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "chat",
+                "conversations",
+                "{{conversation_id}}",
+                "messages"
+              ]
+            },
+            "description": "Multipart. Repeat `attachments` for several files.\n\nSMS members cannot receive a photo, so they get a line telling them to open the app rather than an empty message.",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "text",
+                  "value": "Look at this",
+                  "type": "text"
+                },
+                {
+                  "key": "attachments",
+                  "type": "file",
+                  "src": []
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. SMS webhook (provider)",
+      "item": [
+        {
+          "name": "Inbound SMS (provider callback)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/sms/webhooks/inbound",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "sms",
+                "webhooks",
+                "inbound"
+              ]
+            },
+            "description": "**Called by the telecom provider, not by a client.** Included so the inbound path can be exercised without a real phone.\n\nAuthenticated by an Ed25519 signature over the raw body, not by a token. With `TELNYX_PUBLIC_KEYS` unset (development) the signature is not checked and this request works as written.\n\n### Status codes are the contract\nA provider reads any non-2xx as \"resend this\", so:\n\n| Code | When |\n| --- | --- |\n| `200` | anything we understand and will not change our mind about - duplicate, unknown number, unknown sender, malformed |\n| `401` | bad signature |\n| `500` | we failed to handle it - **please do resend** |\n\n### Commands\n`JOIN [code]`, `HELP`, `MUTE`, `UNMUTE`, `LEAVE`, `STOP`, `YES`. A command must be the **whole message** - \"stop by the shop\" is a message to your family, not an opt-out.\n\nRepeat with the same `data.id` to see de-duplication: the second call returns `duplicate: true` and posts nothing.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"data\": {\n    \"id\": \"evt_1\",\n    \"event_type\": \"message.received\",\n    \"payload\": {\n      \"from\": {\n        \"phone_number\": \"+639171111111\"\n      },\n      \"to\": [\n        {\n          \"phone_number\": \"+14155551001\"\n        }\n      ],\n      \"text\": \"JOIN\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

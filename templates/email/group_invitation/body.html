@@ -1,0 +1,28 @@
+{% extends "email/base.html" %}
+
+{% block title %}{{ inviter_name }} added you to {{ group_name }}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">
+  <strong>{{ inviter_name }}</strong> added you to
+  <strong>{{ group_name }}</strong> on {{ product_name }}.
+</p>
+<p style="margin:0 0 24px;">
+  {{ product_name }} is where the group talks. To see it, create an account
+  with this email address.
+</p>
+<p style="margin:0 0 24px;">
+  <a href="{{ join_url }}"
+     style="display:inline-block; background-color:#0284c7; color:#ffffff; text-decoration:none; font-weight:600; padding:12px 24px; border-radius:8px;">
+    Join {{ group_name }}
+  </a>
+</p>
+<p style="margin:0 0 16px; font-size:14px; color:#52525b;">
+  You will be in the group as soon as you confirm this address &mdash; it is
+  that confirmation, not this email, that lets you in. Nothing here is a
+  password or a key, so forwarding it gives nobody access.
+</p>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  If you were not expecting this, you can ignore it.
+</p>
+{% endblock %}

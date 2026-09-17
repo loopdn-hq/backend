@@ -18,6 +18,9 @@ def avatar_upload_to(instance, filename):
 
     The original filename is discarded on purpose: it is attacker-controlled,
     and users routinely upload `IMG_0001.jpg`, which would collide.
+
+    Migration 0001 refers to this as `user.models.avatar_upload_to`, which
+    resolves because user/models/__init__.py re-exports it. Keep that export.
     """
     suffix = Path(filename).suffix.lower() or '.jpg'
     return f'avatars/{instance.user_id}/{uuid.uuid4().hex}{suffix}'
@@ -65,12 +68,38 @@ class Profile(models.Model):
     # mean nothing. Reset automatically in save() when the number changes.
     phone_no_verified = models.BooleanField(default=False)
 
+    # The account-wide SMS and email switches - `sms_enabled`, `sms_opt_out_at`,
+    # `sms_consent_at`, `email_enabled` - lived here until user/0009 moved them
+    # to MessagingSettings. Their columns are still in this table, unread,
+    # until a later release drops them; see that migration.
+
+    # Whether `user.email` has been confirmed with an emailed code. This is
+    # the flag that gates signing in, not `user.is_active`.
+    #
+    # The two are kept strictly apart, and the split is load-bearing:
+    #
+    #   is_active      an admin has not banned this account. Written by admins
+    #                  only - never by the verification flow.
+    #   email_verified the address has been confirmed. Written by the
+    #                  verification flow only - never by the profile endpoint.
+    #
+    # Collapsing them, which is the obvious shortcut, breaks bans: a banned
+    # account and a never-verified one become indistinguishable, so the two
+    # public verification endpoints hand a banned user a way to switch their
+    # own account back on. Cleared again in UserSerializer.update when the
+    # address changes, which is why is_active must not follow it.
+    email_verified = models.BooleanField(default=False)
+
     bio = models.CharField(max_length=280, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
 
-    # Presence, for the conversation list. `is_online` is the live flag the
-    # websocket layer will flip; `last_seen_at` is what to show once it is
-    # False.
+    # Presence, for the conversation list. `is_online` is flipped by the
+    # websocket layer - the first socket on, the last one off - and
+    # `last_seen_at` is both what to show once it is False and the beat that
+    # keeps it honest: `user/presence.py` disbelieves a flag whose beat has
+    # gone stale, so a crashed worker cannot leave somebody online. Read it
+    # through `presence.is_online`, never the column alone. Whether OTHER
+    # people may see it is PrivacySettings.online_status_visible.
     is_online = models.BooleanField(default=False)
     last_seen_at = models.DateTimeField(null=True, blank=True)
 

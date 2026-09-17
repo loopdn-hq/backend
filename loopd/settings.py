@@ -15,8 +15,17 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from dotenv import load_dotenv
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Local-only secrets (RESEND_API_KEY, etc.) live in a gitignored .env beside
+# manage.py - see .gitignore for the full list. load_dotenv() never
+# overrides a variable already in the environment, so a real env var set by
+# Docker/ECS in staging and production still wins; it's a silent no-op when
+# the file doesn't exist, which is the normal case outside local dev.
+load_dotenv(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
@@ -36,9 +45,8 @@ JWT_SIGNING_KEY = os.environ.get('JWT_SIGNING_KEY', SECRET_KEY)
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DEBUG', 'True').lower() not in ('0', 'false', 'no')
 
-# Comma-separated in the environment. This also gates websockets:
-# AllowedHostsOriginValidator refuses every handshake when DEBUG is off and
-# this list is empty.
+# Comma-separated in the environment. Which Host headers this server answers
+# to - nothing to do with websockets; see CORS_ALLOWED_ORIGINS for those.
 ALLOWED_HOSTS = [
     host.strip() for host in os.environ.get('ALLOWED_HOSTS', '').split(',') if host.strip()
 ]
@@ -108,6 +116,12 @@ CSRF_TRUSTED_ORIGINS = [
 
 # A browser frontend on another local port needs an explicit CORS response.
 # Production origins are supplied by CORS_ALLOWED_ORIGINS instead.
+#
+# THIS ALSO GATES WEBSOCKETS. loopd/asgi.py validates the handshake's Origin
+# against this list, so with DEBUG off and this unset it is EMPTY and every
+# socket is refused - silently, because a rejected handshake looks to a browser
+# exactly like a server that is not there. Set it wherever ALLOWED_HOSTS is
+# set, with the scheme included: matching is on scheme, host and port.
 _default_cors_origins = 'http://localhost:3000,http://127.0.0.1:3000' if DEBUG else ''
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
@@ -143,6 +157,19 @@ INSTALLED_APPS = [
     'user',
     'otp',
     'chat',
+    # The activity feed, and web push - one app, because both are "tell this
+    # person that something happened". Push is the delivery channel that
+    # reaches a closed browser, and the only one that carries a direct
+    # message (chat/delivery.py:register_channel).
+    'notification',
+    'sms',
+    # `mail`, not `email`: a top-level app called `email` would shadow the
+    # standard library module for everything on the path.
+    'mail',
+    'billing',
+    # Custom-priced plans sold through the Plan Builder - a dynamic,
+    # catalog-driven configuration rather than billing's single plan code.
+    'enterprise',
 ]
 
 MIDDLEWARE = [
@@ -165,7 +192,11 @@ ROOT_URLCONF = 'loopd.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        # Project-level templates, searched before any app's. Email bodies live
+        # here rather than inside an app because utils/mail.py renders them and
+        # utils is not an installed app - APP_DIRS would never find them - and
+        # because the next email may not belong to `user` or `otp` at all.
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -306,15 +337,182 @@ else:
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
-    },
-}
+# Product email goes out through utils/mail.py and the Resend HTTP API, not
+# through django.core.mail - see the header of that module for why. This
+# backend therefore only ever carries Django's own mail: admin error reports
+# and anything contrib sends. Console, because nothing should be relying on it.
+#
+# (A `MAILERS` dict used to sit here. Django 6.0 has no such setting, so it was
+# silently ignored and django.core.mail fell through to the SMTP default -
+# which would have tried localhost:25 the first time anything called send_mail.)
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 
-# The console backend ignores this, but it is the From: on every real send,
-# so it has to be right before SMTP is switched on.
+# The From: on every message Resend sends. The domain has to be verified in the
+# Resend dashboard or the API rejects the send with a 403.
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'no-reply@loopdn.com')
+
+# Transactional email (password reset today) goes through Resend's HTTP API -
+# see utils/email.py. Unset in development: send_email() then logs instead of
+# calling out, the same convention utils/sms.py uses for Telnyx, so the flow
+# works with no account and no network.
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+
+# Short on purpose, same reasoning as SMS_REQUEST_TIMEOUT: this call sits
+# inside a request the user is waiting on.
+EMAIL_REQUEST_TIMEOUT = 10
+
+# Available to every email template without the caller passing them.
+EMAIL_PRODUCT_NAME = os.environ.get('EMAIL_PRODUCT_NAME', 'Loopd')
+EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMAIL)
+
+# --- group email --------------------------------------------------------
+#
+# The second delivery channel, alongside SMS. Same shape as the SMS block
+# below: keyed on the presence of configuration rather than on DEBUG, so a
+# laptop runs the whole decision path and logs instead of sending.
+
+# The master switch for outbound group email. Off by default, unlike SMS:
+# turning a channel on for every existing group is a decision somebody should
+# make on purpose, and a domain's sending reputation is not recoverable by
+# turning it off again afterwards.
+MAIL_SENDING_ENABLED = os.environ.get('MAIL_SENDING_ENABLED', 'False').lower() in (
+    '1', 'true', 'yes'
+)
+
+# --- web push -----------------------------------------------------------
+#
+# The third channel. Unlike SMS and email it costs nothing, sends no content
+# anywhere we do not control - the payload is encrypted to the browser's own
+# keys - and needs no account with a provider: a VAPID key pair is generated
+# once with `manage.py generate_vapid_keys` and identifies this server to
+# every browser push service.
+
+# Off by default, like email: a channel that starts notifying everybody the
+# moment it is deployed is a decision somebody should make on purpose.
+PUSH_SENDING_ENABLED = os.environ.get('PUSH_SENDING_ENABLED', 'False').lower() in (
+    '1', 'true', 'yes'
+)
+
+# The public half is handed to every browser (GET /api/v1/push/key/) and is not
+# secret. The private half signs every send and belongs in SSM. Changing either
+# unsubscribes everybody, so they are configuration rather than code.
+VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', '').strip()
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '').strip()
+
+# How a push service reaches a human about our sends. Mozilla refuses anything
+# that is not a mailto: or https:// URL - see notification/checks.py.
+VAPID_SUBJECT = os.environ.get(
+    'VAPID_SUBJECT', f'mailto:{EMAIL_SUPPORT_ADDRESS}'
+)
+
+# How long a push service should hold a notification for a browser that is
+# offline. Twelve hours: long enough for a laptop shut for the evening, short
+# enough that nobody is told about a message they read this morning.
+PUSH_TTL_SECONDS = int(os.environ.get('PUSH_TTL_SECONDS', 12 * 60 * 60))
+
+# The domain the inbound provider receives replies on, e.g. reply.loopdn.com.
+# It must NOT be the domain that receives ordinary mail for the company: every
+# address under it is a machine-readable reply handle. Empty means replies are
+# not accepted, and the templates then say "open Loopd to respond" instead of
+# inviting one that would land nowhere.
+MAIL_REPLY_DOMAIN = os.environ.get('MAIL_REPLY_DOMAIN', '').strip().lower()
+
+# Signs the inbound email webhook. Empty skips verification - development only,
+# and mail/checks.py raises an error if a reply domain is configured without it.
+RESEND_WEBHOOK_SECRET = os.environ.get('RESEND_WEBHOOK_SECRET', '')
+
+# Whether an inbound reply must carry the receiving server's passing SPF, DKIM
+# or DMARC verdict for the domain it claims to be from. The From address is
+# what lets a reply post as a member, and without this it is a string anybody
+# can type. On by default; False is for a laptop feeding the webhook by hand,
+# and mail/checks.py refuses a deploy that has replies on and this off. See
+# mail/authentication.py for the rule.
+MAIL_INBOUND_REQUIRE_AUTHENTICATION = os.environ.get(
+    'MAIL_INBOUND_REQUIRE_AUTHENTICATION', 'True'
+).lower() in ('1', 'true', 'yes')
+
+# How far out of date a webhook signature may be. Same reasoning as
+# SMS_WEBHOOK_TOLERANCE_SECONDS: long enough to survive clock drift, short
+# enough that a captured request cannot be replayed tomorrow.
+MAIL_WEBHOOK_TOLERANCE_SECONDS = int(
+    os.environ.get('MAIL_WEBHOOK_TOLERANCE_SECONDS', '300')
+)
+
+# Above this, the email leg stops and everybody still gets the message in the
+# app. A large group mailing every message is how a sending domain earns a
+# reputation it cannot spend its way out of.
+MAIL_MAX_RECIPIENTS_PER_MESSAGE = int(
+    os.environ.get('MAIL_MAX_RECIPIENTS_PER_MESSAGE', '100')
+)
+
+# This API's own public origin, for the links it prints INTO email. Distinct
+# from FRONTEND_URL, which is where the app lives: the unsubscribe page is
+# served by Django, because a static export on another origin cannot verify a
+# token and must not be what stands between somebody and the way out.
+#
+# There is nothing to build an absolute URL from at send time - the fan-out
+# runs on a Celery worker with no request - so this is configuration rather
+# than something to derive. mail/checks.py refuses a deploy that has group
+# email on and leaves this empty.
+API_PUBLIC_URL = os.environ.get('API_PUBLIC_URL', '').rstrip('/')
+
+# A leaked unsubscribe link must not become a write amplifier. Same cache
+# fixed-window idiom as sms/inbound.py:_join_attempt_allowed. High enough that
+# a real member clicking twice never notices; and because the operation is
+# idempotent, a caller past the cap is simply told what is already true.
+MAIL_MAX_UNSUBSCRIBE_ATTEMPTS_PER_HOUR = int(
+    os.environ.get('MAIL_MAX_UNSUBSCRIBE_ATTEMPTS_PER_HOUR', '20')
+)
+
+# The email retry sweep, with the same three bounds as SMS's: how many times
+# one row may be tried, how old a message may be and still be worth delivering,
+# and how long a row may sit in SENDING before the worker is presumed dead.
+MAIL_MAX_DELIVERY_ATTEMPTS = int(os.environ.get('MAIL_MAX_DELIVERY_ATTEMPTS', '3'))
+MAIL_RETRY_WINDOW_HOURS = int(os.environ.get('MAIL_RETRY_WINDOW_HOURS', '6'))
+MAIL_STALLED_AFTER_MINUTES = int(os.environ.get('MAIL_STALLED_AFTER_MINUTES', '15'))
+
+# A row per recipient per message, recording who is emailed about which
+# private group. Not something to keep forever.
+MAIL_RETENTION_DAYS = int(os.environ.get('MAIL_RETENTION_DAYS', '90'))
+
+# Signs the unsubscribe token. Defaults to SECRET_KEY, so leaving it unset
+# changes nothing at all - it exists so that rotating SECRET_KEY one day does
+# not have to invalidate every unsubscribe link already sitting in somebody's
+# mailbox, which is a worse failure than it sounds: unlike a reply address,
+# nothing replaces a dead unsubscribe link except the next email.
+MAIL_TOKEN_SECRET = os.environ.get('MAIL_TOKEN_SECRET', '') or SECRET_KEY
+
+# Where the frontend lives, for building links that go out in email (password
+# reset today). No trailing slash - callers append their own path.
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://loopdn.com').rstrip('/')
+
+# Origins Stripe Checkout/portal is allowed to redirect back to.
+#
+# success_url/cancel_url/return_url are caller-supplied, and Stripe will
+# redirect a real, just-paid customer to whatever they contain - handing that
+# straight to Stripe unvalidated is an open redirect (and a phishing setup:
+# "you just paid, now here is a look-alike login page"). CORS_ALLOWED_ORIGINS
+# is already the list of frontends this API trusts, so it doubles as the
+# redirect allowlist rather than inventing a second one to keep in sync.
+BILLING_ALLOWED_REDIRECT_ORIGINS = set(CORS_ALLOWED_ORIGINS) | {FRONTEND_URL}
+
+# How long a password-reset link stays valid. This is a real Django setting -
+# django.contrib.auth.tokens.default_token_generator reads it directly, so
+# nothing else has to check the expiry by hand. Also governs any other use of
+# default_token_generator in the project (there is none today).
+PASSWORD_RESET_TIMEOUT = int(os.environ.get('PASSWORD_RESET_TIMEOUT_SECONDS', str(30 * 60)))
+
+# Stops forgot-password from being used to spam an address with reset links.
+# Same two-tier shape as OTP_RESEND_COOLDOWN / OTP_MAX_SENDS_PER_HOUR below:
+# the cooldown stops an immediate double-submit, the hourly ceiling stops a
+# slow drip that waits the cooldown out each time. See
+# _password_reset_rate_limited in user/serializers.py.
+PASSWORD_RESET_COOLDOWN_SECONDS = int(
+    os.environ.get('PASSWORD_RESET_COOLDOWN_SECONDS', '60')
+)
+PASSWORD_RESET_MAX_REQUESTS_PER_HOUR = int(
+    os.environ.get('PASSWORD_RESET_MAX_REQUESTS_PER_HOUR', '3')
+)
 
 
 # One-time passcodes
@@ -323,13 +521,21 @@ DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'no-reply@loopdn.com')
 # Six digits is the familiar length. It is only 1,000,000 possibilities, so
 # the security comes from the short lifetime and the attempt cap below, not
 # from the code itself.
-# Email verification is off for now: registering activates the account
-# immediately and returns tokens, so a new user can sign in straight away.
-# Turn it on (here or via the environment) and register goes back to
-# creating an inactive account that must confirm an emailed code first.
-# Nothing else needs to change - the OTP endpoints stay wired up either way.
+# Email verification is ON: registering emails a code, and login is refused
+# until verify-email confirms it.
+#
+# The flag that gates sign-in is `Profile.email_verified`, NOT `user.is_active`
+# - the two are kept strictly apart, because is_active is also how an admin
+# bans an account, and a verification code must never be able to write it. See
+# the note on the field in user/models.py. LoginSerializer refuses an
+# unverified account only after the password checks out, so it cannot be used
+# to discover which accounts exist.
+#
+# Turn it off (here or via the environment) and registration marks the account
+# verified on the spot, so it can sign in straight away. Nothing else changes -
+# the verification endpoints stay wired up either way.
 REQUIRE_EMAIL_VERIFICATION = os.environ.get(
-    'REQUIRE_EMAIL_VERIFICATION', 'False'
+    'REQUIRE_EMAIL_VERIFICATION', 'True'
 ).lower() in ('1', 'true', 'yes')
 
 OTP_CODE_LENGTH = 6
@@ -347,7 +553,7 @@ OTP_RESEND_COOLDOWN = timedelta(
 
 # The cooldown alone only stops bursts: waiting 60 seconds between requests
 # still buys 1,440 messages a day. These are the ceilings that make an attack
-# uninteresting, and every SMS is a real charge - see utils/sms.py on pumping.
+# uninteresting, and every SMS is a real charge - see sms/client.py on pumping.
 # Enforced per profile AND per destination number, so neither one account
 # working through many numbers nor many accounts hammering one number gets
 # through. See otp/services.py.
@@ -359,13 +565,148 @@ OTP_MAX_SENDS_PER_DAY = int(os.environ.get('OTP_MAX_SENDS_PER_DAY', '10'))
 #
 # We use the Verify API, not the Messages API: Telnyx generates, sends, stores
 # and checks the code, so this project never holds an SMS code at all. The full
-# reasoning is at the top of utils/sms.py.
+# reasoning is at the top of sms/verification.py.
 #
-# Unset in development - utils/sms.py then logs instead of sending and accepts
+# Unset in development - sms/verification.py then logs instead of sending and accepts
 # a fixed code, so the flow works with no account and no network.
 
 TELNYX_API_KEY = os.environ.get('TELNYX_API_KEY', '')
 TELNYX_VERIFY_PROFILE_ID = os.environ.get('TELNYX_VERIFY_PROFILE_ID', '')
+
+# Group SMS, which is a different provider product from phone verification.
+# Unset, sms/client.py:send_text logs instead of sending, so the whole fan-out
+# runs on a laptop and in CI with no account - the same shape as every other
+# backend in this file.
+TELNYX_MESSAGING_PROFILE_ID = os.environ.get('TELNYX_MESSAGING_PROFILE_ID', '')
+
+# Comma-separated: rotating a signing key needs both the old and new one valid
+# at once. Empty means inbound webhook signatures are not checked, which is
+# only ever right in development.
+TELNYX_PUBLIC_KEYS = [
+    key.strip()
+    for key in os.environ.get('TELNYX_PUBLIC_KEYS', '').split(',')
+    if key.strip()
+]
+
+# How far out of step a webhook's timestamp may be before it is refused. Stops a
+# captured request being replayed days later.
+SMS_WEBHOOK_TOLERANCE_SECONDS = int(
+    os.environ.get('SMS_WEBHOOK_TOLERANCE_SECONDS', '300')
+)
+
+# The master switch for outbound group SMS. Off means the fan-out is never even
+# scheduled, so a deployment that has not finished provisioning cannot text
+# anybody by accident.
+SMS_SENDING_ENABLED = os.environ.get('SMS_SENDING_ENABLED', 'True').lower() in (
+    '1', 'true', 'yes'
+)
+
+# Spend ceilings, counted in SEGMENTS rather than messages, because a long
+# message is several charges. The same shape as the OTP ceilings above, for the
+# same reason: one inbound text can trigger a message to everybody in a group,
+# and nothing else bounds that.
+# A group's number belongs to the country of whoever created it, read from
+# their verified phone number. This is the prefix -> ISO table that decides it;
+# it only needs the countries the product actually serves, and it must stay in
+# step with SMS_ALLOWED_COUNTRY_PREFIXES above.
+SMS_COUNTRY_BY_PREFIX = {
+    '+63': 'PH',
+    '+1': 'US',
+    '+44': 'GB',
+    '+61': 'AU',
+    '+65': 'SG',
+}
+
+# Buy every group's number in THIS country, whatever the creator's own country
+# is. Empty means the creator's country decides, which is rule 1 and the way
+# production is meant to run.
+#
+# Set to 'US' while the SMS feature is being tested. Telnyx sells no SMS-capable
+# number in most of SMS_COUNTRY_BY_PREFIX - a search for a local PH, GB, AU or
+# SG number with filter[features][]=sms answers HTTP 400 'No coverage found',
+# because the numbers that exist there are voice/fax only. US and CA are the
+# only two that can actually be bought and texted from, so without this the
+# feature cannot be exercised from a +63 test account at all.
+SMS_FORCE_COUNTRY = os.environ.get('SMS_FORCE_COUNTRY', '').strip().upper()
+
+# Where to look when the creator's own country has nothing available. EMPTY BY
+# DEFAULT, which means a group whose country has nothing gets no number at all
+# rather than a foreign one.
+#
+# It used to default to US,GB,CA. That silently bought a +1 number for a
+# Philippine family group - the number can never be changed afterwards (rule 2)
+# and every member pays international rates to text it, discovered on a phone
+# bill. Null is the honest answer: `conversation.sms_number` is null, the group
+# works in the app, and the backfill retries later.
+SMS_FALLBACK_COUNTRIES = [
+    country.strip()
+    for country in os.environ.get('SMS_FALLBACK_COUNTRIES', '').split(',')
+    if country.strip()
+]
+
+# Buying a number is slower than sending a text and nobody is waiting on a
+# screen for it, so it can afford a longer timeout than SMS_REQUEST_TIMEOUT.
+SMS_NUMBER_REQUEST_TIMEOUT = int(os.environ.get('SMS_NUMBER_REQUEST_TIMEOUT', '30'))
+
+# A search does not reserve anything, so another customer can take a number
+# between finding it and ordering it. Several candidates are fetched so the
+# order can move on to the next one instead of failing.
+SMS_NUMBER_SEARCH_CANDIDATES = 5
+
+# An order is accepted with status 'pending' and becomes 'success' shortly
+# after. US orders settle immediately in practice; these bound the wait for the
+# ones that do not.
+SMS_NUMBER_ORDER_POLLS = int(os.environ.get('SMS_NUMBER_ORDER_POLLS', '3'))
+SMS_NUMBER_ORDER_POLL_SECONDS = float(
+    os.environ.get('SMS_NUMBER_ORDER_POLL_SECONDS', '1.5')
+)
+
+# One message to a group is one text per SMS member. Above this many, the
+# message still reaches everybody in the app and the SMS leg is skipped and
+# recorded - because a single post to a very large group is a bill nobody
+# authorised, and finding out afterwards is too late.
+# Retrying a failed delivery is worth a few goes - carriers have bad minutes -
+# and no more. A disconnected number fails identically every time.
+SMS_MAX_DELIVERY_ATTEMPTS = int(os.environ.get('SMS_MAX_DELIVERY_ATTEMPTS', '3'))
+# And only while the message is still worth delivering. Nobody wants yesterday's
+# "dinner at 7".
+SMS_RETRY_WINDOW_HOURS = int(os.environ.get('SMS_RETRY_WINDOW_HOURS', '6'))
+
+# A row still SENDING after this belongs to a process that died: the provider
+# call sits between the two writes, so nothing else takes that long.
+SMS_STALLED_AFTER_MINUTES = int(os.environ.get('SMS_STALLED_AFTER_MINUTES', '15'))
+
+# How many numberless groups to try to provision per run. Bounded because each
+# one is a purchase.
+SMS_PROVISION_BATCH = int(os.environ.get('SMS_PROVISION_BATCH', '10'))
+
+# The delivery log gains a row per recipient per message and never loses one,
+# and it records who texts which private group. Not something to keep forever.
+SMS_RETENTION_DAYS = int(os.environ.get('SMS_RETENTION_DAYS', '90'))
+
+# Where the daily spend report goes. Unset, it only goes to the log.
+SMS_REPORT_EMAIL = os.environ.get('SMS_REPORT_EMAIL', '')
+
+SMS_MAX_RECIPIENTS_PER_MESSAGE = int(
+    os.environ.get('SMS_MAX_RECIPIENTS_PER_MESSAGE', '100')
+)
+
+# Join codes are six characters from a 29-letter alphabet. That is a lot of
+# guesses, but not if a number can guess without limit, so attempts are capped
+# per sending number.
+SMS_MAX_JOIN_ATTEMPTS_PER_HOUR = int(
+    os.environ.get('SMS_MAX_JOIN_ATTEMPTS_PER_HOUR', '5')
+)
+
+SMS_MAX_SEGMENTS_PER_GROUP_PER_DAY = int(
+    os.environ.get('SMS_MAX_SEGMENTS_PER_GROUP_PER_DAY', '2000')
+)
+SMS_MAX_SEGMENTS_PER_DAY = int(os.environ.get('SMS_MAX_SEGMENTS_PER_DAY', '20000'))
+# Replies to unauthenticated inbound texts (HELP, join refusals). Every one is a
+# billed message somebody else triggered, so it is capped per number.
+SMS_MAX_REPLIES_PER_NUMBER_PER_HOUR = int(
+    os.environ.get('SMS_MAX_REPLIES_PER_NUMBER_PER_HOUR', '3')
+)
 
 # Short on purpose. This call sits inside a request the user is waiting on, and
 # a provider that has stopped answering should surface as an error quickly
@@ -396,6 +737,12 @@ MEDIA_ROOT = BASE_DIR / 'var' / 'media'
 # Avatars are re-encoded thumbnails, not originals, so the ceiling is small.
 MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024
 
+# A group's image. The same number as an avatar today, but its own setting:
+# retuning what somebody may upload for themselves should not silently retune
+# what an admin may upload on behalf of a whole group - and the tests lower
+# these ceilings to reach the failure path, one app at a time.
+MAX_GROUP_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024
+
 # Chat attachments. The ceiling is per file, and the count is per message,
 # so one request can carry at most 10 x 25MB.
 MAX_ATTACHMENT_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -421,6 +768,17 @@ REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'loopd.exceptions.api_exception_handler',
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
+    # Scoped throttles opt in per-view (billing checkout/portal today) rather
+    # than through DEFAULT_THROTTLE_CLASSES, so this only bounds the views
+    # that actually name a scope.
+    'DEFAULT_THROTTLE_RATES': {
+        # A Checkout Session is a real call to Stripe's API, not a free local
+        # read - this is what stops a compromised token or a retry loop from
+        # running up Stripe API usage or tripping Stripe's own abuse controls.
+        'billing_checkout': '10/hour',
+        'billing_portal': '20/hour',
+        'enterprise_checkout': '10/hour',
+    },
 }
 
 if DEBUG:
@@ -482,7 +840,17 @@ if REDIS_URL:
     CHANNEL_LAYERS = {
         'default': {
             'BACKEND': 'channels_redis.core.RedisChannelLayer',
-            'CONFIG': {'hosts': [REDIS_URL]},
+            # socket_timeout has to exceed channels_redis's brpop_timeout (5s).
+            # The receive loop parks on a blocking BZPOPMIN for that long, and
+            # redis-py 8 changed its default socket_timeout from None to 5 - the
+            # exact same number - so the read aborts in a dead heat with the
+            # server's reply. Every consumer then dies with "Timeout reading
+            # from redis:6379" about every five seconds and the browser sits in
+            # a reconnect loop. Anything comfortably above 5 restores the old
+            # behaviour while still failing fast on a genuinely dead Redis.
+            'CONFIG': {
+                'hosts': [{'address': REDIS_URL, 'socket_timeout': 10}],
+            },
         },
     }
 else:
@@ -539,3 +907,73 @@ CELERY_TASK_SOFT_TIME_LIMIT = 9 * 60
 # Schedules live in the database and are editable from the admin, rather
 # than being frozen into a settings dict that needs a deploy to change.
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# The jobs that keep the SMS layer honest. DatabaseScheduler syncs these into
+# the database on start, so they are editable from the admin afterwards without
+# a deploy - which is the point of using it rather than a file-only schedule.
+CELERY_BEAT_SCHEDULE = {
+    'sms-retry-failed-deliveries': {
+        'task': 'sms.retry_failed_deliveries',
+        'schedule': 300.0,
+    },
+    'sms-requeue-stalled-deliveries': {
+        'task': 'sms.requeue_stalled_deliveries',
+        'schedule': 600.0,
+    },
+    'sms-provision-missing-numbers': {
+        'task': 'sms.provision_missing_numbers',
+        'schedule': 900.0,
+    },
+    # After the retry sweep, so nothing is announced that a retry was about to
+    # fix - see sms/maintenance.py:announce_failed_deliveries.
+    'sms-announce-failed-deliveries': {
+        'task': 'sms.announce_failed_deliveries',
+        'schedule': 300.0,
+    },
+    'sms-purge-old-deliveries': {
+        'task': 'sms.purge_old_deliveries',
+        # Daily. Nothing here is urgent and it deletes rows.
+        'schedule': 86400.0,
+    },
+    'sms-daily-spend-report': {
+        'task': 'sms.daily_spend_report',
+        'schedule': 86400.0,
+    },
+    # The same three jobs for email - see mail/maintenance.py.
+    'mail-retry-failed-deliveries': {
+        'task': 'mail.retry_failed_deliveries',
+        'schedule': 300.0,
+    },
+    'mail-requeue-stalled-deliveries': {
+        'task': 'mail.requeue_stalled_deliveries',
+        'schedule': 600.0,
+    },
+    'mail-announce-failed-deliveries': {
+        'task': 'mail.announce_failed_deliveries',
+        'schedule': 300.0,
+    },
+    'mail-purge-old-deliveries': {
+        'task': 'mail.purge_old_deliveries',
+        'schedule': 86400.0,
+    },
+}
+
+
+# Stripe (payments and webhooks)
+#
+# Unset in development - billing/webhooks.py then has no secret to verify
+# against, which billing/checks.py only flags once a secret key is present,
+# the same "empty means development" convention TELNYX_PUBLIC_KEYS uses above.
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY', '')
+
+# The signing secret for THIS endpoint, from `stripe listen` locally or the
+# dashboard's webhook settings in staging/production. Without it,
+# stripe.Webhook.construct_event raises on every request rather than silently
+# accepting unsigned ones - unlike the Telnyx webhook, there is no accept-all
+# fallback here.
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+
+import stripe  # noqa: E402
+
+stripe.api_key = STRIPE_SECRET_KEY

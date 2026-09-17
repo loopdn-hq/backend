@@ -5,10 +5,17 @@ from write shapes (`RegisterSerializer`, `LoginSerializer`): the fields a
 client sends when signing up have almost nothing in common with the fields it
 gets back, and merging them is how write-only fields leak.
 """
+import logging
+
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth.tokens import default_token_generator
+from django.core.cache import cache
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from google.auth.exceptions import GoogleAuthError
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
@@ -19,7 +26,21 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from otp.models import OtpError
 from otp.services import start_email_verification, verify_email
-from user.models import Profile
+from user.lookups import active_users
+from user.models import (
+    AppearanceSettings,
+    MessagingSettings,
+    NotificationSettings,
+    PrivacySettings,
+    Profile,
+    SecuritySettings,
+    UserBlock,
+    phone_number_validator,
+)
+from user.user_settings import ensure_settings
+from utils.email import EmailError, send_email
+
+logger = logging.getLogger(__name__)
 
 
 class ProfileSerializer(serializers.ModelSerializer):
@@ -33,6 +54,10 @@ class ProfileSerializer(serializers.ModelSerializer):
     avatar = serializers.ImageField(write_only=True, required=False, allow_null=True)
     avatar_url = serializers.SerializerMethodField()
     display_label = serializers.CharField(read_only=True)
+    # Group email across every Loop. Not a Profile column since user/0009 - it
+    # lives on MessagingSettings - so it is declared here and read and written
+    # by hand below, under the name clients already use.
+    email_enabled = serializers.BooleanField(write_only=True, required=False)
 
     class Meta:
         model = Profile
@@ -43,6 +68,12 @@ class ProfileSerializer(serializers.ModelSerializer):
             'avatar_url',
             'phone_number',
             'phone_no_verified',
+            'email_verified',
+            # The account-wide switch for group email. Writable, unlike its SMS
+            # sibling: SMS has a carrier word for this and email does not, so
+            # without an endpoint there would be nowhere at all to turn it off.
+            # Stored on MessagingSettings - see the declared field above.
+            'email_enabled',
             'bio',
             'date_of_birth',
             'is_online',
@@ -54,6 +85,7 @@ class ProfileSerializer(serializers.ModelSerializer):
         # could PATCH it could mark its own unverified number verified.
         read_only_fields = [
             'phone_no_verified',
+            'email_verified',
             'is_online',
             'last_seen_at',
             'updated_at',
@@ -85,6 +117,27 @@ class ProfileSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('That phone number is already in use.')
         return value
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Only where it is one of this serializer's fields: PublicProfileSerializer
+        # inherits the declaration, and must never show one person's switch to
+        # another.
+        if 'email_enabled' in self.fields:
+            data['email_enabled'] = MessagingSettings.of(instance.user).email_enabled
+        return data
+
+    def update(self, instance, validated_data):
+        email_enabled = validated_data.pop('email_enabled', None)
+        profile = super().update(instance, validated_data)
+        if email_enabled is not None:
+            switches = MessagingSettings.for_user(profile.user)
+            changed = switches.switch_email(
+                email_enabled, reason=MessagingSettings.EmailOptOutReason.PERSON
+            )
+            if changed:
+                switches.save(update_fields=[*changed, 'updated_at'])
+        return profile
+
 
 class PublicProfileSerializer(ProfileSerializer):
     """What one user is allowed to see about another.
@@ -96,6 +149,29 @@ class PublicProfileSerializer(ProfileSerializer):
     class Meta(ProfileSerializer.Meta):
         fields = ['display_label', 'avatar_url', 'bio', 'is_online', 'last_seen_at']
         read_only_fields = fields
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        from user import presence, privacy
+
+        viewer = getattr(self.context.get('request'), 'user', None)
+        their_own = (
+            viewer is not None
+            and getattr(viewer, 'pk', None) is not None
+            and viewer.pk == instance.user_id
+        )
+
+        # Settings → Privacy → Online status. Withheld rather than falsified
+        # for the viewer's own row: somebody looking at themselves is not
+        # being told about anybody.
+        if not their_own and not privacy.shows_online_status(instance.user):
+            data['is_online'] = False
+            data['last_seen_at'] = None
+            return data
+
+        # The flag is only as good as the beat behind it - see user/presence.py.
+        data['is_online'] = presence.is_online(instance)
+        return data
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -121,16 +197,63 @@ class UserSerializer(serializers.ModelSerializer):
     def validate_email(self, value):
         return _validate_unique_email(value, exclude_user=self.instance)
 
+    def update(self, instance, validated_data):
+        # Compared before the write, while `instance` still holds the old one.
+        email_changed = 'email' in validated_data and (
+            validated_data['email'].lower() != (instance.email or '').lower()
+        )
+
+        user = super().update(instance, validated_data)
+
+        if email_changed:
+            # The new address has not been confirmed, so the badge cannot
+            # survive the change - the same rule Profile.save() applies when a
+            # phone number changes. Without this, someone verifies an address
+            # they own, swaps in one they do not, and keeps the flag.
+            profile = user.profile
+            profile.email_verified = False
+            profile.save(update_fields=['email_verified', 'updated_at'])
+
+        return user
+
 
 class PublicUserSerializer(serializers.ModelSerializer):
     """Another user, as seen from a conversation."""
 
     profile = PublicProfileSerializer(read_only=True)
+    blocked_by_me = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'username', 'profile']
+        fields = ['id', 'username', 'profile', 'blocked_by_me']
         read_only_fields = fields
+
+    def get_blocked_by_me(self, obj):
+        """Whether the CALLER has blocked this person.
+
+        One direction, and only ever the caller's own decision. It is never
+        true because somebody blocked the caller - that would announce a block
+        to the person it was made against, which every refusal in this product
+        is written to avoid. So it discloses nothing that `GET /users/me/blocks/`
+        does not already tell the same caller.
+
+        This is what lets a client render §12's two affordances: the `Blocked`
+        marker beside a name in a shared member list, and the `Unblock` action
+        on a profile opened from one. Without it a client would have to fetch
+        the whole block list and join it by hand.
+
+        False whenever there is no request to ask on behalf of - a broadcast
+        payload built inside a consumer has no viewer, and a field that guessed
+        would be guessing about somebody's privacy.
+        """
+        request = self.context.get('request')
+        viewer = getattr(request, 'user', None)
+        if viewer is None or not viewer.is_authenticated:
+            return False
+
+        from user.blocks import has_blocked
+
+        return has_blocked(viewer, obj)
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -205,20 +328,31 @@ class RegisterSerializer(serializers.ModelSerializer):
 
         # create_user hashes the password; User(**data) would store it raw.
         #
-        # is_active is what email verification actually controls: an inactive
-        # account exists but cannot sign in, because ModelBackend refuses it.
-        # With verification off, accounts are usable the moment they exist.
-        user = User.objects.create_user(
-            password=password,
-            is_active=not settings.REQUIRE_EMAIL_VERIFICATION,
-            **validated_data,
-        )
+        # is_active stays True even when the address is unverified: it means
+        # "not banned", and nothing but an admin may write it. What actually
+        # gates signing in is profile.email_verified, checked in
+        # LoginSerializer. See the note on the field in user/models.py.
+        user = User.objects.create_user(password=password, **validated_data)
 
         # The post_save signal already made the Profile; fill it in.
+        #
+        # email_verified is decided here, in the same place and from the same
+        # setting as the rest of the account, so the two can never disagree.
+        # With verification off nobody is ever asked for a code, so leaving it
+        # False would mark every account unverified forever - and hand a banned
+        # one a working route through resend-code.
         profile = user.profile
         profile.display_name = profile_data['display_name']
         profile.phone_number = profile_data['phone_number']
-        profile.save(update_fields=['display_name', 'phone_number', 'updated_at'])
+        profile.email_verified = not settings.REQUIRE_EMAIL_VERIFICATION
+        profile.save(
+            update_fields=[
+                'display_name',
+                'phone_number',
+                'email_verified',
+                'updated_at',
+            ]
+        )
 
         return user
 
@@ -273,16 +407,23 @@ class LoginSerializer(TokenObtainPairSerializer):
             if match:
                 attrs[self.username_field] = match.username
 
-        try:
-            data = super().validate(attrs)
-        except exceptions.AuthenticationFailed:
-            # authenticate() returns None for an inactive user, which would
-            # otherwise read as "wrong password" to someone who typed it
-            # correctly. Checking the password first means this only ever
-            # tells the truth to a caller who already knows it - so it still
-            # cannot be used to discover which accounts exist.
-            self._explain_if_unverified(attrs)
-            raise
+        # A banned account (is_active=False) fails in here and is told only
+        # 'Incorrect username or password.' - naming the ban would confirm the
+        # account exists, and there is nothing the user could do about it.
+        data = super().validate(attrs)
+
+        # Past this point the password was correct, so saying why sign-in is
+        # refused reveals nothing to anyone who did not already know it. That
+        # is what keeps this from becoming an account-enumeration oracle.
+        if settings.REQUIRE_EMAIL_VERIFICATION and not self.user.profile.email_verified:
+            raise exceptions.AuthenticationFailed(
+                'Verify your email address before signing in.',
+                'email_not_verified',
+            )
+
+        # Only past every refusal, so a failed sign-in creates nothing. The
+        # other sign-ins make the same call in `issue_tokens`.
+        ensure_settings(self.user)
 
         # Reshaped to match register, so a client parses one thing
         # whether it just signed up or just logged in.
@@ -292,16 +433,6 @@ class LoginSerializer(TokenObtainPairSerializer):
         }
 
 
-    def _explain_if_unverified(self, attrs):
-        candidate = User.objects.filter(
-            username=attrs.get(self.username_field), is_active=False
-        ).first()
-        if candidate and candidate.check_password(attrs.get('password') or ''):
-            raise exceptions.AuthenticationFailed(
-                'Verify your email address before signing in.',
-                'email_not_verified',
-            )
-
 
 class VerifyEmailSerializer(serializers.Serializer):
     """Confirms an emailed code and activates the account."""
@@ -310,10 +441,16 @@ class VerifyEmailSerializer(serializers.Serializer):
     code = serializers.CharField(max_length=6)
 
     def validate_email(self, value):
-        user = User.objects.filter(email__iexact=value.strip()).first()
+        # `is_active=True` in the lookup, not a separate check: a banned
+        # account is simply not found, so it gets the same answer as an
+        # address nobody uses. Telling it apart would confirm the account
+        # exists, and a ban must not be undoable from out here anyway.
+        user = User.objects.filter(
+            email__iexact=value.strip(), is_active=True
+        ).select_related('profile').first()
         if user is None:
             raise serializers.ValidationError('No account uses that email address.')
-        if user.is_active:
+        if user.profile.email_verified:
             raise serializers.ValidationError('That account is already verified.')
         self.user = user
         return value
@@ -333,10 +470,14 @@ class ResendCodeSerializer(serializers.Serializer):
     email = serializers.EmailField()
 
     def validate_email(self, value):
-        user = User.objects.filter(email__iexact=value.strip()).first()
+        # See the note in VerifyEmailSerializer: a banned account must not be
+        # issued a code, and must not be able to tell that it is banned.
+        user = User.objects.filter(
+            email__iexact=value.strip(), is_active=True
+        ).select_related('profile').first()
         if user is None:
             raise serializers.ValidationError('No account uses that email address.')
-        if user.is_active:
+        if user.profile.email_verified:
             raise serializers.ValidationError('That account is already verified.')
         self.user = user
         return value
@@ -370,6 +511,190 @@ class LogoutSerializer(serializers.Serializer):
         return self.token
 
 
+class ForgotPasswordSerializer(serializers.Serializer):
+    """Emails a password reset link for an account, given its address.
+
+    Always succeeds from the caller's point of view - `save()` silently does
+    nothing when the address has no active account, and the same when the
+    address is over its rate limit - so this endpoint cannot be used to
+    discover which addresses are registered, or that a limit exists at all.
+    The same reasoning LoginSerializer uses for its one error message.
+    """
+
+    email = serializers.EmailField()
+
+    def save(self, **kwargs):
+        email = self.validated_data['email'].strip().lower()
+
+        # Checked - and recorded - on the submitted address itself, before
+        # the account lookup, so the limit applies identically whether or
+        # not that address has an account. Nothing here can be used to tell
+        # those two cases apart from the response.
+        rate_limited = _password_reset_rate_limited(email)
+        _record_password_reset_request(email)
+        if rate_limited:
+            return None
+
+        user = User.objects.filter(email__iexact=email, is_active=True).first()
+        if user is not None:
+            _send_password_reset_email(user)
+        return user
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    """Consumes a reset link's uid/token and sets a new password.
+
+    uid/token come from the query string of the link ForgotPasswordSerializer
+    emailed - see `_send_password_reset_email` below. The token is checked
+    with Django's own `default_token_generator`, so its lifetime is whatever
+    `settings.PASSWORD_RESET_TIMEOUT` says (30 minutes here) with no separate
+    token model or expiry column to keep in sync.
+    """
+
+    uid = serializers.CharField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+    confirm_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+
+    def validate(self, attrs):
+        try:
+            user_id = force_str(urlsafe_base64_decode(attrs['uid']))
+            user = User.objects.get(pk=user_id, is_active=True)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            raise serializers.ValidationError({'uid': 'This reset link is invalid.'})
+
+        # check_token also enforces the expiry, against PASSWORD_RESET_TIMEOUT -
+        # there is nothing here to expire by hand.
+        if not default_token_generator.check_token(user, attrs['token']):
+            raise serializers.ValidationError(
+                {'token': 'This reset link is invalid or has expired.'}
+            )
+
+        if attrs['new_password'] != attrs['confirm_password']:
+            raise serializers.ValidationError(
+                {'confirm_password': 'The two passwords do not match.'}
+            )
+
+        # Called here rather than as a field validator so that
+        # UserAttributeSimilarityValidator has the user to compare against -
+        # a field validator would run before `user` is known.
+        try:
+            validate_password(attrs['new_password'], user=user)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'new_password': exc.messages})
+
+        self.user = user
+        return attrs
+
+    def save(self, **kwargs):
+        self.user.set_password(self.validated_data['new_password'])
+        self.user.save(update_fields=['password'])
+        return self.user
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """Changes the signed-in user's password. Requires the current one."""
+
+    old_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+    new_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+
+    def validate_old_password(self, value):
+        if not self.context['request'].user.check_password(value):
+            raise serializers.ValidationError('Your current password is incorrect.')
+        return value
+
+    def validate_new_password(self, value):
+        try:
+            validate_password(value, user=self.context['request'].user)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.messages)
+        return value
+
+    def validate(self, attrs):
+        if attrs['old_password'] == attrs['new_password']:
+            raise serializers.ValidationError(
+                {'new_password': 'Your new password must be different from your current one.'}
+            )
+        return attrs
+
+    def save(self, **kwargs):
+        user = self.context['request'].user
+        user.set_password(self.validated_data['new_password'])
+        user.save(update_fields=['password'])
+        return user
+
+
+def _send_password_reset_email(user):
+    """Build a dynamic reset link and email it.
+
+    uid is the user's id, base64-encoded the way Django's own password-reset
+    views do it; token is single-use in effect - `check_token` bakes the
+    current password hash into what it verifies, so consuming the link
+    (which calls `set_password`) invalidates it for any second attempt.
+    """
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    reset_url = f'{settings.FRONTEND_URL}/reset-password?uid={uid}&token={token}'
+    minutes = settings.PASSWORD_RESET_TIMEOUT // 60
+
+    try:
+        send_email(
+            to=user.email,
+            subject="Reset your Loopd'n password",
+            html=(
+                f'<p>Tap the link below to set a new password. '
+                f'It expires in {minutes} minutes.</p>'
+                f'<p><a href="{reset_url}">{reset_url}</a></p>'
+                f'<p>If you did not request this, you can ignore this email.</p>'
+            ),
+        )
+    except EmailError:
+        # The provider failed, not the user, and the caller (forgot_password)
+        # must answer identically either way - see ForgotPasswordSerializer -
+        # so there is nothing useful to do with this here but log it.
+        logger.warning('Password reset email to %s could not be sent.', user.email)
+
+
+# --- forgot-password rate limiting ------------------------------------------
+#
+# Same cache-based fixed-window mechanism as otp/services.py's OTP send
+# limits: a cooldown key stops an immediate double-submit, and an hourly
+# counter stops a slow drip that waits the cooldown out each time. Keyed on
+# the submitted email address itself (not a resolved user), which is what
+# lets ForgotPasswordSerializer check - and record - a request the same way
+# whether or not that address has an account.
+
+
+def _password_reset_cache_keys(email):
+    return (
+        f'password_reset:cooldown:{email}',
+        f'password_reset:h:{email}',
+    )
+
+
+def _password_reset_rate_limited(email):
+    cooldown_key, hourly_key = _password_reset_cache_keys(email)
+    if cache.get(cooldown_key) is not None:
+        return True
+    return (cache.get(hourly_key) or 0) >= settings.PASSWORD_RESET_MAX_REQUESTS_PER_HOUR
+
+
+def _record_password_reset_request(email):
+    cooldown_key, hourly_key = _password_reset_cache_keys(email)
+    cache.set(cooldown_key, True, settings.PASSWORD_RESET_COOLDOWN_SECONDS)
+
+    # add() only writes when the key is absent, which is what starts the
+    # window; incr() then bumps it without extending the expiry - same
+    # pattern as otp/services.py's _record_send.
+    cache.add(hourly_key, 0, 3600)
+    try:
+        cache.incr(hourly_key)
+    except ValueError:
+        # Expired between the add and the incr. Losing one tick of the
+        # window is harmless.
+        cache.set(hourly_key, 1, 3600)
+
+
 def _validate_unique_email(value, exclude_user=None):
     """Django's User.email has no unique constraint; this supplies one.
 
@@ -383,3 +708,216 @@ def _validate_unique_email(value, exclude_user=None):
     if taken.exists():
         raise serializers.ValidationError('An account with that email already exists.')
     return value
+
+
+class BlockSerializer(serializers.Serializer):
+    """Who to block, or unblock. Exactly one of the two.
+
+    `user` is a username, resolved the way every other name in this product is
+    resolved. `phone_number` is a bare number - most members of most groups
+    have no account, so a block keyed only on accounts could not name most of
+    the people somebody might want to be rid of.
+
+    Deliberately NOT resolved through `find_user` with a viewer: that function
+    now hides both sides of a block, so passing the viewer would make an
+    already-blocked person unresolvable and `unblock` impossible.
+    """
+
+    username = serializers.CharField(required=False, allow_blank=True)
+    phone_number = serializers.CharField(
+        required=False, allow_blank=True, max_length=16
+    )
+
+    def validate(self, attrs):
+        username = (attrs.get('username') or '').strip()
+        number = (attrs.get('phone_number') or '').strip()
+
+        if bool(username) == bool(number):
+            raise serializers.ValidationError(
+                'Name the person by exactly one of username or phone_number.'
+            )
+
+        viewer = self.context['request'].user
+
+        if number:
+            phone_number_validator(number)
+            attrs['target_user'] = None
+            attrs['target_number'] = number
+            return attrs
+
+        target = active_users().filter(username__iexact=username).first()
+        if target is None:
+            raise serializers.ValidationError('No user found with that username.')
+        if target.pk == viewer.pk:
+            raise serializers.ValidationError('You cannot block yourself.')
+
+        attrs['target_user'] = target
+        attrs['target_number'] = None
+        return attrs
+
+
+class BlockedEntrySerializer(serializers.Serializer):
+    """One row of "people I have blocked", as the blocker sees it.
+
+    Only ever rendered for the blocker themselves - nothing anywhere shows one
+    person that another has blocked them.
+    """
+
+    id = serializers.IntegerField(read_only=True)
+    username = serializers.SerializerMethodField()
+    display_label = serializers.SerializerMethodField()
+    phone_number = serializers.CharField(
+        source='blocked_phone_number', read_only=True
+    )
+    created_at = serializers.DateTimeField(read_only=True)
+
+    def get_username(self, obj):
+        return obj.blocked_user.username if obj.blocked_user_id else None
+
+    def get_display_label(self, obj):
+        if not obj.blocked_user_id:
+            return obj.blocked_phone_number
+        profile = getattr(obj.blocked_user, 'profile', None)
+        return profile.display_label if profile else obj.blocked_user.username
+
+
+# --- settings screens ---------------------------------------------------------
+
+
+class UserSettingsSerializer(serializers.ModelSerializer):
+    """What every settings screen's serializer shares.
+
+    Each screen names its fields rather than using `__all__`, so a column added
+    to a model is not writable over the API until somebody decides it should
+    be. `id`, `user` and `created_at` are never in the payload: the URL already
+    says whose settings these are.
+    """
+
+    class Meta:
+        read_only_fields = ['updated_at']
+
+
+class AppearanceSettingsSerializer(UserSettingsSerializer):
+    """Settings → Appearance."""
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = AppearanceSettings
+        fields = ['theme', 'text_size', 'message_spacing', 'updated_at']
+
+
+class MessagingSettingsSerializer(UserSettingsSerializer):
+    """Settings → Messaging.
+
+    `sms_enabled` is "Send and receive Loop messages by text", the person's
+    own switch for every Loop. A STOP is not in here: it is per group, and
+    lives on that membership. `email_enabled` is writable, and is the same
+    column PATCH /users/me/profile/ writes for the web client that uses it
+    today. The SMS and email opt-out records are records, not settings, and
+    stay out.
+    """
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = MessagingSettings
+        fields = [
+            'sms_enabled',
+            'email_enabled',
+            'enter_to_send',
+            'link_previews_enabled',
+            'updated_at',
+        ]
+
+    def update(self, instance, validated_data):
+        # Both switches go through the model, so turning one off records when
+        # (and for email, why). The generic update below then saves the row.
+        if 'sms_enabled' in validated_data:
+            instance.switch_sms(validated_data.pop('sms_enabled'))
+        if 'email_enabled' in validated_data:
+            instance.switch_email(
+                validated_data.pop('email_enabled'),
+                reason=MessagingSettings.EmailOptOutReason.PERSON,
+            )
+        return super().update(instance, validated_data)
+
+
+class NotificationSettingsSerializer(UserSettingsSerializer):
+    """Settings → Notifications."""
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = NotificationSettings
+        fields = [
+            'messages',
+            'group_messages',
+            'direct_messages',
+            'mentions_replies',
+            'group_invitations',
+            'incoming_calls',
+            'missed_calls',
+            'sms_delivery_failures',
+            'email_delivery_failures',
+            'show_preview',
+            'sound',
+            'updated_at',
+        ]
+
+
+class PrivacySettingsSerializer(UserSettingsSerializer):
+    """Settings → Privacy."""
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = PrivacySettings
+        fields = [
+            'direct_messages_from',
+            'group_adds_from',
+            'discoverable_by_phone',
+            'discoverable_by_email',
+            'read_receipts_enabled',
+            'online_status_visible',
+            'updated_at',
+        ]
+
+
+class SecuritySettingsSerializer(UserSettingsSerializer):
+    """Settings → Security.
+
+    Two-factor is shown but never written here. Turning it on has to prove the
+    phone number or address the codes will go to, and that flow does not exist
+    yet - a switch flipped without it would send sign-in codes to whatever was
+    typed in. Login alerts are plain preferences.
+    """
+
+    class Meta(UserSettingsSerializer.Meta):
+        model = SecuritySettings
+        fields = [
+            'two_factor_enabled',
+            'two_factor_method',
+            'login_alerts_email',
+            'login_alerts_sms',
+            'updated_at',
+        ]
+        read_only_fields = [
+            *UserSettingsSerializer.Meta.read_only_fields,
+            'two_factor_enabled',
+            'two_factor_method',
+        ]
+
+
+# Each screen's name in the URL, and its serializer - which names its model.
+# The one place a screen is added to the API (SettingsApiTests checks it covers
+# every model in user/user_settings.py).
+SETTINGS_SERIALIZERS = {
+    'appearance': AppearanceSettingsSerializer,
+    'messaging': MessagingSettingsSerializer,
+    'notifications': NotificationSettingsSerializer,
+    'privacy': PrivacySettingsSerializer,
+    'security': SecuritySettingsSerializer,
+}
+
+
+class AppInviteSerializer(serializers.Serializer):
+    """An email address to invite to Loopd'n - see `user/invites.py`.
+
+    An address and nothing else. What happens to it depends on whether anybody
+    already has it, and that is not the caller's business to state or to learn.
+    """
+
+    email = serializers.EmailField()

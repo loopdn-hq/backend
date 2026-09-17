@@ -16,9 +16,17 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from otp.models import EmailOtp, OtpError, SmsOtp
+from otp.services import start_email_verification, start_phone_verification
 from otp.utils import default_expiry, generate_code
+from sms.client import SmsError
+from sms.verification import DEV_BYPASS_CODE
 from user.models import Profile
-from utils.sms import DEV_BYPASS_CODE, SmsError
+from utils.mail import (
+    VERIFICATION_CODE,
+    EmailError,
+    send_email,
+    send_templated_email,
+)
 
 
 class GenerateCodeTests(TestCase):
@@ -146,7 +154,7 @@ class PhoneVerificationApiTests(APITestCase):
     """The two endpoints at /api/v1/users/me/phone/.
 
     Telnyx is unconfigured throughout (no TELNYX_API_KEY), which is the path
-    utils.sms takes locally: nothing is sent and DEV_BYPASS_CODE is accepted.
+    sms.verification takes locally: nothing is sent and DEV_BYPASS_CODE is accepted.
     That keeps these tests offline while still exercising every branch this
     project owns - the ceilings, the cooldown, the attempt count and the
     both-fields-in-one-save rule on Profile.
@@ -310,3 +318,237 @@ class PhoneVerificationApiTests(APITestCase):
 
         self.assertFalse(SmsOtp.objects.filter(profile=self.user.profile).exists())
         self.assertEqual(self.request_code().status_code, status.HTTP_200_OK)
+
+
+class TemplatedEmailTests(TestCase):
+    """utils/mail.py: rendering, the catalogue's guarantees, and the transport.
+
+    Nothing here touches the network. With RESEND_API_KEY blank - which is the
+    default, and how CI runs - send_email renders and logs instead of sending,
+    so the rendering half is exercised for real and only the POST is faked.
+    """
+
+    def test_unconfigured_renders_but_sends_nothing(self):
+        with self.assertLogs('utils.mail', level='INFO') as logs:
+            message_id = send_templated_email(
+                VERIFICATION_CODE,
+                to='yul@example.com',
+                context={'code': '123456', 'expires_in_minutes': 10},
+            )
+
+        self.assertIsNone(message_id)
+        # The rendered body reached the log, which is how a developer with no
+        # Resend account gets the code.
+        self.assertIn('123456', '\n'.join(logs.output))
+
+    @override_settings(RESEND_API_KEY='re_test')
+    def test_the_payload_posted_to_resend_has_every_part(self):
+        with mock.patch('utils.mail._post', return_value={'id': 'abc-123'}) as post:
+            message_id = send_templated_email(
+                VERIFICATION_CODE,
+                to='yul@example.com',
+                context={'code': '654321', 'expires_in_minutes': 10},
+            )
+
+        self.assertEqual(message_id, 'abc-123')
+        payload = post.call_args.args[1]
+
+        self.assertEqual(payload['to'], ['yul@example.com'])
+        self.assertEqual(payload['from'], settings.DEFAULT_FROM_EMAIL)
+        self.assertIn('654321', payload['subject'])
+        # Both alternatives: a code-only HTML mail lands in spam far more often.
+        self.assertIn('654321', payload['html'])
+        self.assertIn('654321', payload['text'])
+
+    @override_settings(RESEND_API_KEY='re_test')
+    def test_the_subject_is_collapsed_to_one_line(self):
+        # A newline reaching a Subject header is header injection, and the
+        # template file ends with one whatever the author intended.
+        with mock.patch('utils.mail._post', return_value={'id': 'x'}) as post:
+            send_templated_email(
+                VERIFICATION_CODE,
+                to='yul@example.com',
+                context={'code': '111111', 'expires_in_minutes': 10},
+            )
+
+        subject = post.call_args.args[1]['subject']
+        self.assertNotIn('\n', subject)
+        self.assertEqual(subject, subject.strip())
+
+    def test_a_missing_context_key_is_refused_before_anything_is_sent(self):
+        # The whole point of declaring context_keys: Django renders an unknown
+        # variable as '', so without this the user gets a code-shaped hole.
+        with self.assertRaises(EmailError) as caught:
+            send_templated_email(
+                VERIFICATION_CODE, to='yul@example.com', context={'code': '123456'}
+            )
+
+        self.assertIn('expires_in_minutes', str(caught.exception))
+
+    def test_an_unknown_template_slug_is_refused(self):
+        with self.assertRaises(EmailError):
+            send_templated_email('no_such_email', to='yul@example.com', context={})
+
+    def test_a_slug_from_the_catalogue_resolves_to_its_template(self):
+        # Callers may pass either the object or its slug; both must work, since
+        # the slug is what a Celery task would carry across a queue.
+        with self.assertLogs('utils.mail', level='INFO'):
+            send_templated_email(
+                'verification_code',
+                to='yul@example.com',
+                context={'code': '222222', 'expires_in_minutes': 10},
+            )
+
+    def test_an_address_carrying_a_newline_is_refused(self):
+        with self.assertRaises(EmailError):
+            send_email(
+                'yul@example.com\nBcc: attacker@example.com',
+                subject='hi',
+                html='<p>hi</p>',
+            )
+
+    def test_no_recipient_is_refused(self):
+        with self.assertRaises(EmailError):
+            send_email([], subject='hi', html='<p>hi</p>')
+
+    @override_settings(RESEND_API_KEY='re_test')
+    def test_a_resend_outage_becomes_an_email_error(self):
+        with mock.patch(
+            'utils.mail.urllib.request.urlopen', side_effect=OSError('timed out')
+        ):
+            with self.assertRaises(EmailError):
+                send_email('yul@example.com', subject='hi', html='<p>hi</p>')
+
+    @override_settings(RESEND_API_KEY='re_test')
+    def test_an_explicit_user_agent_is_always_sent(self):
+        # Cloudflare fronts api.resend.com and answers urllib's default
+        # Python-urllib/3.13 with a 403 "error code: 1010" browser ban. Losing
+        # this header breaks every send, and does it with an error that looks
+        # like a Resend problem rather than ours.
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured['headers'] = dict(request.headers)
+            raise OSError('stop here - the headers are what is under test')
+
+        with mock.patch('utils.mail.urllib.request.urlopen', fake_urlopen):
+            with self.assertRaises(EmailError):
+                send_email('yul@example.com', subject='hi', html='<p>hi</p>')
+
+        # urllib capitalises header names.
+        agent = captured['headers'].get('User-agent')
+        self.assertTrue(agent)
+        self.assertNotIn('urllib', agent.lower())
+
+    @override_settings(RESEND_API_KEY='re_test')
+    def test_an_idempotency_key_is_passed_through_as_a_header(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured['headers'] = dict(request.headers)
+            raise OSError('stop here - the headers are what is under test')
+
+        with mock.patch('utils.mail.urllib.request.urlopen', fake_urlopen):
+            with self.assertRaises(EmailError):
+                send_email(
+                    'yul@example.com',
+                    subject='hi',
+                    html='<p>hi</p>',
+                    idempotency_key='otp-42',
+                )
+
+        # urllib capitalises header names.
+        self.assertEqual(captured['headers'].get('Idempotency-key'), 'otp-42')
+
+
+class EmailVerificationDeliveryTests(TestCase):
+    """start_email_verification now actually sends. What that changes."""
+
+    def setUp(self):
+        # The ceilings live in the cache, which is process-wide and would
+        # otherwise leak counts from one test into the next.
+        cache.clear()
+        self.user = User.objects.create_user(
+            username='yul', email='yul@example.com', password='pw-correct-horse',
+            is_active=False,
+        )
+
+    @override_settings(RESEND_API_KEY='re_test')
+    def test_issuing_a_code_sends_that_code(self):
+        with mock.patch('utils.mail._post', return_value={'id': 'abc'}) as post:
+            otp = start_email_verification(self.user)
+
+        payload = post.call_args.args[1]
+        self.assertEqual(payload['to'], ['yul@example.com'])
+        self.assertIn(otp.code, payload['text'])
+
+    @override_settings(RESEND_API_KEY='re_test')
+    def test_a_resend_outage_does_not_hold_the_cooldown(self):
+        # Same bargain as the SMS path: our outage must not lock the user out
+        # for a minute, so the row goes and they can retry at once.
+        with mock.patch('utils.mail._post', side_effect=EmailError('boom')):
+            with self.assertRaises(EmailError):
+                start_email_verification(self.user)
+
+        self.assertFalse(EmailOtp.objects.filter(profile=self.user.profile).exists())
+
+        with mock.patch('utils.mail._post', return_value={'id': 'abc'}):
+            self.assertIsNotNone(start_email_verification(self.user))
+
+    def test_an_account_with_no_email_is_told_to_add_one(self):
+        self.user.email = ''
+        self.user.save(update_fields=['email'])
+
+        with self.assertRaises(OtpError):
+            start_email_verification(self.user)
+
+    @override_settings(OTP_MAX_SENDS_PER_HOUR=2, OTP_RESEND_COOLDOWN=timedelta(seconds=0))
+    def test_the_hourly_ceiling_stops_a_slow_drip(self):
+        # The cooldown is disabled so the only thing under test is the ceiling.
+        # Without this, /resend-code - which is AllowAny and takes only an
+        # address - is a 1,440-a-day mail bomb pointed at any known account.
+        with mock.patch('utils.mail._post', return_value={'id': 'abc'}):
+            start_email_verification(self.user)
+            start_email_verification(self.user)
+            with self.assertRaises(OtpError):
+                start_email_verification(self.user)
+
+    @override_settings(OTP_MAX_SENDS_PER_HOUR=1, OTP_RESEND_COOLDOWN=timedelta(seconds=0))
+    def test_the_ceiling_also_counts_per_address_across_accounts(self):
+        # Harassment rather than fraud: many accounts, one victim's inbox.
+        with mock.patch('utils.mail._post', return_value={'id': 'abc'}):
+            start_email_verification(self.user)
+
+            other = User.objects.create_user(
+                'maya', 'YUL@example.com', 'pw-correct-horse', is_active=False
+            )
+            # Same inbox, different casing - one budget, not two.
+            with self.assertRaises(OtpError):
+                start_email_verification(other)
+
+    @override_settings(
+        RESEND_API_KEY='re_test',
+        OTP_MAX_SENDS_PER_HOUR=1,
+        OTP_RESEND_COOLDOWN=timedelta(seconds=0),
+    )
+    def test_a_failed_send_does_not_spend_the_ceiling(self):
+        # The budget is recorded only after Resend accepts. An outage that
+        # burned quota would let a brief blip lock a user out for an hour.
+        with mock.patch('utils.mail._post', side_effect=EmailError('boom')):
+            with self.assertRaises(EmailError):
+                start_email_verification(self.user)
+
+        with mock.patch('utils.mail._post', return_value={'id': 'abc'}):
+            self.assertIsNotNone(start_email_verification(self.user))
+
+    @override_settings(OTP_MAX_SENDS_PER_HOUR=1, OTP_RESEND_COOLDOWN=timedelta(seconds=0))
+    def test_email_and_sms_budgets_are_separate(self):
+        # Sharing one budget would mean verifying a phone stopped you being
+        # emailed, which is a support ticket nobody could diagnose.
+        with mock.patch('utils.mail._post', return_value={'id': 'abc'}):
+            start_email_verification(self.user)
+
+        self.user.profile.phone_number = '+639171234567'
+        self.user.profile.save(update_fields=['phone_number', 'updated_at'])
+        # Would raise OtpError if the email send above had spent the SMS budget.
+        self.assertIsNotNone(start_phone_verification(self.user))

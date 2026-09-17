@@ -9,8 +9,8 @@ all cheaper to reject now than after we have paid to text it.
 from rest_framework import serializers
 
 from otp.services import start_phone_verification, verify_phone
+from sms.client import is_allowed_destination
 from user.models import Profile, phone_number_validator
-from utils.sms import is_allowed_destination
 
 
 class RequestPhoneCodeSerializer(serializers.Serializer):

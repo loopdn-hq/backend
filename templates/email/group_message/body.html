@@ -1,0 +1,48 @@
+{% extends "email/base.html" %}
+
+{% block title %}New message in {{ group_name }}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 4px; font-size:14px; color:#71717a;">
+  {{ group_name }}
+</p>
+<p style="margin:0 0 8px; font-weight:600;">
+  {{ sender_name }}
+</p>
+{% comment %}
+linebreaks, not linebreaksbr: a message somebody typed has paragraphs in it,
+and every variable here is autoescaped, so what a member wrote cannot become
+markup in everybody else's inbox.
+{% endcomment %}
+<div style="margin:0 0 24px;">{{ body|linebreaks }}</div>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  {% if can_reply %}
+    Reply to this email to respond to the group.
+  {% else %}
+    Open {{ product_name }} to respond to the group.
+  {% endif %}
+</p>
+{% endblock %}
+
+{% comment %}
+The first template to override this block. The footer says three things and
+each one is doing work:
+
+  - which group this is, so "why am I getting this" has an answer;
+  - how to stop it, in words and as a link, because "included in the email
+    always" is the requirement;
+  - that other groups are unaffected - the only place that reaches somebody who
+    pressed their mail client's own Unsubscribe button, since the client never
+    renders our response.
+{% endcomment %}
+{% block footer %}
+You are getting this because you are in {{ group_name }} on {{ product_name }}.<br>
+{% if can_reply %}
+  To stop emails from this group, reply <strong>{{ stop_keyword }}</strong>{% if unsubscribe_url %} or
+  <a href="{{ unsubscribe_url }}" style="color:#71717a;">use this link</a>{% endif %}.<br>
+{% elif unsubscribe_url %}
+  <a href="{{ unsubscribe_url }}" style="color:#71717a;">Stop emails from this group</a>.<br>
+{% endif %}
+Other groups are not affected.<br><br>
+Questions? Reach us at {{ support_address }}.
+{% endblock %}

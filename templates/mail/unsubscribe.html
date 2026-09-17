@@ -1,0 +1,28 @@
+{% extends "mail/_page.html" %}
+
+{% comment %}
+The confirm page. Renders on GET and writes nothing - see mail/views.py for why
+that is load-bearing rather than polite.
+
+`group_name` is empty when the token did not verify. The page still renders, and
+still offers the button, because saying "that link is not valid" would tell
+somebody probing which membership ids exist. Pressing it simply does nothing.
+{% endcomment %}
+
+{% block title %}Stop emails{% if group_name %} from {{ group_name }}{% endif %}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 8px; font-size:20px; font-weight:600;">
+  {% if group_name %}Stop emails from {{ group_name }}?{% else %}Stop these emails?{% endif %}
+</p>
+<p style="margin:0 0 24px; color:#52525b;">
+  You will still see every message in {{ product_name }}, and your other groups
+  are not affected.
+</p>
+<form method="post" action="">
+  <button type="submit"
+          style="display:inline-block; background-color:#0284c7; color:#ffffff; border:0; border-radius:8px; padding:12px 24px; font-size:16px; font-weight:600; font-family:inherit; cursor:pointer;">
+    {% if group_name %}Stop emails from {{ group_name }}{% else %}Stop these emails{% endif %}
+  </button>
+</form>
+{% endblock %}

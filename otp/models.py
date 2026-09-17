@@ -78,7 +78,7 @@ class BaseOtp(models.Model):
         `extra_defaults` is for fields a channel adds to the base row. SmsOtp
         uses it to record which number the code went to, and to blank `code`:
         under the Telnyx Verify API the provider holds the code, so there is
-        nothing local to store. See utils/sms.py.
+        nothing local to store. See sms/verification.py.
         """
         existing = cls.objects.filter(profile=profile).first()
         if existing and existing.seconds_until_resend > 0:
