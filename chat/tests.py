@@ -836,6 +836,45 @@ class ChatWebsocketTests(TransactionTestCase):
             headers=self.HEADERS,
         )
 
+    async def test_a_socket_marks_them_online_and_closing_it_marks_them_off(self):
+        from user import presence
+        from user.models import Profile
+
+        await database_sync_to_async(cache.clear)()
+
+        communicator = self.connect_as(self.bob)
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        online = await database_sync_to_async(
+            lambda: presence.is_online(Profile.objects.get(user=self.bob))
+        )()
+        self.assertTrue(online)
+
+        await communicator.disconnect()
+
+        still_online = await database_sync_to_async(
+            lambda: presence.is_online(Profile.objects.get(user=self.bob))
+        )()
+        self.assertFalse(still_online)
+
+    async def test_the_other_members_socket_hears_them_arrive(self):
+        await database_sync_to_async(cache.clear)()
+
+        watching = self.connect_as(self.alice)
+        await watching.connect()
+
+        arriving = self.connect_as(self.bob)
+        await arriving.connect()
+
+        frame = await watching.receive_json_from(timeout=3)
+        self.assertEqual(frame['type'], 'presence')
+        self.assertEqual(frame['user_id'], self.bob.pk)
+        self.assertTrue(frame['online'])
+
+        await arriving.disconnect()
+        await watching.disconnect()
+
     async def test_a_notification_reaches_the_socket(self):
         """The half that is easy to leave out and hard to notice.
 
@@ -5595,6 +5634,54 @@ class GroupAddPrivacyTests(EnvelopeAssertions, APITestCase):
 
         self.assertIsNone(group._claim_phone_participant(mom))
         self.assertFalse(group.has_participant(mom))
+
+
+class PresencePrivacyTests(EnvelopeAssertions, APITestCase):
+    """What other members are shown about who is online."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+
+    def bob_as_alice_sees_him(self):
+        self.client.force_authenticate(self.alice)
+        for row in members_of(self.client, self.group.id):
+            if (row.get('user') or {}).get('username') == 'bob':
+                return row['user']['profile']
+        return None
+
+    def test_an_open_socket_shows_as_online(self):
+        from user import presence
+
+        presence.connected(self.bob)
+
+        self.assertTrue(self.bob_as_alice_sees_him()['is_online'])
+
+    def test_with_online_status_off_they_always_read_offline(self):
+        from user import presence
+
+        presence.connected(self.bob)
+        set_privacy(self.bob, online_status_visible=False)
+
+        profile = self.bob_as_alice_sees_him()
+        self.assertFalse(profile['is_online'])
+        self.assertIsNone(profile['last_seen_at'])
+
+    def test_presence_nobody_refreshed_reads_offline(self):
+        from datetime import timedelta
+
+        from user import presence
+        from user.models import Profile
+
+        presence.connected(self.bob)
+        Profile.objects.filter(user=self.bob).update(
+            last_seen_at=timezone.now() - presence.STALE_AFTER - timedelta(seconds=1)
+        )
+
+        self.assertFalse(self.bob_as_alice_sees_him()['is_online'])
 
 
 class ReadReceiptPrivacyTests(EnvelopeAssertions, APITestCase):

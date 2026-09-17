@@ -66,9 +66,19 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
         await self.accept()
 
+        # After accepting, because it writes and broadcasts: a handshake must
+        # not wait on presence, and a broadcast before `accept` would reach
+        # everybody else before this socket could hear its own.
+        await self.announce_presence(online=True)
+
     async def disconnect(self, code):
         for group in list(getattr(self, 'subscribed', ())):
             await self.channel_layer.group_discard(group, self.channel_name)
+
+        # Only for a socket that got as far as being authenticated - a refused
+        # handshake has no user and never counted as a connection.
+        if getattr(self, 'user', None) is not None:
+            await self.announce_presence(online=False)
 
     async def subscribe(self, group):
         await self.channel_layer.group_add(group, self.channel_name)
@@ -80,6 +90,9 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         handlers = {
             'message.send': self.handle_message_send,
             'typing': self.handle_typing,
+            # The client says it is still here. Presence expires without this,
+            # so a tab somebody left open all afternoon keeps its dot.
+            'ping': self.handle_ping,
         }
         handler = handlers.get(content.get('type'))
         if handler is None:
@@ -158,6 +171,15 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
             mentions=content.get('mentions'),
             mention_everyone=bool(content.get('mention_everyone')),
         )
+
+    async def handle_ping(self, content):
+        """Keep this person's presence fresh, and say so.
+
+        The reply is what lets a client notice a socket that is open but dead -
+        a connection can survive a laptop sleeping and deliver nothing.
+        """
+        await self.beat()
+        await self.send_json({'type': 'pong'})
 
     async def handle_typing(self, content):
         conversation = await self.get_conversation(content.get('conversation_id'))
@@ -303,6 +325,24 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
             }
         )
 
+    async def presence(self, event):
+        """Somebody in this conversation came online, or went offline.
+
+        Their own sockets are not told: a client knows whether it is connected,
+        and its own dot is not news.
+        """
+        if event['user_id'] == self.user.pk:
+            return
+
+        await self.send_json(
+            {
+                'type': 'presence',
+                'user_id': event['user_id'],
+                'online': event['online'],
+                'last_seen_at': event['last_seen_at'],
+            }
+        )
+
     async def conversation_read_by(self, event):
         """Somebody else in this conversation has read up to a message.
 
@@ -339,6 +379,36 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         )
 
     # -- database ---------------------------------------------------------
+
+    @database_sync_to_async
+    def presence_change(self, *, online):
+        """Record this socket opening or closing, and say who to tell.
+
+        Returns `(groups, payload)`, empty when nothing changed - a second
+        device arriving is not news - or when they hide their online status.
+        The sending is done by the caller, in async code: doing it here would
+        deadlock, for the reason `user/presence.py:frames` gives.
+        """
+        from user import presence
+
+        changed = (
+            presence.connected(self.user) if online
+            else presence.disconnected(self.user)
+        )
+        if not changed:
+            return [], None
+        return presence.frames(self.user, online=online)
+
+    async def announce_presence(self, *, online):
+        groups, payload = await self.presence_change(online=online)
+        for group in groups:
+            await self.channel_layer.group_send(group, payload)
+
+    @database_sync_to_async
+    def beat(self):
+        from user import presence
+
+        presence.beat(self.user)
 
     @database_sync_to_async
     def sees_read_receipts(self):

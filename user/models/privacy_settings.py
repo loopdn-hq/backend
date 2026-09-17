@@ -125,9 +125,12 @@ class PrivacySettings(UserSettings):
     # "Online status"
     #   On  - other members see a green dot while the person is online, and
     #         when they were last seen once they are not.
-    #   Off - other members are shown neither.
-    # Today: THE ONLY ONE NOT ENFORCED, because there is nothing to hide yet:
-    # nothing ever sets `Profile.is_online` or `last_seen_at`, so everybody
-    # reads as offline. When presence is built, this is one check in
-    # `PublicProfileSerializer` plus whatever broadcasts it.
+    #   Off - other members are shown neither: the dot reads offline and the
+    #         time is withheld, and no presence frame is broadcast for them at
+    #         all. They still see their own - that is a fact about nobody else.
+    # Not the mirror of read receipts: seeing a dot costs nobody anything, so
+    # hiding yours does not blind you to other people's.
+    # Today: real. `user/presence.py` sets `Profile.is_online` from the
+    # websocket, and this is asked in `PublicProfileSerializer` for a fetch and
+    # in `presence.broadcast` for the live frame.
     online_status_visible = models.BooleanField(default=True, db_default=True)

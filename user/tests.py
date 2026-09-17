@@ -2092,6 +2092,79 @@ class SmsSwitchMigrationTests(TransactionTestCase):
         self.assertTrue(NewSettings.objects.get(user_id=untouched.pk).sms_enabled)
 
 
+class PresenceTests(TestCase):
+    """Online while the app holds a socket, and stale presence reads offline."""
+
+    def setUp(self):
+        # The socket counter lives in the cache, which is per-process in tests.
+        cache.clear()
+        self.user = User.objects.create_user(username='presence', password='x')
+
+    def profile(self):
+        return Profile.objects.get(user=self.user)
+
+    def stale(self):
+        from user import presence
+
+        Profile.objects.filter(user=self.user).update(
+            last_seen_at=timezone.now() - presence.STALE_AFTER - timedelta(seconds=1)
+        )
+
+    def test_the_first_socket_marks_them_online(self):
+        from user import presence
+
+        self.assertTrue(presence.connected(self.user))
+        self.assertTrue(presence.is_online(self.profile()))
+
+    def test_a_second_device_is_not_news(self):
+        from user import presence
+
+        presence.connected(self.user)
+
+        self.assertFalse(presence.connected(self.user))
+
+    def test_only_the_last_socket_closing_takes_them_offline(self):
+        from user import presence
+
+        presence.connected(self.user)
+        presence.connected(self.user)
+
+        self.assertFalse(presence.disconnected(self.user))
+        self.assertTrue(presence.is_online(self.profile()))
+
+        self.assertTrue(presence.disconnected(self.user))
+        self.assertFalse(self.profile().is_online)
+
+    def test_presence_with_no_recent_beat_reads_offline(self):
+        # A worker that dies never runs disconnect; nothing may stay online.
+        from user import presence
+
+        presence.connected(self.user)
+        self.stale()
+
+        self.assertFalse(presence.is_online(self.profile()))
+
+    def test_a_beat_refreshes_it_and_then_throttles(self):
+        from user import presence
+
+        presence.connected(self.user)
+        self.stale()
+
+        self.assertTrue(presence.beat(self.user))
+        self.assertTrue(presence.is_online(self.profile()))
+        # Every socket of every signed-in person beats; one write each is plenty.
+        self.assertFalse(presence.beat(self.user))
+
+    def test_nobody_is_told_about_somebody_who_hides_their_status(self):
+        from user import presence
+
+        row = PrivacySettings.for_user(self.user)
+        row.online_status_visible = False
+        row.save(update_fields=['online_status_visible'])
+
+        self.assertEqual(presence.frames(self.user, online=True), ([], None))
+
+
 class DiscoverabilityTests(TestCase):
     """Settings → Privacy → Find me using my phone number / my email.
 

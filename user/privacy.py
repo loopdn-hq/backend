@@ -126,6 +126,23 @@ def discoverable_by(field):
     )
 
 
+def shows_online_status(user):
+    """Whether this person's online state and "last seen" may be shown.
+
+    Off means both are withheld from everybody else - the dot and the time -
+    and no presence frame is broadcast for them at all. They still see their
+    own, which is not a fact about anybody but themselves.
+
+    Not the mirror of `shows_read_receipts`: seeing a dot costs nobody
+    anything, so hiding yours does not blind you to other people's.
+    """
+    from user.models import PrivacySettings
+
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return False
+    return PrivacySettings.of(user).online_status_visible
+
+
 def shows_read_receipts(user):
     """Whether this person's read positions may be shown to other people.
 
