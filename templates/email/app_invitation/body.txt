@@ -1,0 +1,15 @@
+{{ inviter_name }} tried to start a conversation with you on {{ product_name }},
+and there is no account on this email address yet.
+
+{{ product_name }} is where groups talk - in the app, by text and by email.
+To let {{ inviter_name }} reach you, create an account with this address:
+
+{{ signup_url }}
+
+Nothing here is a password or a key, so forwarding it gives nobody access, and
+nobody can message you until you sign up and confirm this address.
+
+If you were not expecting this, you can ignore it. Nothing has been shared with
+you, and you are not in any conversation.
+
+Questions? Reach us at {{ support_address }}.

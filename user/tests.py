@@ -2092,6 +2092,79 @@ class SmsSwitchMigrationTests(TransactionTestCase):
         self.assertTrue(NewSettings.objects.get(user_id=untouched.pk).sms_enabled)
 
 
+class PresenceTests(TestCase):
+    """Online while the app holds a socket, and stale presence reads offline."""
+
+    def setUp(self):
+        # The socket counter lives in the cache, which is per-process in tests.
+        cache.clear()
+        self.user = User.objects.create_user(username='presence', password='x')
+
+    def profile(self):
+        return Profile.objects.get(user=self.user)
+
+    def stale(self):
+        from user import presence
+
+        Profile.objects.filter(user=self.user).update(
+            last_seen_at=timezone.now() - presence.STALE_AFTER - timedelta(seconds=1)
+        )
+
+    def test_the_first_socket_marks_them_online(self):
+        from user import presence
+
+        self.assertTrue(presence.connected(self.user))
+        self.assertTrue(presence.is_online(self.profile()))
+
+    def test_a_second_device_is_not_news(self):
+        from user import presence
+
+        presence.connected(self.user)
+
+        self.assertFalse(presence.connected(self.user))
+
+    def test_only_the_last_socket_closing_takes_them_offline(self):
+        from user import presence
+
+        presence.connected(self.user)
+        presence.connected(self.user)
+
+        self.assertFalse(presence.disconnected(self.user))
+        self.assertTrue(presence.is_online(self.profile()))
+
+        self.assertTrue(presence.disconnected(self.user))
+        self.assertFalse(self.profile().is_online)
+
+    def test_presence_with_no_recent_beat_reads_offline(self):
+        # A worker that dies never runs disconnect; nothing may stay online.
+        from user import presence
+
+        presence.connected(self.user)
+        self.stale()
+
+        self.assertFalse(presence.is_online(self.profile()))
+
+    def test_a_beat_refreshes_it_and_then_throttles(self):
+        from user import presence
+
+        presence.connected(self.user)
+        self.stale()
+
+        self.assertTrue(presence.beat(self.user))
+        self.assertTrue(presence.is_online(self.profile()))
+        # Every socket of every signed-in person beats; one write each is plenty.
+        self.assertFalse(presence.beat(self.user))
+
+    def test_nobody_is_told_about_somebody_who_hides_their_status(self):
+        from user import presence
+
+        row = PrivacySettings.for_user(self.user)
+        row.online_status_visible = False
+        row.save(update_fields=['online_status_visible'])
+
+        self.assertEqual(presence.frames(self.user, online=True), ([], None))
+
+
 class DiscoverabilityTests(TestCase):
     """Settings → Privacy → Find me using my phone number / my email.
 
@@ -2160,3 +2233,126 @@ class DiscoverabilityTests(TestCase):
             self.hidden,
         )
 
+
+class AppInviteTests(EnvelopeAssertions, APITestCase):
+    """POST /users/invite/ - inviting somebody who has no account yet."""
+
+    def setUp(self):
+        # The per-inviter cap lives in the cache, which is shared between tests.
+        cache.clear()
+        self.alice = User.objects.create_user(
+            username='alice', password='a-strong-passphrase-42',
+            email='alice@example.com',
+        )
+        self.alice.profile.display_name = 'Alice G'
+        self.alice.profile.save(update_fields=['display_name'])
+        self.client.force_authenticate(self.alice)
+
+    def url(self):
+        return reverse('user:invite-list')
+
+    def invite(self, email='nobody@example.com'):
+        """One invitation, with the mail layer held still."""
+        with mock.patch('user.invites.send_templated_email') as send:
+            response = self.client.post(self.url(), {'email': email})
+        return response, send
+
+    def account(self, **privacy):
+        """Somebody who IS here, with a verified address and a privacy row."""
+        bob = User.objects.create_user(
+            username='bob', password='x', email='bob@example.com',
+        )
+        bob.profile.email_verified = True
+        bob.profile.save(update_fields=['email_verified'])
+
+        row = PrivacySettings.for_user(bob)
+        for name, value in privacy.items():
+            setattr(row, name, value)
+        row.save()
+        return bob
+
+    def test_an_address_nobody_has_is_emailed_a_link(self):
+        response, send = self.invite('stranger@example.com')
+
+        self.assertEqual(self.assertSuccess(response)['outcome'], 'sent')
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.kwargs['to'], 'stranger@example.com')
+
+        context = send.call_args.kwargs['context']
+        self.assertEqual(context['inviter_name'], 'Alice G')
+        # Carries them to the form with their own address in it. Not a
+        # credential: confirming the address is what makes them reachable.
+        self.assertIn('/signup?email=stranger%40example.com', context['signup_url'])
+
+    def test_the_invitation_email_itself_renders(self):
+        # Every other test here holds the mail layer still, so none of them
+        # would notice a missing template file, or a variable the templates use
+        # and nobody passes. Both only raise on a real send.
+        with mock.patch('utils.mail._is_configured', return_value=True), \
+                mock.patch('utils.mail._post', return_value={'id': 'x'}) as post:
+            response = self.client.post(
+                self.url(), {'email': 'stranger@example.com'}
+            )
+
+        self.assertSuccess(response)
+        payload = post.call_args.args[1]
+        self.assertIn('Alice G', payload['subject'])
+        for part in ('html', 'text'):
+            self.assertIn('/signup?email=stranger%40example.com', payload[part])
+
+    def test_somebody_who_is_already_here_is_not_invited(self):
+        self.account()
+
+        response, send = self.invite('bob@example.com')
+
+        self.assertEqual(self.assertSuccess(response)['outcome'], 'already_here')
+        send.assert_not_called()
+
+    def test_a_hidden_address_is_answered_exactly_like_an_unknown_one(self):
+        # Settings -> Privacy -> "Find me using my email". Any other answer
+        # would make this endpoint the lookup that switch refuses.
+        self.account(discoverable_by_email=False)
+
+        hidden, send = self.invite('bob@example.com')
+        unknown, _ = self.invite('stranger@example.com')
+
+        self.assertEqual(hidden.status_code, unknown.status_code)
+        self.assertEqual(hidden.json(), unknown.json())
+        send.assert_not_called()
+
+    def test_a_block_is_answered_the_same_way_and_sends_nothing(self):
+        from user import blocks
+
+        bob = self.account()
+        blocks.block(bob, user=self.alice)
+
+        response, send = self.invite('bob@example.com')
+
+        self.assertEqual(self.assertSuccess(response)['outcome'], 'sent')
+        send.assert_not_called()
+
+    def test_the_cap_counts_attempts_and_stops_a_flood(self):
+        from user import invites
+
+        for number in range(invites.INVITES_PER_HOUR):
+            response, _ = self.invite(f'stranger{number}@example.com')
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response, send = self.invite('one-too-many@example.com')
+
+        self.assertFailure(response, status.HTTP_429_TOO_MANY_REQUESTS)
+        send.assert_not_called()
+
+    def test_it_needs_an_address(self):
+        response, send = self.invite('not-an-address')
+
+        self.assertFailure(response, status.HTTP_400_BAD_REQUEST)
+        send.assert_not_called()
+
+    def test_it_needs_a_signed_in_account(self):
+        self.client.force_authenticate(None)
+
+        response, send = self.invite()
+
+        self.assertFailure(response, status.HTTP_401_UNAUTHORIZED)
+        send.assert_not_called()

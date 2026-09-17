@@ -93,9 +93,13 @@ class Profile(models.Model):
     bio = models.CharField(max_length=280, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
 
-    # Presence, for the conversation list. `is_online` is the live flag the
-    # websocket layer will flip; `last_seen_at` is what to show once it is
-    # False. Whether OTHER people may see it is PrivacySettings.online_status_visible.
+    # Presence, for the conversation list. `is_online` is flipped by the
+    # websocket layer - the first socket on, the last one off - and
+    # `last_seen_at` is both what to show once it is False and the beat that
+    # keeps it honest: `user/presence.py` disbelieves a flag whose beat has
+    # gone stale, so a crashed worker cannot leave somebody online. Read it
+    # through `presence.is_online`, never the column alone. Whether OTHER
+    # people may see it is PrivacySettings.online_status_visible.
     is_online = models.BooleanField(default=False)
     last_seen_at = models.DateTimeField(null=True, blank=True)
 

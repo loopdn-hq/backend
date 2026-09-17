@@ -150,6 +150,29 @@ class PublicProfileSerializer(ProfileSerializer):
         fields = ['display_label', 'avatar_url', 'bio', 'is_online', 'last_seen_at']
         read_only_fields = fields
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        from user import presence, privacy
+
+        viewer = getattr(self.context.get('request'), 'user', None)
+        their_own = (
+            viewer is not None
+            and getattr(viewer, 'pk', None) is not None
+            and viewer.pk == instance.user_id
+        )
+
+        # Settings → Privacy → Online status. Withheld rather than falsified
+        # for the viewer's own row: somebody looking at themselves is not
+        # being told about anybody.
+        if not their_own and not privacy.shows_online_status(instance.user):
+            data['is_online'] = False
+            data['last_seen_at'] = None
+            return data
+
+        # The flag is only as good as the beat behind it - see user/presence.py.
+        data['is_online'] = presence.is_online(instance)
+        return data
+
 
 class UserSerializer(serializers.ModelSerializer):
     """The signed-in user, and the target of PATCH /api/users/me/."""
@@ -888,3 +911,13 @@ SETTINGS_SERIALIZERS = {
     'privacy': PrivacySettingsSerializer,
     'security': SecuritySettingsSerializer,
 }
+
+
+class AppInviteSerializer(serializers.Serializer):
+    """An email address to invite to Loopd'n - see `user/invites.py`.
+
+    An address and nothing else. What happens to it depends on whether anybody
+    already has it, and that is not the caller's business to state or to learn.
+    """
+
+    email = serializers.EmailField()

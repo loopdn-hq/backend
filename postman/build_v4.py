@@ -271,6 +271,24 @@ ME = [
         )),
     req('Get a user by id', 'GET', '/api/v1/users/{{user_id}}/',
         desc='Public view of another account. Never includes email or phone number.'),
+    req('Invite somebody who is not here', 'POST', '/api/v1/users/invite/',
+        body={'email': 'stranger@example.com'},
+        desc=(
+            "Email an invitation to Loopd'n. For the New conversation box: a "
+            'direct conversation is a pair of ACCOUNTS, so an address nobody '
+            'has cannot be messaged.\n\n'
+            '**The answer never says whether the address has an account.** '
+            '`outcome` is `sent` both for an address nobody has and for one '
+            'whose owner turned "Find me using my email" off, or who is on '
+            'either side of a block - and in those two cases nothing is '
+            'emailed. Any other answer would make this the lookup that Privacy '
+            'refuses. `already_here` is the one plain answer, and it says no '
+            'more than opening the conversation would.\n\n'
+            'Capped per account per hour, counting ATTEMPTS rather than sends, '
+            'then 429. **Email only** - every number the product owns belongs '
+            'to one Loop, so there is nothing to text a stranger from; the web '
+            'app offers a link to send by hand instead.'
+        )),
 ]
 
 PHONE = [
