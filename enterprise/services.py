@@ -389,10 +389,29 @@ def _idempotency_key(*parts, bucket_seconds):
 
 
 def generate_contract_number():
+    """The next `ENT-<year>-<6 digits>` number for this year's prefix.
+
+    Derived from the highest existing suffix, not `count()` of matching rows -
+    a row count assumes numbers are always contiguous from 1, which breaks as
+    soon as one is missing (a deleted test contract, a cleaned-up record): the
+    count no longer matches the highest number in use, so it can regenerate an
+    already-taken number. Worse, `_create_contract`'s retry-on-IntegrityError
+    loop calls this again unchanged on every attempt, so a stale count means
+    every retry collides on the identical number and the whole loop is wasted.
+    Zero-padded to a fixed width, so ordering by the string sorts the same as
+    ordering by the number - no need to pull every row and parse it in Python.
+    """
     year = timezone.now().year
     prefix = f'ENT-{year}-'
-    count = EnterpriseContract.objects.filter(contract_number__startswith=prefix).count()
-    return f'{prefix}{count + 1:06d}'
+    last_number = (
+        EnterpriseContract.objects
+        .filter(contract_number__startswith=prefix)
+        .order_by('-contract_number')
+        .values_list('contract_number', flat=True)
+        .first()
+    )
+    next_suffix = int(last_number[len(prefix):]) + 1 if last_number else 1
+    return f'{prefix}{next_suffix:06d}'
 
 
 @transaction.atomic
@@ -426,7 +445,7 @@ def _create_contract(*, draft, user, catalog, configuration, pricing, line_items
     raise RuntimeError('Could not allocate a unique Enterprise contract number.')
 
 
-def _create_stripe_checkout_session(*, user, contract, customer_id, pricing, line_items,
+def _create_stripe_checkout_session(*, user, contract, draft_id, customer_id, pricing, line_items,
                                      success_url, cancel_url):
     interval_unit, interval_count = STRIPE_INTERVAL_BY_MONTHS[pricing['period_months']]
     stripe_line_items = [
@@ -456,7 +475,14 @@ def _create_stripe_checkout_session(*, user, contract, customer_id, pricing, lin
             'contract_number': contract.contract_number,
             'draft_id': contract.draft.draft_id,
         },
-        idempotency_key=_idempotency_key('enterprise-checkout', contract.pk, bucket_seconds=300),
+        # Keyed on the draft, not `contract.pk` - `_create_contract` mints a
+        # fresh contract (and so a fresh pk) on every call, including a
+        # genuine retry of this same checkout, so a pk-based key could never
+        # actually land a retry on the earlier Stripe request. `draft_id` is
+        # the stable, pre-existing identity of "this configuration, being
+        # checked out" - same reasoning as `create_plan_checkout_session`
+        # keying on `(user.pk, plan.code)` in billing/services.py.
+        idempotency_key=_idempotency_key('enterprise-checkout', draft_id, bucket_seconds=300),
     )
 
     if pricing['discount_percent'] > 0:
@@ -464,7 +490,7 @@ def _create_stripe_checkout_session(*, user, contract, customer_id, pricing, lin
             percent_off=pricing['discount_percent'],
             duration='forever',
             name=f"{pricing['billing_interval'].title()} plan discount",
-            idempotency_key=_idempotency_key('enterprise-coupon', contract.pk, bucket_seconds=300),
+            idempotency_key=_idempotency_key('enterprise-coupon', draft_id, bucket_seconds=300),
         )
         session_kwargs['discounts'] = [{'coupon': coupon['id']}]
 
@@ -498,7 +524,8 @@ def checkout_draft(draft, user, *, success_url, cancel_url):
 
     customer_id = billing_services.get_or_create_stripe_customer(user)
     session = _create_stripe_checkout_session(
-        user=user, contract=contract, customer_id=customer_id, pricing=pricing, line_items=line_items,
+        user=user, contract=contract, draft_id=draft.draft_id, customer_id=customer_id,
+        pricing=pricing, line_items=line_items,
         success_url=success_url, cancel_url=cancel_url,
     )
 
