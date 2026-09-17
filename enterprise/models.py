@@ -195,10 +195,10 @@ class EnterpriseStripeBilling(models.Model):
     contract = models.OneToOneField(
         EnterpriseContract, on_delete=models.CASCADE, related_name='stripe_billing',
     )
-    stripe_customer_id = models.CharField(max_length=64)
-    stripe_subscription_id = models.CharField(max_length=64, null=True, blank=True)
-    stripe_invoice_id = models.CharField(max_length=64, null=True, blank=True)
-    stripe_checkout_session_id = models.CharField(max_length=64, null=True, blank=True)
+    stripe_customer_id = models.CharField(max_length=255)
+    stripe_subscription_id = models.CharField(max_length=255, null=True, blank=True)
+    stripe_invoice_id = models.CharField(max_length=255, null=True, blank=True)
+    stripe_checkout_session_id = models.CharField(max_length=255, null=True, blank=True)
     status = models.CharField(max_length=32, blank=True, default='')
 
     class Meta:
