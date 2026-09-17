@@ -129,6 +129,15 @@ GROUP_INVITATION = EmailTemplate(
     context_keys=('group_name', 'inviter_name', 'join_url'),
 )
 
+# Somebody tried to start a conversation with an address that has no account.
+# The link is a convenience and not a credential, for the same reason as the
+# invitation above: signing up and confirming the address is what makes them
+# reachable.
+APP_INVITATION = EmailTemplate(
+    slug='app_invitation',
+    context_keys=('inviter_name', 'signup_url'),
+)
+
 # One message posted in a group, delivered to a member who takes part by
 # email. Unlike everything else here this is not transactional mail about the
 # account - it is the conversation itself, which is why it carries a reply
@@ -175,6 +184,7 @@ CATALOGUE = {
     for template in (
         VERIFICATION_CODE,
         GROUP_INVITATION,
+        APP_INVITATION,
         GROUP_MESSAGE,
         UNSUBSCRIBED,
         BILLING_CHECKOUT_SUCCESS,

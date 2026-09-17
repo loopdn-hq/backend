@@ -1,0 +1,29 @@
+{% extends "email/base.html" %}
+
+{% block title %}{{ inviter_name }} wants to reach you on {{ product_name }}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">
+  <strong>{{ inviter_name }}</strong> tried to start a conversation with you on
+  {{ product_name }}, and there is no account on this email address yet.
+</p>
+<p style="margin:0 0 24px;">
+  {{ product_name }} is where groups talk &mdash; in the app, by text and by
+  email. To let {{ inviter_name }} reach you, create an account with this
+  address.
+</p>
+<p style="margin:0 0 24px;">
+  <a href="{{ signup_url }}"
+     style="display:inline-block; background-color:#0284c7; color:#ffffff; text-decoration:none; font-weight:600; padding:12px 24px; border-radius:8px;">
+    Create an account
+  </a>
+</p>
+<p style="margin:0 0 16px; font-size:14px; color:#52525b;">
+  Nothing here is a password or a key, so forwarding it gives nobody access,
+  and nobody can message you until you sign up and confirm this address.
+</p>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  If you were not expecting this, you can ignore it. Nothing has been shared
+  with you, and you are not in any conversation.
+</p>
+{% endblock %}

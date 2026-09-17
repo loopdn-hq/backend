@@ -911,3 +911,13 @@ SETTINGS_SERIALIZERS = {
     'privacy': PrivacySettingsSerializer,
     'security': SecuritySettingsSerializer,
 }
+
+
+class AppInviteSerializer(serializers.Serializer):
+    """An email address to invite to Loopd'n - see `user/invites.py`.
+
+    An address and nothing else. What happens to it depends on whether anybody
+    already has it, and that is not the caller's business to state or to learn.
+    """
+
+    email = serializers.EmailField()
