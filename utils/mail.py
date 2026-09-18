@@ -164,6 +164,20 @@ UNSUBSCRIBED = EmailTemplate(
     context_keys=('group_name', 'app_url'),
 )
 
+# The link that lets somebody back into an account they cannot sign in to.
+# `expires_in_minutes` is declared rather than hardcoded in the template
+# because PASSWORD_RESET_TIMEOUT is the thing that decides it, and a template
+# saying thirty while the setting says ten is worse than no number at all.
+PASSWORD_RESET = EmailTemplate(
+    slug='password_reset',
+    context_keys=('reset_url', 'expires_in_minutes'),
+)
+
+# Sent AFTER the fact, on both routes a password moves by - the reset link and
+# the signed-in change. It is the only way somebody finds out about a reset
+# they did not ask for, since by then there is nothing left to refuse.
+PASSWORD_CHANGED = EmailTemplate(slug='password_changed')
+
 # Sent after Stripe confirms a plan checkout or credit top-up checkout.
 BILLING_CHECKOUT_SUCCESS = EmailTemplate(
     slug='billing_checkout_success',
@@ -187,6 +201,8 @@ CATALOGUE = {
         APP_INVITATION,
         GROUP_MESSAGE,
         UNSUBSCRIBED,
+        PASSWORD_RESET,
+        PASSWORD_CHANGED,
         BILLING_CHECKOUT_SUCCESS,
     )
 }

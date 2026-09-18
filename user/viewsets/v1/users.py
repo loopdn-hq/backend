@@ -57,6 +57,10 @@ from user.serializers import (
     UserSerializer,
     VerifyEmailSerializer,
 )
+from user.throttles import (
+    PasswordResetConfirmThrottle,
+    PasswordResetRequestThrottle,
+)
 from user.user_settings import ensure_settings
 from utils.mail import EmailError
 
@@ -350,6 +354,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         url_path='forgot-password',
         url_name='forgot-password',
         permission_classes=[AllowAny],
+        throttle_classes=[PasswordResetRequestThrottle],
     )
     def forgot_password(self, request):
         """Email a password reset link, if the address has an account.
@@ -369,6 +374,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         url_path='reset-password',
         url_name='reset-password',
         permission_classes=[AllowAny],
+        throttle_classes=[PasswordResetConfirmThrottle],
     )
     def reset_password(self, request):
         """Consume a reset link's uid/token and set a new password."""

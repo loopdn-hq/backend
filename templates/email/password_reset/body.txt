@@ -1,0 +1,20 @@
+{% comment %}
+Autoescape off for the whole file: this is the PLAIN-TEXT part, so there is no
+HTML for an entity to be decoded by. Escaped, the reset link arrives reading
+`?uid=NDU&amp;token=...` and the person who copies it out loses the token -
+the one thing the email exists to deliver.
+{% endcomment %}{% autoescape off %}{{ product_name }}
+
+Somebody asked to reset the password on the {{ product_name }} account for
+this address. Open this link to choose a new one:
+
+{{ reset_url }}
+
+The link expires in {{ expires_in_minutes }} minutes and works once. If it has
+already expired, ask for another from the sign-in page.
+
+If you did not ask for this, you can ignore this email - your password has not
+changed, and nobody can use this link without opening it here.
+
+Questions? Reach us at {{ support_address }}.
+{% endautoescape %}

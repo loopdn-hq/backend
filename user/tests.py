@@ -4,6 +4,7 @@ Each test asserts the envelope (`code` 1 or -1) as well as the payload,
 because the envelope is the contract the client actually codes against.
 """
 import io
+import re
 import shutil
 import tempfile
 from datetime import timedelta
@@ -19,6 +20,8 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -2356,3 +2359,373 @@ class AppInviteTests(EnvelopeAssertions, APITestCase):
 
         self.assertFailure(response, status.HTTP_401_UNAUTHORIZED)
         send.assert_not_called()
+
+
+@override_settings(REQUIRE_EMAIL_VERIFICATION=False, RESEND_API_KEY='re_test')
+class PasswordResetTests(EnvelopeAssertions, APITestCase):
+    """forgot-password -> emailed link -> reset-password.
+
+    `utils.mail._post` is patched at the HTTP boundary - the same place
+    verification mail is patched - so the templates really render and the link
+    is really built, rather than being mocked out a layer above where a broken
+    URL would still pass.
+
+    The cache is cleared in setUp because two separate limits live there and
+    both would otherwise leak between tests: the per-email window in
+    `user/serializers.py` and the per-IP throttles in `user/throttles.py`.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.password = 'sup3r-secret-pw'
+        self.user = User.objects.create_user(
+            username='yul', email='yul@example.com', password=self.password
+        )
+        self.user.profile.email_verified = True
+        self.user.profile.save(update_fields=['email_verified'])
+
+    def tearDown(self):
+        cache.clear()
+
+    # -- helpers ------------------------------------------------------------
+
+    def forgot(self, email='yul@example.com'):
+        """POST forgot-password, returning (response, the patched sender)."""
+        with patch('utils.mail._post', return_value={'id': 'abc'}) as post:
+            response = self.client.post(
+                reverse('user:user-forgot-password'), {'email': email}
+            )
+        return response, post
+
+    def link_parts(self, post):
+        """Pull uid and token back out of the email that was actually sent.
+
+        From the PLAIN-TEXT part, not the HTML: the HTML one is correctly
+        escaped to `&amp;token=`, while the text part has to carry the raw URL
+        or the person copying it loses the token. Reading the text part is
+        therefore also a guard on that - if autoescaping creeps back into
+        body.txt, this stops matching.
+        """
+        text = post.call_args_list[0].args[1]['text']
+        match = re.search(r'/reset-password/\?uid=(\S+?)&token=(\S+)', text)
+        self.assertIsNotNone(match, text)
+        return match.group(1), match.group(2)
+
+    def request_link(self):
+        response, post = self.forgot()
+        self.assertSuccess(response)
+        return self.link_parts(post)
+
+    def reset(self, uid, token, new_password='an0ther-secret-pw', confirm=None):
+        """POST reset-password.
+
+        The sender is patched here rather than by each caller - with
+        RESEND_API_KEY set on the class, an unpatched `_post` would try a real
+        HTTP request - and left on `self.reset_mail` for the tests that care
+        what the notice said.
+        """
+        with patch('utils.mail._post', return_value={'id': 'abc'}) as post:
+            self.reset_mail = post
+            return self.client.post(
+                reverse('user:user-reset-password'),
+                {
+                    'uid': uid,
+                    'token': token,
+                    'new_password': new_password,
+                    'confirm_password': new_password if confirm is None else confirm,
+                },
+            )
+
+    # -- requesting a link --------------------------------------------------
+
+    def test_a_registered_address_is_emailed_a_link(self):
+        response, post = self.forgot()
+
+        self.assertSuccess(response)
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[1]['to'], ['yul@example.com'])
+
+    def test_the_link_carries_the_trailing_slash_the_export_needs(self):
+        _, post = self.forgot()
+
+        html = post.call_args.args[1]['html']
+        self.assertIn(f'{settings.FRONTEND_URL}/reset-password/?uid=', html)
+
+    def test_an_address_is_matched_whatever_its_case(self):
+        response, post = self.forgot('YUL@Example.com')
+
+        self.assertSuccess(response)
+        post.assert_called_once()
+
+    def test_an_unknown_address_answers_identically_and_sends_nothing(self):
+        known, _ = self.forgot()
+        unknown, post = self.forgot('nobody@example.com')
+
+        self.assertEqual(unknown.status_code, known.status_code)
+        self.assertEqual(unknown.json(), known.json())
+        post.assert_not_called()
+
+    def test_a_deactivated_account_cannot_reset_its_way_back_in(self):
+        self.user.is_active = False
+        self.user.save(update_fields=['is_active'])
+
+        response, post = self.forgot()
+
+        self.assertSuccess(response)
+        post.assert_not_called()
+
+    def test_a_provider_failure_is_not_revealed_to_the_caller(self):
+        with patch(
+            'utils.mail._post',
+            side_effect=EmailError('boom'),
+        ):
+            response = self.client.post(
+                reverse('user:user-forgot-password'), {'email': 'yul@example.com'}
+            )
+
+        self.assertSuccess(response)
+
+    # -- the per-email limit ------------------------------------------------
+
+    def test_a_second_request_inside_the_cooldown_sends_nothing(self):
+        self.forgot()
+        response, post = self.forgot()
+
+        self.assertSuccess(response)
+        post.assert_not_called()
+
+    @override_settings(PASSWORD_RESET_COOLDOWN_SECONDS=0)
+    def test_the_hourly_ceiling_stops_a_drip_that_waits_the_cooldown_out(self):
+        for _ in range(settings.PASSWORD_RESET_MAX_REQUESTS_PER_HOUR):
+            self.assertSuccess(self.forgot()[0])
+
+        response, post = self.forgot()
+
+        self.assertSuccess(response)
+        post.assert_not_called()
+
+    @override_settings(PASSWORD_RESET_COOLDOWN_SECONDS=0)
+    def test_the_limit_is_per_address_not_global(self):
+        other = User.objects.create_user(
+            username='ada', email='ada@example.com', password=self.password
+        )
+        other.profile.email_verified = True
+        other.profile.save(update_fields=['email_verified'])
+
+        for _ in range(settings.PASSWORD_RESET_MAX_REQUESTS_PER_HOUR):
+            self.forgot()
+
+        response, post = self.forgot('ada@example.com')
+
+        self.assertSuccess(response)
+        post.assert_called_once()
+
+    # -- the per-IP ceiling -------------------------------------------------
+
+    @override_settings(PASSWORD_RESET_COOLDOWN_SECONDS=0)
+    def test_walking_a_list_of_addresses_hits_the_per_ip_ceiling(self):
+        """The per-email limit gives every address its own budget, so this is
+        the only thing standing between an attacker and an unbounded probe."""
+        rate = settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']
+        allowed = int(rate['password_reset_request'].split('/')[0])
+
+        for i in range(allowed):
+            self.assertSuccess(self.forgot(f'probe{i}@example.com')[0])
+
+        response, _ = self.forgot('probe-one-too-many@example.com')
+
+        self.assertFailure(response, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_the_confirm_endpoint_is_bounded_too(self):
+        rate = settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']
+        allowed = int(rate['password_reset_confirm'].split('/')[0])
+
+        for _ in range(allowed):
+            self.reset('bad-uid', 'bad-token')
+
+        response = self.reset('bad-uid', 'bad-token')
+
+        self.assertFailure(response, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    # -- consuming the link -------------------------------------------------
+
+    def test_the_link_sets_a_new_password(self):
+        uid, token = self.request_link()
+
+        self.assertSuccess(self.reset(uid, token))
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('an0ther-secret-pw'))
+
+    def test_the_new_password_logs_in_and_the_old_one_does_not(self):
+        uid, token = self.request_link()
+        self.reset(uid, token)
+
+        self.assertSuccess(
+            self.client.post(
+                reverse('user:user-login'),
+                {'username': 'yul', 'password': 'an0ther-secret-pw'},
+            )
+        )
+        self.assertFailure(
+            self.client.post(
+                reverse('user:user-login'),
+                {'username': 'yul', 'password': self.password},
+            ),
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+    def test_a_link_cannot_be_used_twice(self):
+        uid, token = self.request_link()
+        self.assertSuccess(self.reset(uid, token))
+
+        second = self.reset(uid, token, new_password='third-secret-pw-99')
+
+        self.assertIn('token', self.assertFailure(second)['data'])
+
+    # Negative, not zero: Django checks `elapsed > PASSWORD_RESET_TIMEOUT`, so
+    # a zero timeout still admits a token made in the same second.
+    @override_settings(PASSWORD_RESET_TIMEOUT=-1)
+    def test_an_expired_link_is_refused(self):
+        uid, token = self.request_link()
+
+        self.assertIn('token', self.assertFailure(self.reset(uid, token))['data'])
+
+    def test_a_tampered_uid_is_refused(self):
+        _, token = self.request_link()
+
+        self.assertIn('uid', self.assertFailure(self.reset('not-base64', token))['data'])
+
+    def test_a_token_from_one_account_does_not_open_another(self):
+        other = User.objects.create_user(
+            username='ada', email='ada@example.com', password=self.password
+        )
+        uid, token = self.request_link()
+        other_uid = urlsafe_base64_encode(force_bytes(other.pk))
+
+        self.assertIn('token', self.assertFailure(self.reset(other_uid, token))['data'])
+
+    def test_mismatched_confirmation_is_refused(self):
+        uid, token = self.request_link()
+
+        response = self.reset(uid, token, confirm='something-else-entirely')
+
+        self.assertIn('confirm_password', self.assertFailure(response)['data'])
+
+    def test_a_weak_password_is_refused(self):
+        uid, token = self.request_link()
+
+        response = self.reset(uid, token, new_password='123')
+
+        self.assertIn('new_password', self.assertFailure(response)['data'])
+
+    def test_a_password_like_the_username_is_refused(self):
+        """validate_password is handed the user, so similarity is checked."""
+        uid, token = self.request_link()
+
+        response = self.reset(uid, token, new_password='yul@example.com')
+
+        self.assertIn('new_password', self.assertFailure(response)['data'])
+
+    # -- what a reset does to sessions --------------------------------------
+
+    def test_a_reset_ends_every_session_the_account_had(self):
+        """The point of the whole flow when somebody else is already inside."""
+        refresh = self.assertSuccess(
+            self.client.post(
+                reverse('user:user-login'),
+                {'username': 'yul', 'password': self.password},
+            )
+        )['tokens']['refresh']
+
+        uid, token = self.request_link()
+        self.assertSuccess(self.reset(uid, token))
+
+        self.assertFailure(
+            self.client.post(
+                reverse('user:user-token-refresh'), {'refresh': refresh}
+            ),
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+    def test_a_change_leaves_the_caller_signed_in(self):
+        """Unlike a reset: this caller proved they know the old password."""
+        tokens = self.assertSuccess(
+            self.client.post(
+                reverse('user:user-login'),
+                {'username': 'yul', 'password': self.password},
+            )
+        )
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'Bearer {tokens["tokens"]["access"]}'
+        )
+
+        with patch('utils.mail._post', return_value={'id': 'abc'}):
+            self.assertSuccess(
+                self.client.post(
+                    reverse('user:user-change-password'),
+                    {
+                        'old_password': self.password,
+                        'new_password': 'an0ther-secret-pw',
+                        'confirm_password': 'an0ther-secret-pw',
+                    },
+                )
+            )
+
+        self.assertSuccess(
+            self.client.post(
+                reverse('user:user-token-refresh'),
+                {'refresh': tokens['tokens']['refresh']},
+            )
+        )
+
+    # -- telling the owner --------------------------------------------------
+
+    def test_a_reset_tells_the_account_it_happened(self):
+        uid, token = self.request_link()
+
+        self.assertSuccess(self.reset(uid, token))
+
+        self.reset_mail.assert_called_once()
+        payload = self.reset_mail.call_args.args[1]
+        self.assertEqual(payload['to'], ['yul@example.com'])
+        self.assertIn('changed', payload['subject'].lower())
+
+    def test_a_change_tells_the_account_too(self):
+        tokens = self.assertSuccess(
+            self.client.post(
+                reverse('user:user-login'),
+                {'username': 'yul', 'password': self.password},
+            )
+        )
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'Bearer {tokens["tokens"]["access"]}'
+        )
+
+        with patch('utils.mail._post', return_value={'id': 'abc'}) as post:
+            self.assertSuccess(
+                self.client.post(
+                    reverse('user:user-change-password'),
+                    {
+                        'old_password': self.password,
+                        'new_password': 'an0ther-secret-pw',
+                        'confirm_password': 'an0ther-secret-pw',
+                    },
+                )
+            )
+
+        post.assert_called_once()
+        self.assertIn('changed', post.call_args.args[1]['subject'].lower())
+
+    def test_a_failed_notice_does_not_fail_the_reset(self):
+        """The password has already changed by then; a 500 would be a lie."""
+        uid, token = self.request_link()
+
+        with patch(
+            'utils.mail._post',
+            side_effect=EmailError('boom'),
+        ):
+            self.assertSuccess(self.reset(uid, token))
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('an0ther-secret-pw'))

@@ -1,0 +1,20 @@
+{% extends "email/base.html" %}
+
+{% block title %}Your {{ product_name }} password was changed{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 24px;">
+  The password on your {{ product_name }} account was just changed.
+</p>
+<p style="margin:0 0 24px;">
+  If that was you, there is nothing to do.
+</p>
+<p style="margin:0 0 16px; font-size:14px; color:#52525b;">
+  If it was not, somebody else may have access to this address or to your
+  account. Reset the password straight away from the sign-in page, and if you
+  cannot get in, reply to this email so we can help.
+</p>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  Resetting a password also signs out every device that was already signed in.
+</p>
+{% endblock %}
