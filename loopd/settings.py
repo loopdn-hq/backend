@@ -351,10 +351,12 @@ EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 # Resend dashboard or the API rejects the send with a 403.
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'no-reply@loopdn.com')
 
-# Transactional email (password reset today) goes through Resend's HTTP API -
-# see utils/email.py. Unset in development: send_email() then logs instead of
-# calling out, the same convention utils/sms.py uses for Telnyx, so the flow
-# works with no account and no network.
+# Every email the product sends goes through Resend's HTTP API - see
+# utils/mail.py, which is the ONE transport: verification codes, invitations,
+# group messages, password reset, billing receipts. Unset in development:
+# send_email() then renders the message and logs it instead of calling out,
+# the same convention utils/sms.py uses for Telnyx, so every flow works with
+# no account and no network.
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 
 # Short on purpose, same reasoning as SMS_REQUEST_TIMEOUT: this call sits
@@ -778,6 +780,11 @@ REST_FRAMEWORK = {
         'billing_checkout': '10/hour',
         'billing_portal': '20/hour',
         'enterprise_checkout': '10/hour',
+        # Per-IP ceilings on the password reset endpoints - user/throttles.py
+        # explains why these exist alongside the per-email limits below, which
+        # bound a single address rather than a walk through many.
+        'password_reset_request': '20/hour',
+        'password_reset_confirm': '20/hour',
     },
 }
 
