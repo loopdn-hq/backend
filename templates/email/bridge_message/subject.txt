@@ -1,0 +1,3 @@
+{% comment %}
+Stable per bridge so clients thread it, for the same reason group_message's is.
+{% endcomment %}{{ sender_name }} on {{ product_name }}

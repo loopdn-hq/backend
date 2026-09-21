@@ -37,7 +37,13 @@ from mail import commands
 from mail.models import EmailDelivery
 from mail.tokens import reply_address, unsubscribe_url
 from user.models import MessagingSettings
-from utils.mail import GROUP_MESSAGE, EmailError, send_templated_email
+from utils.mail import (
+    BRIDGE_CONSENT,
+    BRIDGE_MESSAGE,
+    GROUP_MESSAGE,
+    EmailError,
+    send_templated_email,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +62,31 @@ def from_header(conversation):
     without this one group's name would silently break every email it ever
     sent, permanently and for everybody in it.
     """
-    name = ' '.join((conversation.name or '').split())
+    name = ' '.join((_conversation_label(conversation) or '').split())
     label = f'{name} via {settings.EMAIL_PRODUCT_NAME}'
     return formataddr((label, settings.DEFAULT_FROM_EMAIL))
+
+
+def _conversation_label(conversation):
+    """The name in front of the From address: a group's, or a person's.
+
+    An external one-to-one has no name of its own - it is one person writing to
+    one address - so the label is the sender's. `created_by` is that person by
+    construction: an external thread is opened by one account and nobody else
+    can be added to it.
+
+    This is the half of "its own template and its own product decision" that
+    lives in the header. Without it the From line read " via Loopd", which is
+    the bug that made direct conversations undeliverable in the first place.
+    """
+    if not conversation.is_external_direct:
+        return conversation.name
+
+    owner = conversation.created_by
+    profile = getattr(owner, 'profile', None)
+    if profile is not None:
+        return profile.display_label
+    return getattr(owner, 'username', '') or settings.EMAIL_PRODUCT_NAME
 
 
 def list_id_for(conversation):
@@ -83,7 +111,11 @@ def list_id_for(conversation):
     newlines. The id form is machine-stable and has no injection surface.
     """
     domain = (settings.DEFAULT_FROM_EMAIL or '').rpartition('@')[2] or 'loopdn.com'
-    return f'<group-{conversation.pk}.lists.{domain}>'
+    # A different prefix for an external thread, so a client that scopes its
+    # own unsubscribe control by list scopes it to this one conversation and
+    # not to every group the same address also receives.
+    prefix = 'bridge' if conversation.is_external_direct else 'group'
+    return f'<{prefix}-{conversation.pk}.lists.{domain}>'
 
 
 def body_for(message):
@@ -98,9 +130,13 @@ def body_for(message):
 
 
 def address_for(participant):
-    """The address to mail for this member, or None."""
+    """The address to mail for this member, or None.
+
+    A row with no account carries its own address, and that is now a real
+    destination rather than a placeholder - see `_address_reason`.
+    """
     if participant.user_id is None:
-        return None
+        return (participant.email or '').strip().lower() or None
     return (participant.user.email or '').strip() or None
 
 
@@ -148,11 +184,25 @@ def _address_reason(participant):
     chat.delivery before this is reached.
     """
     if participant.user_id is None:
-        # A phone row, or an invitation to an address nobody has claimed yet.
-        # An unclaimed invitation is answered by verifying it, and until that
-        # happens they are in no group they can see - so there is nothing to
-        # send them about it.
-        return 'no verified address'
+        # An address-only row. This used to refuse outright, on the grounds
+        # that an unclaimed invitation is answered by verifying it - but that
+        # made email a channel only for people who already had accounts, which
+        # is the opposite of what a channel is for.
+        #
+        # THE GATE IS CONSENT, AND IT IS NOT HERE. chat.delivery has already
+        # refused every row whose consent is not OPTED_IN, one rung above this
+        # one, and the only thing that writes OPTED_IN for a row with no
+        # account is a YES replied to a consent request and vouched for by the
+        # receiving server. So an invitation nobody has answered is still
+        # refused - by the rung that is actually about agreement.
+        #
+        # Checked here rather than by also asking what kind of conversation
+        # this is: `retry_refusal` calls this with a participant and nothing
+        # else, and `participant.conversation` is not select_related on the
+        # fan-out path, so asking would cost a query per recipient.
+        #
+        # A phone-only row still has nothing to write to.
+        return None if participant.email else 'no verified address'
 
     profile = getattr(participant.user, 'profile', None)
     if profile is None or not MessagingSettings.of(participant.user).email_enabled:
@@ -277,6 +327,45 @@ def retry_delivery(delivery_row):
     return record.status == EmailDelivery.Status.SENT
 
 
+def _template_and_context(message, participant, body, reply_to, stop_url):
+    """Which email this is, and what it needs. One decision, in one place.
+
+    THE CHOICE IS THE CONSENT STATE, NOT THE CALLER. A retry is the reason: if
+    the first contact fails and the sweep picks it up an hour later, asking the
+    state again re-sends it as a consent request rather than as a bare message
+    to somebody who still has not agreed to receive one. A caller passing the
+    template in would have to remember that, and one day would not.
+
+    An external thread's first email carries the sender's message AND the
+    question, which is Yul's call (2026-09-19): a stranger who can see what
+    they are being asked about is far likelier to answer than one who cannot.
+    Everything else about it is unchanged - one email, one ask, a way out in
+    the footer.
+    """
+    common = {
+        'sender_name': message.sender_label,
+        'body': body,
+        # False on a deployment with no inbound email, so the template does not
+        # invite a reply that would land nowhere.
+        'can_reply': bool(reply_to),
+        # The way out, in every single message. None when no public API URL is
+        # configured, which the templates branch on - and which mail/checks.py
+        # refuses to let a real deployment do.
+        'unsubscribe_url': stop_url,
+        'stop_keyword': commands.KEYWORD,
+    }
+
+    if not message.conversation.is_external_direct:
+        return GROUP_MESSAGE, {
+            'group_name': message.conversation.name, **common
+        }
+
+    consent = delivery.consent_for(participant, ChannelConsent.Channel.EMAIL)
+    if consent is not None and consent.allows_delivery:
+        return BRIDGE_MESSAGE, common
+    return BRIDGE_CONSENT, common
+
+
 def _deliver(record, message, participant, sender, body):
     """One provider call for one row, and the outcome written on the row.
 
@@ -289,23 +378,15 @@ def _deliver(record, message, participant, sender, body):
     reply_to = reply_address(participant)
     stop_url = unsubscribe_url(participant)
 
+    template, context = _template_and_context(
+        message, participant, body, reply_to, stop_url
+    )
+
     try:
         message_id = send_templated_email(
-            GROUP_MESSAGE,
+            template,
             to=address,
-            context={
-                'group_name': message.conversation.name,
-                'sender_name': message.sender_label,
-                'body': body,
-                # False on a deployment with no inbound email, so the template
-                # does not invite a reply that would land nowhere.
-                'can_reply': bool(reply_to),
-                # The way out, in every single message. None when no public API
-                # URL is configured, which the templates branch on - and which
-                # mail/checks.py refuses to let a real deployment do.
-                'unsubscribe_url': stop_url,
-                'stop_keyword': commands.KEYWORD,
-            },
+            context=context,
             from_email=sender,
             reply_to=reply_to,
             # RFC 3834. It tells the recipient's mail system that a human did
@@ -333,6 +414,14 @@ def _deliver(record, message, participant, sender, body):
             'provider rejected the message' if exc.permanent else 'provider unavailable',
         )
         return record
+
+    if template is BRIDGE_CONSENT:
+        # Stamped on the way out rather than when the email was composed: this
+        # is what decides whether a first attempt that never arrived may be
+        # asked again, and a send that failed must not count as having asked.
+        from chat.membership import record_consent_asked
+
+        record_consent_asked(participant, context.get('body', ''))
 
     record.status = EmailDelivery.Status.SENT
     record.reason = ''

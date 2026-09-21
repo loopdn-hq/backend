@@ -13,6 +13,9 @@ from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth.tokens import default_token_generator
 from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
+# Aliased: this module already has several `validate_email` serializer methods,
+# and an unaliased import would read like one of them.
+from django.core.validators import validate_email as validate_email_address
 from django.db import transaction
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
@@ -795,22 +798,42 @@ class BlockSerializer(serializers.Serializer):
     phone_number = serializers.CharField(
         required=False, allow_blank=True, max_length=16
     )
+    email = serializers.CharField(required=False, allow_blank=True, max_length=254)
 
     def validate(self, attrs):
         username = (attrs.get('username') or '').strip()
         number = (attrs.get('phone_number') or '').strip()
+        address = (attrs.get('email') or '').strip().lower()
 
-        if bool(username) == bool(number):
+        if len([value for value in (username, number, address) if value]) != 1:
             raise serializers.ValidationError(
-                'Name the person by exactly one of username or phone_number.'
+                'Name the person by exactly one of username, phone_number or email.'
             )
 
         viewer = self.context['request'].user
+
+        if address:
+            # NOT resolved through `find_user`, for the reason the module
+            # docstring gives for usernames and one more: resolving would make
+            # this endpoint answer "does this address have an account", which
+            # is the lookup `user/invites.py` exists to refuse. An address is
+            # blocked as an address, whoever may or may not be behind it.
+            try:
+                validate_email_address(address)
+            except DjangoValidationError:
+                raise serializers.ValidationError('That is not an email address.')
+            if address == (viewer.email or '').strip().lower():
+                raise serializers.ValidationError('You cannot block yourself.')
+            attrs['target_user'] = None
+            attrs['target_number'] = None
+            attrs['target_email'] = address
+            return attrs
 
         if number:
             phone_number_validator(number)
             attrs['target_user'] = None
             attrs['target_number'] = number
+            attrs['target_email'] = None
             return attrs
 
         target = active_users().filter(username__iexact=username).first()
@@ -821,6 +844,7 @@ class BlockSerializer(serializers.Serializer):
 
         attrs['target_user'] = target
         attrs['target_number'] = None
+        attrs['target_email'] = None
         return attrs
 
 
@@ -837,6 +861,7 @@ class BlockedEntrySerializer(serializers.Serializer):
     phone_number = serializers.CharField(
         source='blocked_phone_number', read_only=True
     )
+    email = serializers.CharField(source='blocked_email', read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
 
     def get_username(self, obj):
@@ -844,7 +869,7 @@ class BlockedEntrySerializer(serializers.Serializer):
 
     def get_display_label(self, obj):
         if not obj.blocked_user_id:
-            return obj.blocked_phone_number
+            return obj.blocked_phone_number or obj.blocked_email
         profile = getattr(obj.blocked_user, 'profile', None)
         return profile.display_label if profile else obj.blocked_user.username
 

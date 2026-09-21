@@ -1,0 +1,12 @@
+{% autoescape off %}{{ sender_name }}:
+
+{{ body }}
+
+{% if can_reply %}Reply to this email to respond.{% else %}Open {{ product_name }} to respond.{% endif %}
+
+-- 
+You are getting this because you agreed to receive messages from
+{{ sender_name }} on {{ product_name }}.
+{% if can_reply %}To stop, reply: {{ stop_keyword }}
+{% endif %}{% if unsubscribe_url %}{% if can_reply %}Or use this link{% else %}To stop, use this link{% endif %}: {{ unsubscribe_url }}
+{% endif %}{% endautoescape %}

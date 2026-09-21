@@ -1,0 +1,9 @@
+{% autoescape off %}You're all set. Just reply to these emails to keep talking to
+{{ sender_name }} - they will see your replies on {{ product_name }}.
+
+You still do not need an account. Everything happens here, in your inbox.
+
+-- 
+To stop these emails at any time, reply: {{ stop_keyword }}
+{% if unsubscribe_url %}Or use this link: {{ unsubscribe_url }}
+{% endif %}{% endautoescape %}

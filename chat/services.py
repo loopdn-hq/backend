@@ -10,6 +10,7 @@ from django.db import IntegrityError, transaction
 
 from chat.models import (
     Attachment,
+    ChannelConsent,
     Conversation,
     Message,
     Participant,
@@ -55,7 +56,8 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     message whose `sender` and `sender_participant` disagree would render one
     name in the app and credit a different one in the SMS fan-out.
     """
-    _refuse_if_blocked(conversation, sender)
+    _refuse_if_blocked(conversation, sender, participant)
+    _refuse_if_awaiting_consent(conversation, sender)
 
     if participant is None and sender is not None:
         # Explicit queryset, and explicitly ACTIVE: a message is credited to a
@@ -187,7 +189,7 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     return message
 
 
-def _refuse_if_blocked(conversation, sender):
+def _refuse_if_blocked(conversation, sender, participant=None):
     """A direct conversation between blocked people takes no new messages.
 
     Read-only rather than gone. The thread stays in both lists, with its
@@ -206,8 +208,22 @@ def _refuse_if_blocked(conversation, sender):
     something indistinguishable from any other refusal, because §2 of the spec
     forbids revealing that a block exists - and both come back as the same 403,
     so the status code cannot be read as an answer either.
+
+    AN EXTERNAL THREAD IS THE SAME QUESTION, ASKED OF AN ADDRESS. One side has
+    no account, so `blocks_between` has nothing to compare; `blocks_email` is
+    the one-directional form, and which direction is being asked decides which
+    sentence comes back. Handled below rather than skipped, because this is the
+    single write path and an inbound reply arrives here with `sender=None` -
+    the branch above it would let a blocked address post.
     """
-    if conversation.kind != Conversation.Kind.DIRECT or sender is None:
+    if conversation.kind != Conversation.Kind.DIRECT:
+        return
+
+    if conversation.is_external_direct:
+        _refuse_if_external_blocked(conversation, sender, participant)
+        return
+
+    if sender is None:
         return
 
     other = (
@@ -225,6 +241,86 @@ def _refuse_if_blocked(conversation, sender):
         return
 
     if has_blocked(sender, other.user):
+        raise PostingNotAllowed(
+            'You blocked this person. Unblock them to send a message.'
+        )
+    raise PostingNotAllowed('Unable to send message.')
+
+
+def _refuse_if_awaiting_consent(conversation, sender):
+    """One message to an address, until they say whether they want more.
+
+    The first message goes out inside the consent request; everything after it
+    waits. This refuses the second one OUTRIGHT rather than storing it, and the
+    difference matters: a stored-but-unsent message produces a SKIPPED delivery
+    row that nothing will ever release, so the sender sees a message in their
+    thread that the recipient will never receive. Failing here is the only
+    version where nothing is silently lost.
+
+    Applies to the account holder only. A reply arriving FROM the address is
+    how consent gets answered in the first place, and `mail/inbound.py` decides
+    what to do with it long before this.
+    """
+    if sender is None or not conversation.is_external_direct:
+        return
+
+    from chat.membership import consent_status
+
+    participant = (
+        Participant.objects.filter(conversation=conversation, user__isnull=True)
+        .only('id')
+        .first()
+    )
+    if participant is None:
+        return
+
+    answer = consent_status(participant, ChannelConsent.Channel.EMAIL)
+    if answer != ChannelConsent.Status.PENDING:
+        return
+
+    if Message.objects.filter(conversation=conversation).exists():
+        raise PostingNotAllowed(
+            'Waiting for them to accept email messages. '
+            'You can send again once they reply.'
+        )
+
+
+def _refuse_if_external_blocked(conversation, sender, participant):
+    """The same rule where the far side is an address, not an account.
+
+    Only the account holder can hold a block here, so there is one block to
+    look for and two ways of arriving at it:
+
+        the account writing    they blocked the address - told plainly
+        the address writing    the account blocked them - told nothing, the
+                               same sentence any other refusal gives
+
+    The account is `conversation.created_by`: an external thread is opened by
+    one person and nobody else can be added to it.
+    """
+    from user.blocks import blocks_email
+
+    owner = conversation.created_by
+    if owner is None:
+        return
+
+    address = None
+    if sender is None:
+        # An inbound reply. The address is on the row it was credited to.
+        address = getattr(participant, 'email', None)
+    elif sender.pk == owner.pk:
+        address = (
+            Participant.objects.filter(
+                conversation=conversation, user__isnull=True
+            )
+            .values_list('email', flat=True)
+            .first()
+        )
+
+    if not address or not blocks_email(owner, address):
+        return
+
+    if sender is not None:
         raise PostingNotAllowed(
             'You blocked this person. Unblock them to send a message.'
         )

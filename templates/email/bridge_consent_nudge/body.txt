@@ -1,0 +1,12 @@
+{% autoescape off %}We didn't catch that.
+
+Reply with just the word YES to carry on your conversation with
+{{ sender_name }} by email, or NO to stop.
+
+Anything else will not reach {{ sender_name }} until you have answered. This is
+the only reminder we will send.
+
+-- 
+Reply NO{% if unsubscribe_url %} or use this link: {{ unsubscribe_url }}{% endif %}
+and we will not email you about this conversation again.
+{% endautoescape %}

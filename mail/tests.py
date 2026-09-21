@@ -23,6 +23,8 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from datetime import timedelta
 
+from django.core.cache import cache
+from django.db import transaction
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from django.urls import reverse
@@ -30,13 +32,16 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from chat import delivery, membership
+from chat.membership import set_channel_consent
 from chat.models import (
     Attachment,
     ChannelConsent,
     Conversation,
     Message,
     Participant,
+    PostingNotAllowed,
 )
+from notification.models import Notification
 from chat.services import create_message
 from mail import (
     authentication,
@@ -2379,3 +2384,289 @@ class EmailFailureAlertTests(TestCase):
         self.announce()
 
         self.assertEqual(self.alerts().count(), 1)
+
+
+@override_settings(
+    MAIL_SENDING_ENABLED=True,
+    MAIL_REPLY_DOMAIN=REPLY_DOMAIN,
+    MAIL_PUBLIC_API_URL=API_URL,
+)
+class BridgeConsentTests(TransactionTestCase):
+    """The handshake with somebody who has no account.
+
+    `TransactionTestCase` because the fan-out runs from `transaction.on_commit`
+    and a plain TestCase never commits - the same reason `WiredUpTests` is one.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.yul = make_user('yul')
+        self.address = 'stewart@gmail.com'
+
+    def tearDown(self):
+        cache.clear()
+
+    # -- helpers ------------------------------------------------------------
+
+    def open_bridge(self, text='Are we still playing tomorrow?'):
+        """First contact: the conversation, the message, and the one email."""
+        conversation, _ = Conversation.start_direct_external(self.yul, self.address)
+        self.row = Participant.objects.get(
+            conversation=conversation, user__isnull=True
+        )
+        with capture_sent() as sent:
+            with transaction.atomic():
+                create_message(
+                    conversation=conversation, sender=self.yul, text=text
+                )
+        self.conversation = conversation
+        return sent
+
+    def consent(self):
+        return ChannelConsent.objects.get(
+            participant=self.row, channel=ChannelConsent.Channel.EMAIL
+        )
+
+    def reply(self, body, sender=None, headers=None):
+        with capture_sent() as sent:
+            result = inbound.handle_inbound(
+                reply_address(self.row),
+                sender or self.address,
+                body,
+                headers=authenticated('gmail.com') if headers is None else headers,
+            )
+        self.last_sent = sent
+        return result
+
+    # -- first contact ------------------------------------------------------
+
+    def test_first_contact_is_one_email_carrying_the_message(self):
+        sent = self.open_bridge()
+
+        self.assertEqual(len(sent), 1, sent)
+        self.assertEqual(sent[0]['to'], [self.address])
+        self.assertIn('still playing tomorrow', sent[0]['text'])
+        self.assertIn('YES', sent[0]['text'])
+
+    def test_it_starts_pending_and_stamps_what_was_asked(self):
+        self.open_bridge()
+
+        self.assertEqual(self.consent().status, ChannelConsent.Status.PENDING)
+        self.row.refresh_from_db()
+        self.assertIsNotNone(self.row.consent_sent_at)
+        self.assertIn('still playing', self.row.consent_text)
+
+    def test_the_from_line_names_the_sender_not_a_blank_group(self):
+        sent = self.open_bridge()
+
+        self.assertIn('yul via', sent[0]['from'].lower())
+        self.assertNotIn(' via', sent[0]['from'].split('yul')[0].strip() or 'x')
+
+    def test_the_list_id_is_scoped_to_this_thread(self):
+        sent = self.open_bridge()
+
+        self.assertIn(f'<bridge-{self.conversation.pk}.', sent[0]['headers']['List-ID'])
+
+    def test_a_second_message_before_they_answer_is_refused(self):
+        self.open_bridge()
+
+        with self.assertRaises(PostingNotAllowed):
+            create_message(
+                conversation=self.conversation, sender=self.yul, text='Still there?'
+            )
+
+    # -- YES ----------------------------------------------------------------
+
+    def test_yes_opts_them_in_and_is_not_a_message(self):
+        self.open_bridge()
+
+        result = self.reply('YES')
+
+        self.assertEqual(result.action, 'consent_accepted')
+        self.assertEqual(self.consent().status, ChannelConsent.Status.OPTED_IN)
+        self.assertEqual(self.conversation.messages.count(), 1)
+
+    def test_yes_is_acknowledged_and_the_acknowledgement_carries_no_message(self):
+        self.open_bridge()
+
+        self.reply('YES')
+
+        self.assertEqual(len(self.last_sent), 1, self.last_sent)
+        self.assertNotIn('still playing tomorrow', self.last_sent[0]['text'])
+
+    def test_yes_tells_the_sender(self):
+        self.open_bridge()
+
+        self.reply('YES')
+
+        self.assertTrue(
+            Notification.objects.filter(
+                to_user=self.yul, type=Notification.Type.EMAIL_OPTED_IN
+            ).exists()
+        )
+
+    def test_after_consent_an_ordinary_reply_posts(self):
+        self.open_bridge()
+        self.reply('YES')
+
+        result = self.reply('Sounds good!')
+
+        self.assertEqual(result.action, 'posted')
+        self.assertEqual(result.message.text, 'Sounds good!')
+        self.assertEqual(result.message.source, Message.Source.EMAIL)
+        self.assertIsNone(result.message.sender_id)
+
+    def test_after_consent_the_word_no_is_a_message_not_a_command(self):
+        """The regression sms/inbound.py records: "Are you coming?" "No"."""
+        self.open_bridge()
+        self.reply('YES')
+
+        result = self.reply('No')
+
+        self.assertEqual(result.action, 'posted')
+        self.assertEqual(self.consent().status, ChannelConsent.Status.OPTED_IN)
+
+    def test_a_message_after_consent_uses_the_message_template(self):
+        self.open_bridge()
+        self.reply('YES')
+
+        with capture_sent() as sent:
+            with transaction.atomic():
+                create_message(
+                    conversation=self.conversation, sender=self.yul, text='See you at 7'
+                )
+
+        self.assertEqual(len(sent), 1, sent)
+        self.assertIn('See you at 7', sent[0]['text'])
+        self.assertNotIn('Reply with just the word YES', sent[0]['text'])
+
+    # -- NO -----------------------------------------------------------------
+
+    def test_no_declines_and_is_confirmed(self):
+        self.open_bridge()
+
+        result = self.reply('NO')
+
+        self.assertEqual(result.action, 'consent_declined')
+        self.assertEqual(self.consent().status, ChannelConsent.Status.DECLINED)
+        self.assertEqual(len(self.last_sent), 1, self.last_sent)
+        self.assertIn('not email you', self.last_sent[0]['text'])
+
+    def test_no_tells_the_sender(self):
+        self.open_bridge()
+
+        self.reply('NO')
+
+        self.assertTrue(
+            Notification.objects.filter(
+                to_user=self.yul, type=Notification.Type.EMAIL_DECLINED
+            ).exists()
+        )
+
+    def test_nothing_is_ever_sent_after_a_decline(self):
+        self.open_bridge()
+        self.reply('NO')
+
+        with capture_sent() as sent:
+            with transaction.atomic():
+                create_message(
+                    conversation=self.conversation, sender=self.yul, text='Still there?'
+                )
+
+        self.assertEqual(sent, [])
+
+    # -- neither ------------------------------------------------------------
+
+    def test_an_unparseable_reply_is_nudged_once_and_then_ignored(self):
+        self.open_bridge()
+
+        first = self.reply('Yes please!')
+        self.assertEqual(first.action, 'ignored_pending_consent')
+        self.assertEqual(len(self.last_sent), 1, self.last_sent)
+        self.assertIn("didn't catch that", self.last_sent[0]['text'])
+
+        self.reply('Sure!')
+        self.assertEqual(self.last_sent, [])
+
+        self.reply('who is this?')
+        self.assertEqual(self.last_sent, [])
+
+    def test_an_unparseable_reply_does_not_become_a_message(self):
+        self.open_bridge()
+
+        self.reply('Yes please!')
+
+        self.assertEqual(self.conversation.messages.count(), 1)
+        self.assertEqual(self.consent().status, ChannelConsent.Status.PENDING)
+
+    # -- who is allowed to answer ------------------------------------------
+
+    def test_an_unauthenticated_yes_changes_nothing(self):
+        self.open_bridge()
+
+        result = self.reply('YES', headers={})
+
+        self.assertEqual(result.action, 'ignored_unauthenticated')
+        self.assertEqual(self.consent().status, ChannelConsent.Status.PENDING)
+
+    def test_a_yes_from_another_address_changes_nothing(self):
+        self.open_bridge()
+
+        # Genuinely authenticated, just not the address we asked. Vouching for
+        # `else.com` is what makes this the mismatch rung rather than the
+        # authentication one above it.
+        result = self.reply(
+            'YES', sender='someone@else.com', headers=authenticated('else.com')
+        )
+
+        self.assertEqual(result.action, 'ignored_address_mismatch')
+        self.assertEqual(self.consent().status, ChannelConsent.Status.PENDING)
+
+    def test_yes_never_clears_an_opt_out(self):
+        self.open_bridge()
+        set_channel_consent(
+            self.row, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.OPTED_OUT
+        )
+
+        self.reply('YES')
+
+        self.assertEqual(self.consent().status, ChannelConsent.Status.OPTED_OUT)
+
+    def test_a_quoted_consent_email_is_not_an_answer(self):
+        """The footer contains the word YES; quoting it back is not agreeing."""
+        sent = self.open_bridge()
+        quoted = '\n'.join('> ' + line for line in sent[0]['text'].splitlines())
+
+        result = self.reply(quoted)
+
+        self.assertNotEqual(result.action, 'consent_accepted')
+        self.assertEqual(self.consent().status, ChannelConsent.Status.PENDING)
+
+
+@override_settings(MAIL_SENDING_ENABLED=True, MAIL_REPLY_DOMAIN=REPLY_DOMAIN)
+class BridgeContainmentTests(TransactionTestCase):
+    """Stage A must not have quietly shipped stage B.
+
+    An email-only member of a GROUP is seeded PENDING and nothing in the
+    product asks them for consent yet, so the group's messages must still not
+    reach them - even though the address rung now lets account-less rows
+    through. The guard is the consent rung, and this is the test that says so.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.row = self.group.add_email_participant('stranger@gmail.com')
+
+    def test_a_pending_group_invitee_is_not_emailed_the_group(self):
+        with capture_sent() as sent:
+            with transaction.atomic():
+                create_message(
+                    conversation=self.group, sender=self.alice, text='Dinner at 7'
+                )
+
+        self.assertEqual(sent, [])
+        record = EmailDelivery.objects.get(participant=self.row)
+        self.assertEqual(record.status, EmailDelivery.Status.SKIPPED)
+        self.assertIn('consent', record.reason)

@@ -50,7 +50,7 @@ from django.db import transaction
 from chat import membership
 from chat.models import ChannelConsent, Message, Participant, PostingNotAllowed
 from chat.services import create_message
-from mail import authentication, autoreply, commands
+from mail import authentication, autoreply, commands, consent
 from mail.quoting import strip_quoted_reply
 from mail.tokens import participant_id_from
 from user.models import MessagingSettings
@@ -157,21 +157,61 @@ def handle_inbound(to_address, from_address, body, *, headers, subject=''):
     # The account's own "Send and receive Loop messages by email". Off, no reply
     # to any group is taken - silently, per the module docstring. Asked after
     # STOP EMAILS above, so that still works whatever this says.
-    if not MessagingSettings.of(participant.user).email_enabled:
+    #
+    # GUARDED ON user_id, which is new and is not defensive padding: a member
+    # with no account has no MessagingSettings and `of(None)` raises. Before
+    # external conversations existed, every row that reached here had an
+    # account; the first reply from an address would have been a 500.
+    if participant.user_id is not None and not MessagingSettings.of(
+        participant.user
+    ).email_enabled:
         return InboundResult(action='ignored_email_off', participant=participant)
+
+    answer = membership.consent_status(participant, ChannelConsent.Channel.EMAIL)
+
+    # A STOP is about this address everywhere, so nothing below may act on it -
+    # not a YES, not a message. Asked before the answer branches for exactly
+    # that reason, and it is why YES can never undo an opt-out.
+    if answer == ChannelConsent.Status.OPTED_OUT:
+        return InboundResult(action='ignored_email_declined', participant=participant)
+
+    # YES AND NO ARE ANSWERS ONLY WHILE A QUESTION IS OPEN. That qualifier is
+    # the whole rule, and `sms/inbound.py` records what leaving it out cost:
+    # "Are you coming?" "No" swallowed the message AND silently unsubscribed
+    # them. Once consent is OPTED_IN this branch is never reached, so a bare
+    # "no" is an ordinary message again - which is the point.
+    reply = commands.parse_consent(text)
+
+    if reply == commands.YES and answer in (
+        ChannelConsent.Status.PENDING,
+        ChannelConsent.Status.DECLINED,
+    ):
+        consent.accept(participant)
+        return InboundResult(action='consent_accepted', participant=participant)
+
+    if reply == commands.NO and answer == ChannelConsent.Status.PENDING:
+        consent.decline(participant)
+        return InboundResult(action='consent_declined', participant=participant)
+
+    if answer == ChannelConsent.Status.PENDING:
+        # They were asked a question and said something that is not an answer.
+        # NOT a message: posting it would put "who is this?" into a thread the
+        # sender thinks is still waiting, and would count as consent by
+        # accident. One reminder, ever - see `mail/consent.py`.
+        consent.nudge(participant)
+        return InboundResult(action='ignored_pending_consent', participant=participant)
 
     # They stopped this group's email - STOP EMAILS, or its footer link. Until
     # they turn it back on for this group in the app, the group neither emails
     # them nor takes their replies.
-    if membership.consent_status(participant, ChannelConsent.Channel.EMAIL) in (
-        ChannelConsent.Status.DECLINED,
-        ChannelConsent.Status.OPTED_OUT,
-    ):
+    if answer == ChannelConsent.Status.DECLINED:
         return InboundResult(action='ignored_email_declined', participant=participant)
 
     try:
         message = create_message(
             conversation=participant.conversation,
+            # None for somebody with no account: the message is credited to the
+            # participant row instead, which is what `sender_label` reads.
             sender=participant.user,
             text=text,
             source=Message.Source.EMAIL,
@@ -217,7 +257,12 @@ def _sender_is_the_member(participant, from_address):
         return False
 
     if participant.user_id is None:
-        return False
+        # An address-only member. There is no account and no verified-address
+        # column to lean on, so the row's own address is the whole identity -
+        # and `_from_is_authenticated` above has already made the receiving
+        # server's SPF/DKIM/DMARC verdict vouch for it. That verdict is not one
+        # check among several here; it is the only proof there is.
+        return bool(participant.email) and address == participant.email.strip().lower()
 
     profile = getattr(participant.user, 'profile', None)
     if profile is None or not profile.email_verified:

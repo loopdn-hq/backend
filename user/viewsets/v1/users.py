@@ -473,6 +473,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
             request.user,
             user=serializer.validated_data['target_user'],
             phone_number=serializer.validated_data['target_number'],
+            email=serializer.validated_data['target_email'],
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -487,6 +488,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
             request.user,
             user=serializer.validated_data['target_user'],
             phone_number=serializer.validated_data['target_number'],
+            email=serializer.validated_data['target_email'],
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
 

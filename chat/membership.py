@@ -18,7 +18,7 @@ import logging
 from urllib.parse import quote
 
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -480,6 +480,64 @@ def set_channel_consent(participant, channel, status, *, when=None):
     return consent
 
 
+def accept_email_consent(participant):
+    """They replied YES. The one-way IN, and the mirror of `decline_email`.
+
+    Reached from PENDING - the ordinary case - and from DECLINED, because
+    changing your mind back is allowed and `invite_by_phone` already documents
+    the same pair on the other channel: NO turns a group off, YES turns it on
+    again.
+
+    NEVER from OPTED_OUT, and that is the whole guard. A provider complaint or
+    a STOP is about this address everywhere, not about one conversation, and a
+    YES to one sender must not quietly undo it. `sms/inbound.py` learned this
+    the expensive way - see the paragraph there about a word the carrier does
+    not recognise for that purpose.
+
+    Returns True when something actually changed, so a caller can stay quiet
+    about a repeat rather than sending a second acknowledgement.
+    """
+    already = consent_status(participant, ChannelConsent.Channel.EMAIL)
+    if already == ChannelConsent.Status.OPTED_OUT:
+        logger.info(
+            'Not accepting email consent for participant %s: opted out',
+            participant.pk,
+        )
+        return False
+
+    set_channel_consent(
+        participant, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.OPTED_IN
+    )
+    if participant.consent_at is None:
+        participant.consent_at = timezone.now()
+        participant.save(update_fields=['consent_at'])
+    return already != ChannelConsent.Status.OPTED_IN
+
+
+def record_consent_asked(participant, wording):
+    """Stamp when this member was asked to agree, and to exactly what.
+
+    Called once the consent request has actually been accepted by the provider,
+    not when it was composed: `consent_sent_at` gates whether a bounced first
+    attempt may be asked again, and a send that never happened must not count
+    as an ask.
+
+    `consent_text` keeps the wording verbatim because "what exactly were they
+    agreeing to" is the question a complaint turns on, and the template will
+    have changed by the time anybody asks.
+    """
+    fields = []
+    if participant.consent_sent_at is None:
+        participant.consent_sent_at = timezone.now()
+        fields.append('consent_sent_at')
+    if wording and not participant.consent_text:
+        participant.consent_text = wording
+        fields.append('consent_text')
+    if fields:
+        participant.save(update_fields=fields)
+    return participant
+
+
 def decline_email(participant):
     """Stop this group emailing this member. The one-way exit.
 
@@ -562,6 +620,96 @@ def grant_email_consent_on_claim(participant):
     return set_channel_consent(
         participant, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.OPTED_IN
     )
+
+
+def rekey_external_direct(conversation, user):
+    """Re-file an external thread under its pair of accounts, once it has two.
+
+    The address has just become an account, so the conversation is now an
+    ordinary one-to-one - but it is still filed under `'<id>:email:<address>'`.
+    Left that way, the next `start_direct` between the two computes the id-pair
+    key, finds nothing, and opens a SECOND thread. That is exactly the
+    duplicate `direct_key` exists to prevent, arriving by the back door.
+
+    So the key is rewritten. Nothing else moves: same conversation, same
+    messages, same participants - only its filing name changes.
+
+    THE COLLISION IS REAL AND IS HANDLED. The pair may already have a thread,
+    if they got an account some other way and were messaged there while the
+    bridge also existed. The unique constraint refuses the rewrite, and the
+    bridge is folded into the older thread instead - the same "one human, two
+    rows, keep one and move the history" move `claim_email_invitations` makes
+    one level down, applied a level up.
+
+    Returns 'rekeyed', 'folded', or None when there was nothing to do. The
+    caller needs to tell the first two apart: folding DELETES this conversation
+    and the participant row with it, so anything that would go on to touch that
+    row - announcing the membership, say - must not.
+
+    Never raises: this runs inside email verification, which has already
+    succeeded by the time it is reached.
+    """
+    if not conversation.is_external_direct:
+        return None
+
+    other = (
+        Participant.objects.filter(conversation=conversation, user__isnull=False)
+        .exclude(user=user)
+        .select_related('user')
+        .first()
+    )
+    if other is None:
+        return None
+
+    key = Conversation.direct_key_for(other.user, user)
+    try:
+        with transaction.atomic():
+            conversation.direct_key = key
+            conversation.save(update_fields=['direct_key', 'updated_at'])
+        return 'rekeyed'
+    except IntegrityError:
+        pass
+
+    existing = Conversation.objects.filter(direct_key=key).first()
+    if existing is None or existing.pk == conversation.pk:
+        logger.warning(
+            'Could not re-key external conversation %s and found no thread to '
+            'fold it into', conversation.pk,
+        )
+        return None
+
+    try:
+        with transaction.atomic():
+            _fold_into(conversation, existing, user)
+    except Exception:
+        logger.exception(
+            'Could not fold external conversation %s into %s',
+            conversation.pk, existing.pk,
+        )
+        return None
+    return 'folded'
+
+
+def _fold_into(bridge, target, user):
+    """Move one external thread's messages into the pair's existing one.
+
+    `sender_participant` is SET_NULL, so the rows have to be re-pointed before
+    the bridge goes - deleting first would orphan everything posted through it.
+    """
+    rows = {
+        row.user_id: row
+        for row in Participant.objects.filter(
+            conversation=target, user__isnull=False
+        )
+    }
+    for row in Participant.objects.filter(conversation=bridge):
+        replacement = rows.get(row.user_id)
+        if replacement is not None:
+            row.messages_sent.update(sender_participant=replacement)
+
+    bridge.messages.update(conversation=target)
+    bridge.delete()
+    logger.info('Folded external conversation into %s for user %s', target.pk, user.pk)
 
 
 def consent_status(participant, channel):
@@ -1121,8 +1269,13 @@ def claim_email_invitations(user):
             row.status = Participant.Status.ACTIVE
             row.save(update_fields=['user', 'email', 'status'])
             grant_email_consent_on_claim(row)
+            outcome = rekey_external_direct(row.conversation, user)
             claimed += 1
-            _announce_membership(row)
+            if outcome != 'folded':
+                # Folding deleted this row along with its conversation, so
+                # there is no membership left to announce - and the pair were
+                # already talking in the thread it was folded into.
+                _announce_membership(row)
             continue
 
         # Already in as an account and as an address: one human, two rows.

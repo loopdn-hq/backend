@@ -178,6 +178,58 @@ PASSWORD_RESET = EmailTemplate(
 # they did not ask for, since by then there is nothing left to refuse.
 PASSWORD_CHANGED = EmailTemplate(slug='password_changed')
 
+# --- the external one-to-one ("bridge") ------------------------------------
+#
+# One person on Loopd'n, one address that has no account. Five templates rather
+# than one because the far side has to be asked before anything else is sent,
+# and then told what happened. `body` appears on exactly TWO of them - the
+# first contact and an ordinary message - so the sender's words reach the
+# recipient there and nowhere else. The other three have no `body` variable to
+# render even if a caller passed one, which is the catalogue enforcing the rule
+# structurally rather than by review.
+
+# First contact: the sender's message AND the question, in one email (Yul's
+# call, 2026-09-19). A stranger who can see what they are being asked about is
+# far likelier to answer than one who cannot - at the cost of putting
+# user-authored text in front of somebody who has not consented, which is what
+# the per-sender cap and the one-ask-per-address rule exist to bound.
+BRIDGE_CONSENT = EmailTemplate(
+    slug='bridge_consent',
+    context_keys=('sender_name', 'body', 'stop_keyword', 'unsubscribe_url'),
+)
+
+# They replied, but not with YES or NO. Sent ONCE per address, ever - the cap
+# is a query against the delivery log, so an auto-responder terminates. No
+# `body`: it is a reminder of the instruction, not a second copy of the message.
+BRIDGE_CONSENT_NUDGE = EmailTemplate(
+    slug='bridge_consent_nudge',
+    context_keys=('sender_name', 'stop_keyword', 'unsubscribe_url'),
+)
+
+# They said YES. Tells them the rules of the thread they have just joined -
+# that replying is how they take part, and that STOP EMAILS still ends it.
+BRIDGE_ACCEPTED = EmailTemplate(
+    slug='bridge_accepted',
+    context_keys=('sender_name', 'stop_keyword', 'unsubscribe_url'),
+)
+
+# They said NO. Confirmed in the channel the request arrived on, for the reason
+# mail/optout.py gives: somebody who replies and hears nothing does not know it
+# worked, and the next thing they press is Report spam. The one template with
+# no way out in it, because they have already taken it.
+BRIDGE_DECLINED = EmailTemplate(
+    slug='bridge_declined',
+    context_keys=('sender_name', 'app_url'),
+)
+
+# Every message after consent.
+BRIDGE_MESSAGE = EmailTemplate(
+    slug='bridge_message',
+    context_keys=(
+        'sender_name', 'body', 'can_reply', 'stop_keyword', 'unsubscribe_url',
+    ),
+)
+
 # Sent after Stripe confirms a plan checkout or credit top-up checkout.
 BILLING_CHECKOUT_SUCCESS = EmailTemplate(
     slug='billing_checkout_success',
@@ -203,6 +255,11 @@ CATALOGUE = {
         UNSUBSCRIBED,
         PASSWORD_RESET,
         PASSWORD_CHANGED,
+        BRIDGE_CONSENT,
+        BRIDGE_CONSENT_NUDGE,
+        BRIDGE_ACCEPTED,
+        BRIDGE_DECLINED,
+        BRIDGE_MESSAGE,
         BILLING_CHECKOUT_SUCCESS,
     )
 }

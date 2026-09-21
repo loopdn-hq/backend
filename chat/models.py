@@ -159,8 +159,20 @@ class Conversation(models.Model):
     # also what lets the column carry no db_default; see migration 0003.
     image = models.ImageField(upload_to=group_image_upload_to, blank=True, null=True)
 
-    # Direct conversations only: '<lower user id>:<higher user id>'.
-    direct_key = models.CharField(max_length=64, unique=True, null=True, blank=True)
+    # One-to-one conversations only, in one of two forms:
+    #
+    #     '<lower user id>:<higher user id>'   both sides have accounts
+    #     '<user id>:email:<address>'          the other side is an address
+    #
+    # It was never "two user ids" by nature - it is a canonical unique name for
+    # the pair, and an address is as good a name as an id. Holding both forms in
+    # one column is what keeps ONE rule ("every one-to-one conversation has
+    # exactly one unique key") instead of two nullable columns that can disagree.
+    # The forms cannot collide: the second segment is either digits or 'email'.
+    #
+    # 320 rather than 64 because an address may be 254 characters. Widening a
+    # varchar in Postgres is metadata-only - no table rewrite, no index rebuild.
+    direct_key = models.CharField(max_length=320, unique=True, null=True, blank=True)
 
     ## GROUP SETTINGS ##
 
@@ -273,6 +285,29 @@ class Conversation(models.Model):
         low, high = sorted([int(user_a.pk), int(user_b.pk)])
         return f'{low}:{high}'
 
+    @staticmethod
+    def direct_key_for_email(user, email):
+        """The same idea for a pair where one side is only an address.
+
+        Not order-independent, unlike the pair form, and it does not need to be:
+        an address cannot start a conversation, so there is only ever one way
+        round. The ':email:' segment names the channel rather than being a bare
+        '<id>:<address>', so a future SMS bridge is '<id>:sms:+63...' in this
+        same column under this same uniqueness rule.
+        """
+        return f'{int(user.pk)}:email:{(email or "").strip().lower()}'
+
+    @property
+    def is_external_direct(self):
+        """One-to-one, with an address on the other side instead of an account.
+
+        Read off the key rather than by looking at the participants, so it stays
+        a fact about the conversation that costs no query - which is what lets
+        `chat.delivery.conversation_reason` keep answering from the conversation
+        alone.
+        """
+        return bool(self.direct_key) and ':email:' in self.direct_key
+
     @classmethod
     def start_direct(cls, user, other):
         """Return this pair's conversation, creating it only if needed."""
@@ -299,6 +334,43 @@ class Conversation(models.Model):
         # administer, and neither person outranks the other.
         conversation.add_participant(user, role=Participant.Role.MEMBER)
         conversation.add_participant(other, role=Participant.Role.MEMBER)
+        return conversation, True
+
+    @classmethod
+    def start_direct_external(cls, user, email, *, display_name=None):
+        """This person's conversation with an address, creating it if needed.
+
+        The twin of `start_direct`, and deliberately the same shape: reached by
+        `direct_key`, idempotent, and re-activating both rows when the thread
+        already exists. Without the key lookup, messaging the same address twice
+        would open a second thread - and each would send its own consent
+        request, which is how "one ask per address, ever" quietly stops being
+        true.
+
+        The conversation is a DIRECT one. It is one-to-one, it has no name and
+        nobody administers it, so every rule already written for DIRECT is the
+        rule this wants; only the key's shape differs.
+        """
+        address = (email or '').strip().lower()
+        if not address:
+            raise ValueError('An external conversation needs an address.')
+
+        key = cls.direct_key_for_email(user, address)
+        conversation = cls.objects.filter(direct_key=key).first()
+        if conversation:
+            conversation.add_participant(user, role=Participant.Role.MEMBER)
+            conversation.add_email_participant(
+                address, display_name=display_name, added_by=user
+            )
+            return conversation, False
+
+        conversation = cls.objects.create(
+            kind=cls.Kind.DIRECT, direct_key=key, created_by=user
+        )
+        conversation.add_participant(user, role=Participant.Role.MEMBER)
+        conversation.add_email_participant(
+            address, display_name=display_name, added_by=user
+        )
         return conversation, True
 
     @classmethod
@@ -485,6 +557,31 @@ class Conversation(models.Model):
                 'added_by': added_by,
                 'role': Participant.Role.MEMBER,
                 'sms_enabled': True,
+            },
+        )
+        return participant
+
+    def add_email_participant(self, email, display_name=None, added_by=None):
+        """Add somebody who has no account, reachable only at this address.
+
+        The sibling of `add_phone_participant`, and consent starts PENDING for
+        the same reason: email is the only way this member can receive anything,
+        and somebody else typing their address is not them agreeing to be
+        emailed. `chat.signals.seed_channel_consent` sets that PENDING itself,
+        off `user_id is None` - there is nothing to pass here.
+
+        The name falls back to the local part, which is what `display_label`
+        would show anyway; storing it keeps the row readable in the admin and
+        satisfies the name constraint.
+        """
+        address = (email or '').strip().lower()
+        participant, _ = Participant.objects.get_or_create(
+            conversation=self,
+            email=address,
+            defaults={
+                'display_name': display_name or local_part(address) or 'Unknown',
+                'added_by': added_by,
+                'role': Participant.Role.MEMBER,
             },
         )
         return participant

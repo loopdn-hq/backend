@@ -1,0 +1,20 @@
+{% extends "email/base.html" %}
+
+{% block title %}You won&rsquo;t hear from us here again{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">
+  Done &mdash; we will not email you about your conversation with
+  <strong>{{ sender_name }}</strong> again.
+</p>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  This applies to this conversation only. If somebody else invites this address
+  to a group on {{ product_name }}, you will be asked separately, and you can
+  say no to that too.
+</p>
+{% endblock %}
+
+{% block footer %}
+{% if app_url %}<a href="{{ app_url }}">{{ product_name }}</a>{% else %}{{ product_name }}{% endif %}
+&mdash; one group, any phone, everyone connected.
+{% endblock %}

@@ -21,6 +21,7 @@ from rest_framework.test import APITestCase, APITransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from chat import delivery, membership
+from user import blocks
 from sms import inbound
 from chat.mentions import set_mentions
 from chat.models import (
@@ -31,6 +32,7 @@ from chat.models import (
     Message,
     MessageReaction,
     Participant,
+    PostingNotAllowed,
     REACTION_EMOJI,
 )
 from chat.serializers import ConversationSerializer, MessageSerializer
@@ -5982,3 +5984,190 @@ class MentionTests(TestCase):
         )
 
         self.assertEqual(message.text, '@Bob can you bring bread')
+
+
+class ExternalConversationTests(TestCase):
+    """A one-to-one thread whose far side is an address, not an account."""
+
+    def setUp(self):
+        self.yul = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.address = 'stewart@gmail.com'
+
+    def test_it_is_a_direct_conversation_keyed_on_the_address(self):
+        conversation, created = Conversation.start_direct_external(
+            self.yul, self.address
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(conversation.kind, Conversation.Kind.DIRECT)
+        self.assertTrue(conversation.is_external_direct)
+        self.assertEqual(
+            conversation.direct_key, f'{self.yul.pk}:email:{self.address}'
+        )
+
+    def test_opening_it_twice_returns_the_same_thread(self):
+        first, _ = Conversation.start_direct_external(self.yul, self.address)
+        second, created = Conversation.start_direct_external(self.yul, self.address)
+
+        self.assertEqual(first.pk, second.pk)
+        self.assertFalse(created)
+        self.assertEqual(
+            Participant.objects.filter(conversation=first, user__isnull=True).count(),
+            1,
+        )
+
+    def test_the_address_is_normalised_so_case_cannot_fork_the_thread(self):
+        first, _ = Conversation.start_direct_external(self.yul, self.address)
+        second, _ = Conversation.start_direct_external(self.yul, '  Stewart@Gmail.com ')
+
+        self.assertEqual(first.pk, second.pk)
+
+    def test_two_senders_reaching_one_address_get_two_threads(self):
+        other = User.objects.create_user('ada', 'ada@example.com', 'x')
+
+        mine, _ = Conversation.start_direct_external(self.yul, self.address)
+        theirs, _ = Conversation.start_direct_external(other, self.address)
+
+        self.assertNotEqual(mine.pk, theirs.pk)
+
+    def test_the_far_side_starts_pending_and_is_named_by_its_local_part(self):
+        conversation, _ = Conversation.start_direct_external(self.yul, self.address)
+
+        row = Participant.objects.get(conversation=conversation, user__isnull=True)
+        self.assertEqual(row.status, Participant.Status.ACTIVE)
+        self.assertEqual(row.display_label, 'stewart')
+        self.assertEqual(
+            ChannelConsent.objects.get(
+                participant=row, channel=ChannelConsent.Channel.EMAIL
+            ).status,
+            ChannelConsent.Status.PENDING,
+        )
+
+    def test_an_account_pair_key_and_an_address_key_cannot_collide(self):
+        ada = User.objects.create_user('ada2', 'ada2@example.com', 'x')
+        pair, _ = Conversation.start_direct(self.yul, ada)
+        external, _ = Conversation.start_direct_external(self.yul, self.address)
+
+        self.assertNotEqual(pair.direct_key, external.direct_key)
+        self.assertFalse(pair.is_external_direct)
+
+
+class ExternalDeliveryRuleTests(TestCase):
+    """What the delivery ladder says about each kind of conversation."""
+
+    def setUp(self):
+        self.yul = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.ada = User.objects.create_user('ada', 'ada@example.com', 'x')
+
+    def test_a_group_is_carried_by_every_channel(self):
+        group = Conversation.start_group(self.yul, name='Family')
+
+        self.assertIsNone(delivery.conversation_reason(group))
+        self.assertIsNone(delivery.conversation_reason(group, 'email'))
+        self.assertIsNone(delivery.conversation_reason(group, 'sms'))
+
+    def test_a_conversation_between_two_accounts_is_still_carried_by_none(self):
+        """The regression DirectMessagesAreNotEmailedTests guards."""
+        pair, _ = Conversation.start_direct(self.yul, self.ada)
+
+        self.assertIsNotNone(delivery.conversation_reason(pair))
+        self.assertIsNotNone(delivery.conversation_reason(pair, 'email'))
+        self.assertIsNotNone(delivery.conversation_reason(pair, 'sms'))
+
+    def test_an_external_thread_is_carried_by_email_and_not_by_sms(self):
+        external, _ = Conversation.start_direct_external(self.yul, 'x@gmail.com')
+
+        self.assertIsNone(delivery.conversation_reason(external, 'email'))
+        self.assertIsNotNone(delivery.conversation_reason(external, 'sms'))
+
+
+class ExternalBlockTests(TestCase):
+    """Blocking the address on the far side, in both directions."""
+
+    def setUp(self):
+        self.yul = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.address = 'stewart@gmail.com'
+        self.conversation, _ = Conversation.start_direct_external(
+            self.yul, self.address
+        )
+        self.row = Participant.objects.get(
+            conversation=self.conversation, user__isnull=True
+        )
+
+    def test_the_blocker_is_told_plainly(self):
+        blocks.block(self.yul, email=self.address)
+
+        with self.assertRaises(PostingNotAllowed) as caught:
+            create_message(self.conversation, self.yul, text='hello')
+
+        self.assertIn('You blocked', str(caught.exception))
+
+    def test_the_blocked_address_is_told_nothing(self):
+        blocks.block(self.yul, email=self.address)
+
+        with self.assertRaises(PostingNotAllowed) as caught:
+            create_message(
+                self.conversation, None, text='hello', participant=self.row
+            )
+
+        self.assertNotIn('blocked', str(caught.exception).lower())
+
+    def test_an_unblocked_address_may_still_post(self):
+        message = create_message(
+            self.conversation, None, text='hello', participant=self.row
+        )
+
+        self.assertEqual(message.text, 'hello')
+
+
+class ExternalRekeyTests(TestCase):
+    """What happens when the address finally gets an account."""
+
+    def setUp(self):
+        self.yul = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.address = 'stewart@gmail.com'
+        self.conversation, _ = Conversation.start_direct_external(
+            self.yul, self.address
+        )
+
+    def sign_up_stewart(self):
+        stewart = User.objects.create_user('stewart', self.address, 'x')
+        stewart.profile.email_verified = True
+        stewart.profile.save(update_fields=['email_verified'])
+        membership.claim_email_invitations(stewart)
+        return stewart
+
+    def test_the_thread_is_refiled_under_the_pair(self):
+        stewart = self.sign_up_stewart()
+
+        self.conversation.refresh_from_db()
+        self.assertFalse(self.conversation.is_external_direct)
+        self.assertEqual(
+            self.conversation.direct_key,
+            Conversation.direct_key_for(self.yul, stewart),
+        )
+
+    def test_start_direct_then_finds_the_thread_they_already_have(self):
+        """Without the re-key this opens a SECOND thread - the whole point."""
+        stewart = self.sign_up_stewart()
+
+        found, created = Conversation.start_direct(self.yul, stewart)
+
+        self.assertFalse(created)
+        self.assertEqual(found.pk, self.conversation.pk)
+
+    def test_a_thread_that_already_exists_absorbs_the_bridge(self):
+        stewart = User.objects.create_user('stewart', 'other@example.com', 'x')
+        pair, _ = Conversation.start_direct(self.yul, stewart)
+        create_message(self.conversation, self.yul, text='sent by email')
+
+        stewart.email = self.address
+        stewart.save(update_fields=['email'])
+        stewart.profile.email_verified = True
+        stewart.profile.save(update_fields=['email_verified'])
+        membership.claim_email_invitations(stewart)
+
+        self.assertFalse(
+            Conversation.objects.filter(pk=self.conversation.pk).exists()
+        )
+        self.assertEqual(pair.messages.filter(text='sent by email').count(), 1)

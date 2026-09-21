@@ -22,6 +22,11 @@ safety.
     "only while a question is open" gate on the SMS side; a two-word imperative
     needs none, because there is no context in which somebody's whole reply is
     those two words and they mean something else.
+
+    That gate is exactly what `parse_consent` at the foot of this module is
+    for. It reads `YES` and `NO`, and `mail/inbound.py` honours them ONLY while
+    consent is still PENDING - so the rule here is unchanged: a single word is
+    unsafe unconditionally, which is why STOP EMAILS is two.
   - `UNSUBSCRIBE` reads as "block everything from this sender", which is the
     opposite of what this does. It stops ONE group.
 
@@ -68,3 +73,42 @@ def parse(body):
 
 def is_stop_emails(body):
     return parse(body) == STOP_EMAILS
+
+
+# --- answering the consent question ---------------------------------------
+#
+# YES and NO, and kept OUT of `parse` on purpose: everything above is about a
+# command that must work at ANY time, and these two are answers that only mean
+# anything while a question is open. Mixing them would make "STOP EMAILS is the
+# whole message" and "YES is the whole message" look like the same rule, and
+# they are not - one is unconditional, the other is gated on consent still
+# being PENDING by `mail/inbound.py`.
+#
+# WHY THE STRICTNESS. Exactly `YES` or exactly `NO`, upper-cased and stripped
+# of trailing punctuation, and nothing else. Not `Y`, not `OK`, not `Sure`, not
+# first-word matching on "yes please". `sms/commands.py` already wrote the
+# reason and it is the same reason here: a guess here is a guess about consent,
+# and reading "Y" as agreement is how somebody who never really answered starts
+# being emailed. The mitigation for "yes please" is the copy in
+# `bridge_consent` - *reply with just the word YES* - and one nudge when
+# somebody does it anyway, not a looser parser.
+
+YES = 'yes'
+NO = 'no'
+
+_CONSENT_WORDS = {'YES': YES, 'NO': NO}
+
+
+def parse_consent(body):
+    """Return YES, NO, or None if this reply is neither.
+
+    Caller decides whether an answer means anything - see `mail/inbound.py`.
+    Once consent has been given this is never reached, which is what lets
+    somebody answer "no" to an ordinary question without unsubscribing
+    themselves.
+    """
+    if not body:
+        return None
+
+    cleaned = ' '.join(str(body).strip(_TRIM).split()).upper()
+    return _CONSENT_WORDS.get(cleaned)

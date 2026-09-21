@@ -110,6 +110,21 @@ def verify_email(user, code):
             user.pk,
         )
 
+    # And the moment a bare address becomes a person is the moment any block
+    # against that address becomes a block against this account - the same rule
+    # `link_number_to_account` applies to a verified number, and for the same
+    # reason: without it, signing up is a way round a block. Guarded like the
+    # claim above, because verification itself has already succeeded.
+    try:
+        from user.blocks import link_email_to_account
+
+        link_email_to_account(user)
+    except Exception:
+        logger.exception(
+            'Could not move email blocks onto account %s after verification',
+            user.pk,
+        )
+
     return user
 
 

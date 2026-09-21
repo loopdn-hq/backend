@@ -363,6 +363,15 @@ RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 # inside a request the user is waiting on.
 EMAIL_REQUEST_TIMEOUT = 10
 
+# How long before a consent request to an address that never answered may be
+# sent a second time. A first attempt can bounce or be eaten by a spam filter,
+# so one retry is recoverable; anything shorter is pestering somebody who has
+# not agreed to hear from us at all. Never applies after DECLINED or OPTED_OUT,
+# which are answers and are final.
+MAIL_CONSENT_RESEND_HOURS = int(
+    os.environ.get('MAIL_CONSENT_RESEND_HOURS', '24')
+)
+
 # Available to every email template without the caller passing them.
 EMAIL_PRODUCT_NAME = os.environ.get('EMAIL_PRODUCT_NAME', 'Loopd')
 EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMAIL)

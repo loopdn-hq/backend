@@ -33,17 +33,29 @@ conversation from a list; it is not a request for silence. Muting is how
 somebody asks for that, and a member who tidied a group away still expects the
 text when somebody posts.
 
-ONLY A GROUP GOES OUT
----------------------
+WHAT GOES OUT
+-------------
 Before anybody in a conversation is considered, the conversation itself is.
 `conversation_reason` says whether the outside channels carry it at all, and
-today only a GROUP is carried. Every external channel is shaped for one: the
-email is signed "<group name> via Loopd" and ends with a footer for leaving the
-group, the text goes out from the group's own number. A direct conversation
-has neither a name nor a number, so its email arrived from " via Loopd" and
-invited the reader to leave a group that did not exist - which is how this rule
-was found. Telling somebody about a direct message is its own template and its
-own product decision, not a group message with the name left blank.
+two kinds are carried:
+
+    a GROUP             on every external channel
+    an EXTERNAL 1:1     on email only - a thread whose far side is an address
+                        rather than an account (`Conversation.is_external_direct`)
+
+A one-to-one between two ACCOUNTS is still carried by none of them, and the
+reason is the bug that produced this rule: every external channel is shaped for
+a group - the email is signed "<group name> via Loopd" and ends with a footer
+for leaving the group, the text goes out from the group's own number - so such a
+conversation's email arrived from " via Loopd" and invited the reader to leave a
+group that did not exist. The rule then said a direct message needed "its own
+template and its own product decision". The external 1:1 now has both: its own
+From line, its own List-Id and its own footer, in `mail/outbound.py`. Two
+accounts still have neither, and need neither - both sides are already in the
+app, and nobody outside it is waiting to be told.
+
+SMS carries no one-to-one at all, external or not: every number the product
+owns belongs to one Loop, with that Loop's consent and STOP handling around it.
 
 CHANNELS REGISTER THEMSELVES
 ----------------------------
@@ -104,10 +116,38 @@ def refusal_reason(participant, channel):
     if consent is None:
         return NO_CONSENT
     if not consent.allows_delivery:
+        if _is_the_consent_request(participant, consent):
+            # The one send that a PENDING answer does not refuse, because this
+            # send IS the question. An external one-to-one asks by email - the
+            # message and the request travel together - so refusing here would
+            # mean the question could never be put and the answer could never
+            # be given.
+            #
+            # Narrow on purpose: only a row with no account, only while nothing
+            # has been asked yet (`consent_sent_at`), and only in a thread
+            # opened against an address. A group invitee is still refused,
+            # because nothing in the product asks them for consent yet.
+            return None
         return _consent_reason(consent)
 
     # Archived deliberately absent. See the module docstring.
     return None
+
+
+def _is_the_consent_request(participant, consent):
+    """Whether this send is the first contact that asks for consent.
+
+    The conversation is only consulted once the cheap tests have passed - an
+    account row is seeded OPTED_IN and never reaches here, so a group fan-out
+    does not pay for this.
+    """
+    if consent.status != ChannelConsent.Status.PENDING:
+        return False
+    if participant.user_id is not None or not participant.email:
+        return False
+    if participant.consent_sent_at is not None:
+        return False
+    return participant.conversation.is_external_direct
 
 
 def retry_refusal(participant, message, channel, address_reason):
@@ -135,7 +175,7 @@ def retry_refusal(participant, message, channel, address_reason):
         return 'the membership is gone'
 
     if message is not None:
-        reason = conversation_reason(message.conversation)
+        reason = conversation_reason(message.conversation, channel)
         if reason is not None:
             return reason
 
@@ -146,13 +186,18 @@ def retry_refusal(participant, message, channel, address_reason):
     )
 
 
-def conversation_reason(conversation):
-    """Why NO channel carries this conversation outside the app, or None.
+def conversation_reason(conversation, channel=None):
+    """Why this conversation is not carried outside the app, or None.
 
-    None for a group. For anything else a reason in the ladder's own idiom,
-    asked before any member is considered because it is a fact about the
-    conversation and not about anybody in it - see ONLY A GROUP GOES OUT in the
-    module docstring.
+    None for a group, and None for an EXTERNAL one-to-one on a channel that
+    carries one. Otherwise a reason in the ladder's own idiom, asked before any
+    member is considered because it is still a fact about the conversation and
+    not about anybody in it - see WHAT GOES OUT in the module docstring.
+
+    `channel` is optional so a caller with no particular channel in mind still
+    gets the conversation-level answer. Given one, the answer narrows: email
+    carries an external thread and SMS does not, because every number the
+    product owns belongs to a Loop.
 
     Asked in two places, on purpose. `schedule_all` asks so that no work is
     queued: a busy day of direct messages would otherwise hand a worker one
@@ -161,9 +206,15 @@ def conversation_reason(conversation):
     button written later - still finds nobody. One rule, defined here, applied
     at the door and again at the desk.
     """
-    if conversation.kind != Conversation.Kind.GROUP:
-        return f'{conversation.kind} conversations are not delivered externally'
-    return None
+    if conversation.kind == Conversation.Kind.GROUP:
+        return None
+
+    if conversation.is_external_direct:
+        if channel is None or carries_external(channel):
+            return None
+        return f'{channel} does not carry external conversations'
+
+    return f'{conversation.kind} conversations are not delivered externally'
 
 
 def audience(message, *, select_related=(), prefetch_related=()):
@@ -204,7 +255,7 @@ def eligible_for(message, channel):
     The sender is left out: they wrote it, and texting somebody their own
     message reads as an echo and bills for the privilege.
     """
-    if conversation_reason(message.conversation) is not None:
+    if conversation_reason(message.conversation, channel) is not None:
         # Nobody - and nothing written to the delivery log either. The log
         # answers for omissions among a group's members, and this is not an
         # omission: nothing in the product promises a direct message will be
@@ -260,9 +311,10 @@ def screen_for_message(message):
 
         an account      `message.sender`
         a bare number   `message.sender_participant.phone_number`, for somebody
-                        with no account who texted or emailed in - `sender` is
-                        NULL for them, and they are most of the members of most
-                        groups
+                        with no account who texted in - `sender` is NULL for
+                        them, and they are most of the members of most groups
+        a bare address  `message.sender_participant.email`, the same person
+                        arriving by the other channel
 
     Built once per message and read per recipient, so a fan-out stays two
     queries plus one however large the group is.
@@ -270,12 +322,12 @@ def screen_for_message(message):
     from user.blocks import screen_for_sender
 
     participant = message.sender_participant
-    number = (
-        participant.phone_number
-        if participant is not None and participant.user_id is None
-        else None
+    account_less = participant is not None and participant.user_id is None
+    return screen_for_sender(
+        user_id=message.sender_id,
+        phone_number=participant.phone_number if account_less else None,
+        email=participant.email if account_less else None,
     )
-    return screen_for_sender(user_id=message.sender_id, phone_number=number)
 
 
 def sender_block_reason(participant, message):
@@ -316,11 +368,18 @@ def block_reason(participant, screen):
 
     A phone-only recipient is never screened: `UserBlock.blocker` is a
     non-nullable FK to User, so somebody with no account cannot have blocked
-    anybody.
+    anybody. That reasoning is about the BLOCKER's side, and it still holds -
+    which is why an address-only recipient IS screened here. Nobody is claiming
+    they blocked anyone; the question is whether this sender blocked THEM, and
+    `screen.emails` holds exactly the addresses for which the answer is yes.
     """
-    if not screen or participant.user_id is None:
+    if not screen:
         return None
-    return BLOCKED_REASON if participant.user_id in screen else None
+    if participant.user_id is not None:
+        return BLOCKED_REASON if participant.user_id in screen.users else None
+    if participant.email:
+        return BLOCKED_REASON if participant.email in screen.emails else None
+    return None
 
 
 def consent_for(participant, channel):
@@ -386,9 +445,15 @@ _channels = {}
 #: {name: scheduler} dict still works; a name that is not in here is
 #: group-shaped, which is the safe default.
 _carries_direct = set()
+# Channels that carry a ONE-TO-ONE conversation whose far side is an address
+# rather than an account. Narrower than `_carries_direct`: push carries every
+# direct message because it goes to a device about a thread the person is
+# already in, while email carries only the external kind, because that is the
+# one with somebody outside the app to deliver to.
+_carries_external = set()
 
 
-def register_channel(name, scheduler, *, groups_only=True):
+def register_channel(name, scheduler, *, groups_only=True, external=False):
     """Announce that this channel wants a copy of every new message.
 
     `scheduler` is called with the Message and is responsible for queueing its
@@ -403,12 +468,30 @@ def register_channel(name, scheduler, *, groups_only=True):
     to the person's own device, about a conversation they are already in, so it
     carries a direct message as naturally as a group one and registers with
     `groups_only=False`.
+
+    `external=True` is the narrower claim email makes: not "I carry direct
+    messages" but "I carry the one-to-one threads whose far side is an address",
+    which are the only ones with somebody outside the app to deliver to.
     """
     _channels[name] = scheduler
     if groups_only:
         _carries_direct.discard(name)
     else:
         _carries_direct.add(name)
+    if external:
+        _carries_external.add(name)
+    else:
+        _carries_external.discard(name)
+
+
+def carries_external(name):
+    """Whether this channel carries an external one-to-one conversation.
+
+    False for a name that was never registered, which keeps the promise
+    `registered_channels` relies on: a test may patch `_channels` with a plain
+    dict and nothing here will raise on a name it has not seen.
+    """
+    return name in _carries_external
 
 
 def registered_channels():
@@ -425,9 +508,8 @@ def schedule_all(message):
     must not stop the other channels either, which is why the loop catches per
     channel rather than around the whole thing.
     """
-    reason = conversation_reason(message.conversation)
-
     for name, scheduler in list(_channels.items()):
+        reason = conversation_reason(message.conversation, name)
         if reason is not None and name not in _carries_direct:
             logger.debug(
                 'Message %s not offered to %s: %s', message.pk, name, reason

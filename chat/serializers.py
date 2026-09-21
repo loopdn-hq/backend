@@ -2,6 +2,8 @@
 import logging
 
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import validate_email as validate_email_address
 from django.db import transaction
 from rest_framework import serializers
 
@@ -23,7 +25,7 @@ from chat.services import (
     subscribe_to_conversation,
 )
 from user import privacy
-from user.blocks import has_blocked
+from user.blocks import blocks_email, has_blocked
 from user.lookups import find_user
 from user.models import phone_number_validator
 from user.serializers import PublicUserSerializer
@@ -820,10 +822,14 @@ class ConversationSerializer(serializers.ModelSerializer):
 
         viewer = self._viewer()
         for participant in obj.participants.all():
-            # A direct conversation cannot contain a phone-only member today,
-            # but titling one after a member with no account would crash on
-            # `.user.profile` rather than degrade, so it is skipped explicitly.
             if participant.user_id is None:
+                # An EXTERNAL thread is titled after exactly this row - the
+                # address on the far side - and `display_label` already falls
+                # back to the local part for it. A phone-only row is still
+                # skipped: it cannot occur in a one-to-one, and titling one
+                # after it would be a guess.
+                if obj.is_external_direct and participant.email:
+                    return participant.display_label
                 continue
             if viewer is None or participant.user_id != viewer.pk:
                 return participant.display_label
@@ -985,7 +991,9 @@ class DirectConversationSerializer(serializers.Serializer):
     """Start (or find) a one-to-one conversation with somebody."""
 
     identifier = serializers.CharField(
-        help_text='A username, or a phone number in +E.164 form.'
+        help_text=(
+            'A username, a phone number in +E.164 form, or an email address.'
+        )
     )
 
     #: What the blocker is told. Only ever shown to the person who made the
@@ -994,6 +1002,10 @@ class DirectConversationSerializer(serializers.Serializer):
 
     #: What everybody else is told, blocked or simply mistyped.
     NOT_FOUND = 'No user found with that username or number.'
+
+    #: Set by `validate_identifier` when the identifier is an address nobody
+    #: has. `create` reads it to open an external thread rather than refusing.
+    external_address = None
 
     #: What somebody is told when the other person's Privacy settings refuse.
     #: Plain, unlike the block wording above: a privacy setting is not a secret.
@@ -1033,10 +1045,53 @@ class DirectConversationSerializer(serializers.Serializer):
         if candidate is not None and has_blocked(viewer, candidate):
             raise serializers.ValidationError(self.BLOCKED_BY_ME)
 
+        # Nobody has it - and if it is an address, that is not a dead end any
+        # more. AFTER the two branches above, deliberately: an address whose
+        # owner hid it in Settings → Privacy, or who is on the far side of a
+        # block, is answered by them and never reaches here, so this cannot
+        # become the account lookup `user/invites.py` exists to refuse.
+        #
+        # `find_user` treats '@' as a TRY and falls through to the username
+        # branch, because Django allows '@' in a username - so a real address
+        # is the thing that is left once BOTH have missed, and it still has to
+        # validate. Without that check a mistyped username containing '@'
+        # would open a bridge to a mailbox nobody owns.
+        address = value.strip().lower()
+        if '@' in address:
+            try:
+                validate_email_address(address)
+            except DjangoValidationError:
+                raise serializers.ValidationError(self.NOT_FOUND)
+            if address == (viewer.email or '').strip().lower():
+                raise serializers.ValidationError(self.NOT_FOUND)
+            if blocks_email(viewer, address):
+                raise serializers.ValidationError(self.BLOCKED_BY_ME)
+            self.external_address = address
+            return value
+
         raise serializers.ValidationError(self.NOT_FOUND)
 
     def create(self, validated_data):
         starter = self.context['request'].user
+
+        address = getattr(self, 'external_address', None)
+        if address is not None:
+            from user.invites import TooManyInvites, consume_invite_allowance
+
+            # The same bucket `user/invites.py` counts against, not a second
+            # one beside it: two doors onto one cap, or the real limit is
+            # double what either says. Counted as an ATTEMPT, so a probe costs
+            # the prober the same whether or not anything is sent.
+            if not consume_invite_allowance(starter):
+                raise TooManyInvites
+
+            conversation, created = Conversation.start_direct_external(
+                starter, address
+            )
+            if created:
+                subscribe_to_conversation(conversation, [starter])
+            return conversation
+
         conversation, created = Conversation.start_direct(starter, self.other)
         if created:
             announce_added_to_conversation(conversation, [self.other])
