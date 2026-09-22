@@ -129,7 +129,29 @@ CORS_ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
+# The desktop app's own page origin.
+#
+# A Tauri webview reports tauri://localhost on macOS and Linux, and
+# http://tauri.localhost on Windows - different origins to a browser, so both
+# are listed. Kept separate from the deployed frontend origins because this
+# list is reused below for payment redirects, where the desktop origin must
+# NOT appear: see BILLING_ALLOWED_REDIRECT_ORIGINS.
+DESKTOP_ORIGINS = ['tauri://localhost', 'http://tauri.localhost']
+
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '310157572832-e20tuelb23m2jbrier48hvg49i9kvg5t.apps.googleusercontent.com')
+
+# Every Google OAuth client whose ID tokens this API accepts.
+#
+# The web app signs in through a Web client; the desktop app cannot use that
+# flow (Google Identity Services validates window.location.origin, and
+# tauri://localhost cannot be registered) so it uses a Desktop client, whose
+# tokens carry a DIFFERENT `aud`. Verification compares `aud` against a single
+# value at a time, so the serializer tries each of these in turn.
+GOOGLE_CLIENT_IDS = [
+    client_id.strip()
+    for client_id in os.environ.get('GOOGLE_CLIENT_IDS', GOOGLE_CLIENT_ID).split(',')
+    if client_id.strip()
+]
 
 
 # Application definition
@@ -170,6 +192,9 @@ INSTALLED_APPS = [
     # Custom-priced plans sold through the Plan Builder - a dynamic,
     # catalog-driven configuration rather than billing's single plan code.
     'enterprise',
+    # Account roles and the feature matrix. Schema only for now - nothing
+    # reads these tables yet; see docs/rbac_plan.md for the build order.
+    'rbac',
 ]
 
 MIDDLEWARE = [
@@ -505,7 +530,17 @@ FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://loopdn.com').rstrip('/')
 # "you just paid, now here is a look-alike login page"). CORS_ALLOWED_ORIGINS
 # is already the list of frontends this API trusts, so it doubles as the
 # redirect allowlist rather than inventing a second one to keep in sync.
-BILLING_ALLOWED_REDIRECT_ORIGINS = set(CORS_ALLOWED_ORIGINS) | {FRONTEND_URL}
+#
+# With one exception. Adding the desktop origins to CORS_ALLOWED_ORIGINS -
+# which they must be, or neither REST nor the chat socket works from the
+# desktop app - would silently make tauri://localhost a valid Stripe
+# success_url. It is not attacker-reachable, but it does not belong on a list
+# whose whole purpose is refusing redirect targets, and it is not needed: the
+# desktop build sends the public web origin for checkout, exactly because
+# Stripe rejects a custom scheme anyway.
+BILLING_ALLOWED_REDIRECT_ORIGINS = (
+    set(CORS_ALLOWED_ORIGINS) - set(DESKTOP_ORIGINS)
+) | {FRONTEND_URL}
 
 # How long a password-reset link stays valid. This is a real Django setting -
 # django.contrib.auth.tokens.default_token_generator reads it directly, so

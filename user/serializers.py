@@ -375,16 +375,28 @@ class GoogleCredentialSerializer(serializers.Serializer):
     credential = serializers.CharField(trim_whitespace=True)
 
     def validate_credential(self, value):
-        if not settings.GOOGLE_CLIENT_ID:
+        if not settings.GOOGLE_CLIENT_IDS:
             raise serializers.ValidationError('Google sign-in is not configured.')
 
-        try:
-            claims = id_token.verify_oauth2_token(
-                value,
-                google_requests.Request(),
-                settings.GOOGLE_CLIENT_ID,
-            )
-        except (GoogleAuthError, ValueError):
+        # Tried one client ID at a time rather than passing audience=None and
+        # checking `aud` afterwards. Passing None turns Google's own audience
+        # verification OFF, leaving the only check in code a later edit could
+        # drop without anything failing - the token would still verify, just
+        # for somebody else's application. The loop is slower by nothing that
+        # matters (Google's certs are cached) and cannot be silently weakened.
+        claims = None
+        for client_id in settings.GOOGLE_CLIENT_IDS:
+            try:
+                claims = id_token.verify_oauth2_token(
+                    value,
+                    google_requests.Request(),
+                    client_id,
+                )
+                break
+            except (GoogleAuthError, ValueError):
+                continue
+
+        if claims is None:
             raise serializers.ValidationError('The Google credential is invalid.')
 
         if not claims.get('email') or claims.get('email_verified') is not True:

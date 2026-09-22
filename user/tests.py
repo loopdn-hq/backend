@@ -206,7 +206,7 @@ class RegisterTests(EnvelopeAssertions, APITestCase):
         )
 
 
-@override_settings(GOOGLE_CLIENT_ID='google-client-id')
+@override_settings(GOOGLE_CLIENT_IDS=['google-client-id'])
 class GoogleAuthTests(EnvelopeAssertions, APITestCase):
     def setUp(self):
         self.url = reverse('user:user-google')
@@ -218,6 +218,41 @@ class GoogleAuthTests(EnvelopeAssertions, APITestCase):
             'family_name': 'G',
             'name': 'Yul G',
         }
+
+    @override_settings(GOOGLE_CLIENT_IDS=['web-client-id', 'desktop-client-id'])
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_a_desktop_client_id_is_accepted(self, verify_token):
+        """The desktop app signs in with a different OAuth client.
+
+        Google Identity Services validates window.location.origin, and
+        tauri://localhost cannot be registered there - so the desktop build
+        uses a Desktop client, whose ID tokens carry a different `aud`.
+        Verification takes one audience at a time, so the first client ID
+        raises and the second must still be tried.
+        """
+        def verify(token, request, client_id):
+            if client_id != 'desktop-client-id':
+                raise ValueError('Token has wrong audience')
+            return self.claims
+
+        verify_token.side_effect = verify
+
+        data = self.assertSuccess(
+            self.client.post(self.url, {'credential': 'desktop-id-token'}),
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(data['user']['email'], 'yul@example.com')
+        self.assertEqual(verify_token.call_count, 2)
+
+    @override_settings(GOOGLE_CLIENT_IDS=['web-client-id', 'desktop-client-id'])
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_a_token_for_no_configured_client_is_rejected(self, verify_token):
+        """Trying several audiences must not become accepting any audience."""
+        verify_token.side_effect = ValueError('Token has wrong audience')
+
+        response = self.client.post(self.url, {'credential': 'someone-elses-token'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(verify_token.call_count, 2)
 
     @patch('user.serializers.id_token.verify_oauth2_token')
     def test_creates_an_account_and_returns_tokens(self, verify_token):
