@@ -35,7 +35,9 @@ import json
 import os
 import re
 import sys
+from contextlib import ExitStack
 from pathlib import Path
+from unittest import mock
 
 import django
 
@@ -44,6 +46,7 @@ sys.path.insert(0, str(HERE.parent))
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'loopd.settings')
 django.setup()
 
+from django.test import override_settings  # noqa: E402
 from django.test.utils import setup_test_environment, teardown_test_environment  # noqa: E402
 from django.test.runner import DiscoverRunner  # noqa: E402
 from rest_framework.test import APIClient  # noqa: E402
@@ -77,6 +80,12 @@ EXPECTED = {
     'Stripe webhook (provider callback)': (
         400, 'Postman cannot mint a valid Stripe signature; only the Stripe '
              'CLI or a real event can'),
+    'Decline a call': (
+        400, 'the signed-in user started the call, and cannot decline their '
+             'own - somebody else has to'),
+    'LiveKit webhook (provider callback)': (
+        400, 'Postman cannot mint a valid LiveKit signature; only LiveKit '
+             'itself can'),
 }
 
 #: Requests to skip, with the reason. Kept short on purpose - a skip is a hole
@@ -149,6 +158,40 @@ def capture_from(item, body, variables):
                 variables[name] = value
 
 
+def livekit_stack():
+    """LiveKit and S3, stood in for.
+
+    The Calls folder is exercised for real - real tokens, real rows, real
+    permission and plan checks - with only what would leave the process
+    replaced: LiveKit's egress and room APIs, and the recordings bucket. Without
+    this every call request would answer 503, which proves nothing.
+    """
+    from livekit import api as lk
+
+    stack = ExitStack()
+    stack.enter_context(override_settings(
+        LIVEKIT_URL='wss://livekit.example.test',
+        LIVEKIT_API_KEY='verify-key',
+        LIVEKIT_API_SECRET='verify-secret-verify-secret-verify-secret',
+        LIVEKIT_RECORDING_BUCKET='verify-bucket',
+    ))
+    stack.enter_context(mock.patch(
+        'calls.livekit.start_recording',
+        return_value=lk.EgressInfo(
+            egress_id='EG_verify', status=lk.EgressStatus.EGRESS_ACTIVE),
+    ))
+    stack.enter_context(mock.patch(
+        'calls.livekit.stop_recording',
+        return_value=lk.EgressInfo(
+            egress_id='EG_verify', status=lk.EgressStatus.EGRESS_ENDING),
+    ))
+    stack.enter_context(mock.patch('calls.livekit.delete_room'))
+    stack.enter_context(mock.patch(
+        'calls.storage.download_url', return_value='https://signed.example/recording.mp4'))
+    stack.enter_context(mock.patch('calls.storage.delete_file'))
+    return stack
+
+
 def seed_before(name, variables):
     """Create the other people the collection's examples talk about.
 
@@ -159,6 +202,16 @@ def seed_before(name, variables):
     find_user deliberately refuses to resolve an unverified one.
     """
     from django.contrib.auth.models import User
+
+    if name == 'Start recording':
+        # Free has no recording. A person would upgrade first; do that.
+        from billing.models import Plan, Subscription
+
+        user = User.objects.get(username='yul')
+        Subscription.objects.update_or_create(
+            user=user, defaults={'plan': Plan.objects.get(code='premium')}
+        )
+        return
 
     if name != 'Create group':
         return
@@ -188,6 +241,18 @@ def seed_after(name, variables):
         row = EmailOtp.objects.order_by('-timestamp').first()
         if row is not None:
             variables['otp_code'] = row.code
+    elif name == 'Stop recording':
+        # LiveKit reports the finished file by webhook, which Postman cannot
+        # send; report it the same way so Get and Delete have a real recording.
+        from livekit import api as lk
+
+        from calls.services import apply_egress_info
+
+        apply_egress_info(lk.EgressInfo(
+            egress_id='EG_verify',
+            status=lk.EgressStatus.EGRESS_COMPLETE,
+            file_results=[lk.FileInfo(size=2048, duration=30 * 10**9)],
+        ))
     elif name == 'Request phone code':
         # Telnyx owns the SMS code; unconfigured, verification accepts this one.
         from sms.verification import DEV_BYPASS_CODE
@@ -222,6 +287,8 @@ def run():
     setup_test_environment()
     runner = DiscoverRunner(verbosity=0, interactive=False)
     old_config = runner.setup_databases()
+    calls_stack = livekit_stack()
+    calls_stack.__enter__()
 
     variables = {v['key']: v['value'] for v in collection.get('variable', [])}
     client = APIClient()
@@ -286,6 +353,7 @@ def run():
                 results.append((name, mark, f'{code} {detail}'))
                 print(f'   {mark}  {code}  {name}  {detail}')
     finally:
+        calls_stack.__exit__(None, None, None)
         runner.teardown_databases(old_config)
         teardown_test_environment()
 

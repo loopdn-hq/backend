@@ -647,6 +647,13 @@ def _sync_account_plan(contract, *, current_period_end=None):
             'max_members_per_group': limits['max_members_per_group'],
             'max_admins_per_group': limits['max_admins_per_group'],
             'storage_gb': limits['storage_gb'],
+            # The catalog has no call options yet, so a contract gets what the
+            # seeded Enterprise plan has: no participant cap, screen sharing
+            # and recording on, recordings kept until somebody deletes them.
+            'max_call_participants': None,
+            'has_screen_share': True,
+            'has_call_recording': True,
+            'call_recording_retention_days': None,
             'features': _feature_labels_for_contract(contract),
             'is_custom_pricing': True,
             'active': True,

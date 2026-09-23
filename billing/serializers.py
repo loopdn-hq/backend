@@ -30,7 +30,9 @@ class PlanSerializer(serializers.ModelSerializer):
         fields = (
             'code', 'name', 'monthly_price_cents', 'price_display',
             'max_groups', 'max_members_per_group', 'max_admins_per_group',
-            'storage_gb', 'has_whatsapp', 'has_telegram', 'features',
+            'storage_gb', 'max_call_participants', 'has_screen_share',
+            'has_call_recording', 'call_recording_retention_days',
+            'has_whatsapp', 'has_telegram', 'features',
             'is_custom_pricing',
         )
 
