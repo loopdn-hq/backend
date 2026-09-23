@@ -33,6 +33,21 @@ class Plan(models.Model):
     max_admins_per_group = models.PositiveIntegerField(null=True, blank=True)
     storage_gb = models.PositiveIntegerField(null=True, blank=True)
 
+    # Calling. Enforced server-side by `calls/services.py`; the client only
+    # reads these to decide what to show.
+    #
+    # Null means "no limit", like every limit above. The two flags default to
+    # False so a plan nobody has thought about yet grants nothing.
+    #
+    # A call's limits are its GROUP OWNER's plan (a direct conversation uses the
+    # person who started the call) - the same rule as members-per-group.
+    max_call_participants = models.PositiveIntegerField(null=True, blank=True)
+    has_screen_share = models.BooleanField(default=False, db_default=False)
+    has_call_recording = models.BooleanField(default=False, db_default=False)
+    # How long a finished recording is kept before it is deleted. Null keeps it
+    # until somebody deletes it.
+    call_recording_retention_days = models.PositiveIntegerField(null=True, blank=True)
+
     has_whatsapp = models.BooleanField(default=False, db_default=False)
     has_telegram = models.BooleanField(default=False, db_default=False)
 

@@ -22,7 +22,8 @@ class StripeWebhookEventAdmin(admin.ModelAdmin):
 class PlanAdmin(admin.ModelAdmin):
     list_display = (
         'name', 'code', 'monthly_price_cents', 'max_groups',
-        'max_members_per_group', 'is_custom_pricing', 'active', 'sort_order',
+        'max_members_per_group', 'max_call_participants', 'has_call_recording',
+        'is_custom_pricing', 'active', 'sort_order',
     )
     list_filter = ('active', 'is_custom_pricing')
     search_fields = ('name', 'code')

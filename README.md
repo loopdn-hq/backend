@@ -21,6 +21,12 @@ clients need and nothing they render:
 - **Messages** — text, image and file attachments, paginated history.
 - **Realtime** — one websocket per user at `/ws/chat/`, carrying new messages,
   typing indicators and new-conversation events for every thread you belong to.
+- **Calls** — voice and video calls in any conversation, on a self-hosted
+  [LiveKit](https://livekit.io). Django decides who may join, enforces the plan's
+  participant limit and signs a short-lived token; the browser then talks to
+  LiveKit directly, so no audio or video ever passes through this API. Call
+  events ring people over the same websocket. Recording writes to S3 by way of
+  LiveKit's egress service, and Django keeps only the metadata.
 
 Two conventions worth knowing before reading the code:
 
@@ -37,6 +43,7 @@ Two conventions worth knowing before reading the code:
 | [user/](user/) | Accounts, JWT auth, profiles, search, websocket auth middleware |
 | [otp/](otp/) | One-time passcodes: issue, verify, rate-limit, expire |
 | [chat/](chat/) | Conversations, participants, messages, attachments, websocket consumer |
+| [calls/](calls/) | Calls, participants, recordings, the LiveKit wrapper and webhook; plan limits are read from [billing/](billing/) |
 
 ## Tech stack
 
@@ -95,6 +102,104 @@ Celery is optional locally — nothing schedules work yet. To exercise it, point
 ```bash
 celery -A loopd worker --loglevel=info
 ```
+
+### Testing calls locally
+
+Calls run on [LiveKit](https://livekit.io), a separate media server. Django only
+authorises a call and signs a token; the browser then connects to LiveKit
+directly, so **a call cannot connect unless a LiveKit server is reachable**. The
+tests (`python manage.py test calls`) need none of this — they never contact
+LiveKit. This is for trying the feature by hand.
+
+You will have three things running at once, each in its own terminal:
+
+| What | Where |
+| --- | --- |
+| Django (`runserver`) | port 8000 |
+| The web frontend | port 3000 |
+| A LiveKit server, in Docker | port 7880 (signalling), 7881/7882 (media) |
+
+SQLite and the in-memory channel layer are fine; no Postgres or Redis needed.
+
+**1. Give Django a LiveKit key and secret.** Any pair will do, as long as the
+LiveKit server is started with the *same* one. Generate one, and keep the secret
+at 32 characters or more:
+
+```bash
+python -c "import secrets; print('LIVEKIT_API_KEY=API' + secrets.token_hex(6)); print('LIVEKIT_API_SECRET=' + secrets.token_urlsafe(32))"
+```
+
+Put both lines in `.env`, with the address of the server you are about to start:
+
+```
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+LIVEKIT_URL=ws://localhost:7880
+LIVEKIT_API_URL=
+```
+
+Leave `LIVEKIT_API_URL` blank: it defaults to `LIVEKIT_URL`. All three of key,
+secret and URL must be set, or none — a partly configured setup fails
+`manage.py check` (`calls.E001`), and with none set every call endpoint answers
+`503`.
+
+**2. Start LiveKit.** Needs Docker Desktop running. On Windows, from this folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\livekit-local.ps1
+```
+
+It reads the key and secret from `.env` and runs the same image version the
+staging service uses. Leave it running; Ctrl+C stops it. `curl http://localhost:7880`
+should answer `OK`. On macOS or Linux, run the equivalent by hand:
+
+```bash
+docker run --rm --name livekit -p 7880:7880 -p 7881:7881 -p 7882:7882/udp \
+  -e "LIVEKIT_KEYS=<your key>: <your secret>" \
+  -e $'LIVEKIT_CONFIG=port: 7880\nrtc:\n  tcp_port: 7881\n  udp_port: 7882\n  use_external_ip: false\n' \
+  livekit/livekit-server:v1.13.7 --node-ip 127.0.0.1
+```
+
+**3. Restart `runserver`.** Django reads `.env` only when it starts, so a running
+server still has the old values. Then check that it can reach LiveKit:
+
+```bash
+python manage.py shell -c "from calls import livekit; livekit.delete_room('x'); print('reachable')"
+```
+
+`reachable` means it can. `Cannot reach LiveKit at ...` means the container is not
+running or `LIVEKIT_URL` is wrong.
+
+**4. Make a call.** A call needs two people, so sign in as two different
+accounts at once — a normal window and a private one, say — and put both in the
+same group or direct conversation. One presses the call button, the other gets the
+incoming call and accepts. `localhost` counts as a secure context, so the browser
+will allow the microphone and camera. Try audio and video, mute and unmute, one
+person leaving, and the last person leaving (which ends the call).
+
+**What does not work locally**
+
+- **A closed tab is not noticed straight away.** LiveKit reports disconnects to
+  Django by webhook, and it cannot reach your machine. The person stays "in" the
+  call until the background sweep gives their place back (`calls.sweep_stale_calls`,
+  which needs Celery beat, so in practice: until they leave properly).
+- **Recording.** It needs LiveKit's separate egress service and an S3 bucket, and
+  neither exists in this setup. `POST .../recording/start/` answers `503` here.
+  Leave `LIVEKIT_RECORDING_BUCKET` blank and it says so plainly.
+- **Plan limits are still enforced.** Every account is on Free unless you change
+  it, which allows 4 people on a call and has no screen sharing or recording.
+  Change a plan in `/admin/` (Billing → Subscriptions) to try the others.
+
+**When something goes wrong**
+
+| You see | It means |
+| --- | --- |
+| `503` from `POST /api/v1/calls/` | `LIVEKIT_URL`, `LIVEKIT_API_KEY` or `LIVEKIT_API_SECRET` is missing, or `runserver` was not restarted after setting them |
+| `Cannot reach LiveKit at ...` in the Django log | The LiveKit container is not running, or `LIVEKIT_URL` points somewhere that does not exist |
+| The call starts, then hangs up about a second later, and a following `join` gets `409` | The browser could not connect to LiveKit, so the app left the call. Check the container and the browser console |
+| `403` "This call is full" | The plan's participant limit — see above |
+| `404` on a call you can see in the UI | You are not an active member of that conversation |
+| `database is locked` | Fixed in `loopd/settings.py` for SQLite (`transaction_mode: IMMEDIATE`); restart `runserver` if you still see it |
 
 ### The full stack, in Docker
 
