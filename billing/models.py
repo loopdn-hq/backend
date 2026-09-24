@@ -42,17 +42,17 @@ class Plan(models.Model):
     # A call's limits are its GROUP OWNER's plan (a direct conversation uses the
     # person who started the call) - the same rule as members-per-group.
     #
-    # has_calls/has_video_calls default to True, unlike every other flag here -
-    # calling ships as part of the four platform plans, and only the Enterprise
-    # Plan Builder sells it as a separate line item
-    # (enterprise.services.FEATURE_KEYS: 'voice_calls', 'video_calls'). A
-    # custom plan built from a catalog that did not include them gets False;
+    # Whether this plan may call at all - audio and video together, one
+    # permission rather than two. A plan does not choose one without the
+    # other: video is not billed, sold or gated separately from voice.
+    #
+    # Defaults to True, unlike every other flag here - calling ships as part
+    # of the four platform plans, and only the Enterprise Plan Builder sells
+    # it as a separate line item (enterprise.services.FEATURE_KEYS: 'calls').
+    # A custom plan built from a catalog that did not include it gets False;
     # Free, Premium, Business and the seeded Enterprise row are untouched by
     # this default, so nothing about their calling changed by adding it.
     has_calls = models.BooleanField(default=True, db_default=True)
-    # Meaningless with has_calls False - calls/services.py checks has_calls
-    # first, so a plan can never have video without voice.
-    has_video_calls = models.BooleanField(default=True, db_default=True)
     max_call_participants = models.PositiveIntegerField(null=True, blank=True)
     has_screen_share = models.BooleanField(default=False, db_default=False)
     has_call_recording = models.BooleanField(default=False, db_default=False)

@@ -13,9 +13,4 @@ class Migration(migrations.Migration):
             name='has_calls',
             field=models.BooleanField(db_default=True, default=True),
         ),
-        migrations.AddField(
-            model_name='plan',
-            name='has_video_calls',
-            field=models.BooleanField(db_default=True, default=True),
-        ),
     ]

@@ -1,20 +1,18 @@
-"""Add calling to the Plan Builder catalog: three priced, toggleable features
-on the existing catalog version - voice calls, video calls, and recording.
+"""Add calling to the Plan Builder catalog: two priced, toggleable features on
+the existing catalog version - calls (audio and video together) and
+recording.
+
+One `calls` feature, not two: `billing.Plan.has_calls` is a single flag that
+grants both audio and video, so a custom plan has no reason to buy them
+separately either.
 
 Prices are PLACEHOLDERS, same as 0002_seed_pricing_catalog's own and pending
 the same confirmation from product/finance - they exist so the feature is
-priced at all, not because $15/$25/$20 are numbers anyone has signed off on.
+priced at all, not because $25/$20 are numbers anyone has signed off on.
 
-Added to catalog version 1 in place, not a new version 2, matching how this
-catalog has been extended so far (0002 is still the only version seeded). A
-version bump protects a contract that has already priced against a version
-from a LATER price change to something it already bought - it is not needed
-to ADD a feature nothing has bought yet. Safe here specifically: nothing here
-changes an existing option's price, and `_sync_entitlements` /
-`_sync_account_plan` read `configuration['features']` with `.get`, so a
-contract frozen before this migration (there are already several in this
-database) treats a key it has never heard of as "not bought" rather than
-erroring the next time it is touched.
+Added to catalog version 1 in place, not a new version 2 - see the same
+reasoning in this migration's own history (0002 is still the only version
+seeded, and nothing has bought either of these keys yet).
 """
 from django.db import migrations
 
@@ -31,12 +29,8 @@ def seed(apps, schema_editor):
 
     features = [
         (
-            'voice_calls', 'Voice calls',
-            'One-to-one and group voice calls, on LiveKit.', 1_500,
-        ),
-        (
-            'video_calls', 'Video calls',
-            'Video, on top of voice calls. Requires voice calls.', 2_500,
+            'calls', 'Calls',
+            'Voice and video calls, one-to-one and in groups, on LiveKit.', 2_500,
         ),
         (
             'call_recording', 'Call recording',
@@ -53,8 +47,7 @@ def seed(apps, schema_editor):
 def unseed(apps, schema_editor):
     PlanFeature = apps.get_model('enterprise', 'PlanFeature')
     PlanFeature.objects.filter(
-        catalog_version__version=1,
-        key__in=['voice_calls', 'video_calls', 'call_recording'],
+        catalog_version__version=1, key__in=['calls', 'call_recording'],
     ).delete()
 
 

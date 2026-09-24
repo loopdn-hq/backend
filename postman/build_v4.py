@@ -687,8 +687,8 @@ BILLING = [
         desc=(
             'The pricing page: Free, Premium, Business, Enterprise - their '
             'monthly price, group/member/admin limits, storage, call limits '
-            '(`has_calls`, `has_video_calls`, `max_call_participants`, '
-            '`has_screen_share`, `has_call_recording`, '
+            '(`has_calls` covers audio and video together, plus '
+            '`max_call_participants`, `has_screen_share`, `has_call_recording`, '
             '`call_recording_retention_days` - `null` means unlimited / kept '
             'until deleted), and whether WhatsApp/Telegram are included.\n\n'
             'Public, so a logged-out visitor sees pricing before signing up. '
@@ -778,10 +778,13 @@ BILLING = [
                                   'metadata': {'credit_package_id': '{{credit_package_id}}'}}}},
         desc=(
             '**Called by Stripe, not by a client.** Included so the shape of '
-            'every event this project understands is documented in one '
-            'place: `checkout.session.completed` (subscription activation or '
-            'a credit top-up), `customer.subscription.updated` and '
-            '`customer.subscription.deleted`.\n\n'
+            'the account-facing events this project understands is '
+            'documented in one place: `checkout.session.completed` '
+            '(subscription activation or a credit top-up), '
+            '`customer.subscription.updated`, `customer.subscription.deleted`, '
+            '`invoice.paid`, `invoice.payment_failed` and `charge.refunded`. '
+            'The catalog-sync events (`product.*`, `price.*`) are a separate '
+            'example below.\n\n'
             'Authenticated by a signature over the raw body '
             '(`Stripe-Signature` header, verified against '
             '`STRIPE_WEBHOOK_SECRET`), not a token - like the SMS webhook, '
@@ -797,6 +800,51 @@ BILLING = [
             '| `500` | a known event failed to process - Stripe retries |\n\n'
             'Repeat with the same event `id` to see de-duplication: the '
             'second call returns `duplicate: true` and changes nothing.'
+        )),
+    req('Stripe webhook: plan catalog sync (provider callback)', 'POST',
+        '/api/v1/billing/webhooks/stripe/', auth=False,
+        body={
+            'id': 'evt_catalog_1', 'type': 'price.updated',
+            'data': {'object': {
+                'id': 'price_premium_live', 'product': 'prod_premium_live',
+                'unit_amount': 999, 'currency': 'usd',
+                'recurring': {'interval': 'month'},
+                'metadata': {
+                    'data': (
+                        '{"type": "plan", "code": "premium", "max_groups": 25, '
+                        '"max_members_per_group": 250, "max_admins_per_group": 5, '
+                        '"storage_gb": 10, "has_calls": true, '
+                        '"max_call_participants": 25, "has_call_recording": true, '
+                        '"call_recording_retention_days": 30, "has_whatsapp": true, '
+                        '"has_telegram": true, "is_custom_pricing": false}'
+                    ),
+                },
+            }},
+        },
+        desc=(
+            'The same endpoint again - Stripe is the one place plan pricing '
+            'and limits are meant to be edited going forward, not a Django '
+            'admin form. Set `metadata.data` (a JSON string) on a Price - or '
+            'a Product, before it has a price - to this shape, and '
+            '`product.created/updated` or `price.created/updated` upserts the '
+            'matching `Plan` row from it.\n\n'
+            '**Calling fields**, read from the same payload: `has_calls` is '
+            'one permission for audio and video together, not two - it '
+            'defaults to `true` (matching the column\'s own default) when a '
+            'product\'s metadata has never mentioned calling at all, so '
+            'editing a price for an unrelated reason cannot silently switch '
+            'calling off for a plan nobody has touched calling on. '
+            '`max_call_participants`, `has_call_recording` and '
+            '`call_recording_retention_days` are read the same way. '
+            '`has_screen_share` is never read from metadata - it always just '
+            'equals `has_calls`, the same rule the Enterprise Plan Builder '
+            'uses (see `10. Enterprise`).\n\n'
+            'Matched to a `Plan` by `code` for a `product.created` with no '
+            'price yet, and by `stripe_product_id` afterwards - a second '
+            '`price.updated` for the SAME product updates that plan in place '
+            'rather than creating another one. Running this as written '
+            'returns `400` for the same signature reason as *Stripe webhook '
+            '(provider callback)*.'
         )),
 ]
 
@@ -1083,11 +1131,10 @@ COLLECTION = {
             'short-lived token; LiveKit carries the media, so **audio and video '
             'never pass through this API**. Recording (to S3), its retention '
             'and its permissions are here too. *Plan* objects gained '
-            '`has_calls`, `has_video_calls`, `max_call_participants`, '
-            '`has_screen_share`, `has_call_recording` and '
-            '`call_recording_retention_days`. Calling and video calling can '
-            'each be switched off per plan - see `10. Enterprise` for pricing '
-            'them separately on a custom plan.\n'
+            '`has_calls` (one flag for audio and video together), '
+            '`max_call_participants`, `has_screen_share`, `has_call_recording` '
+            'and `call_recording_retention_days`. Calling can be switched off '
+            'per plan - see `10. Enterprise` for pricing it on a custom plan.\n'
             '- **Call events arrive on the existing websocket**, `/ws/chat/`, '
             'to everyone in the conversation: `call.incoming`, `call.accepted`, '
             '`call.rejected`, `call.ended`, `call.recording.started` and '

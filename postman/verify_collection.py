@@ -80,6 +80,8 @@ EXPECTED = {
     'Stripe webhook (provider callback)': (
         400, 'Postman cannot mint a valid Stripe signature; only the Stripe '
              'CLI or a real event can'),
+    'Stripe webhook: plan catalog sync (provider callback)': (
+        400, 'same reason as the request above - no valid signature'),
     'Decline a call': (
         400, 'the signed-in user started the call, and cannot decline their '
              'own - somebody else has to'),

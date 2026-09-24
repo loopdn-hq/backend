@@ -452,16 +452,22 @@ class StripeWebhook(APIView):
         yet (`_upsert_plan_from_product_only`) gets the same fields a priced
         one does, once its price arrives and this runs again.
 
-        `has_calls`/`has_video_calls` default to True - matching
-        `Plan.has_calls`'s own db_default - so a product whose metadata has
-        never mentioned calling at all is not silently switched off calling
-        the next time somebody edits its price for an unrelated reason. Every
-        other field here defaults the way `Plan`'s own column does: off, or
-        no limit.
+        `has_calls` defaults to True - matching `Plan.has_calls`'s own
+        db_default - so a product whose metadata has never mentioned calling
+        at all is not silently switched off the next time somebody edits its
+        price for an unrelated reason. Every other field here defaults the
+        way `Plan`'s own column does: off, or no limit.
+
+        `has_screen_share` is not read from the payload at all: it is bundled
+        with calling rather than sold separately, the same rule
+        `enterprise.services._sync_account_plan` uses for a custom plan -
+        whoever has calls gets it, and there is no metadata key that can turn
+        it off on its own.
         """
+        has_calls = self._coerce_bool(payload.get('has_calls'), default=True)
         return {
-            'has_calls': self._coerce_bool(payload.get('has_calls'), default=True),
-            'has_video_calls': self._coerce_bool(payload.get('has_video_calls'), default=True),
+            'has_calls': has_calls,
+            'has_screen_share': has_calls,
             'max_call_participants': self._coerce_int(payload.get('max_call_participants')),
             'has_call_recording': self._coerce_bool(payload.get('has_call_recording')),
             'call_recording_retention_days': self._coerce_int(

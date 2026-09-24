@@ -32,9 +32,10 @@ logger = logging.getLogger(__name__)
 LIMIT_CATEGORIES = ['max_groups', 'max_members_per_group', 'max_admins_per_group', 'storage_gb']
 FEATURE_KEYS = [
     'extended_message_history', 'search', 'advanced_notifications', 'moderation_tools',
-    # Calling. Each is its own line item, priced separately - see
-    # `_sync_account_plan` for how they become `billing.Plan` flags.
-    'voice_calls', 'video_calls', 'call_recording',
+    # Calling: one line item for audio and video together (billing.Plan.has_calls
+    # is a single flag too, not two), plus recording as its own. See
+    # `_sync_account_plan` for how these become `billing.Plan` flags.
+    'calls', 'call_recording',
 ]
 CURRENCY = 'usd'
 DRAFT_LIFETIME = timedelta(days=30)
@@ -649,8 +650,7 @@ def _sync_account_plan(contract, *, current_period_end=None):
     limits = contract.configuration_snapshot['limits']
     # .get, not [key]: see the same comment in _sync_entitlements.
     features = contract.configuration_snapshot['features']
-    voice_calls = bool(features.get('voice_calls'))
-    video_calls = bool(features.get('video_calls'))
+    calls = bool(features.get('calls'))
     call_recording = bool(features.get('call_recording'))
 
     plan, _ = Plan.objects.update_or_create(
@@ -664,17 +664,14 @@ def _sync_account_plan(contract, *, current_period_end=None):
             'storage_gb': limits['storage_gb'],
             # Calling is priced per feature for a custom plan, unlike the four
             # platform plans, where it ships as standard - see the comment on
-            # `Plan.has_calls`. A video call is still a call: buying
-            # `video_calls` alone is enough to turn calling on at all, so a
-            # buyer is never left with video access and no way to place a
-            # plain audio call.
-            'has_calls': voice_calls or video_calls,
-            'has_video_calls': video_calls,
-            # Not sold as its own line item yet, so every contract gets it -
-            # the same placeholder the catalog had before calling existed at
-            # all. Worth its own FEATURE_KEYS entry once screen-sharing during
-            # a call is something Enterprise buyers are actually charged for.
-            'has_screen_share': True,
+            # `Plan.has_calls`. One flag for audio and video together, same as
+            # the platform plans - a contract does not buy video separately.
+            'has_calls': calls,
+            # Bundled with calling rather than sold separately: whoever bought
+            # calling gets screen sharing on top at no extra charge, so it is
+            # not its own FEATURE_KEYS entry and is never read from the
+            # configuration.
+            'has_screen_share': calls,
             'has_call_recording': call_recording,
             # A flat 90 days when bought. Not yet its own priced tier the way
             # storage_gb is - the whole retention PERIOD is currently included
