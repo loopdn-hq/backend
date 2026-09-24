@@ -297,6 +297,7 @@ class StripeWebhook(APIView):
             'max_members_per_group': self._coerce_int(payload.get('max_members_per_group')),
             'max_admins_per_group': self._coerce_int(payload.get('max_admins_per_group')),
             'storage_gb': self._coerce_int(payload.get('storage_gb')),
+            **self._call_defaults(payload),
             'has_whatsapp': self._coerce_bool(payload.get('has_whatsapp')),
             'has_telegram': self._coerce_bool(payload.get('has_telegram')),
             'features': payload.get('features') if isinstance(payload.get('features'), list) else [],
@@ -332,6 +333,7 @@ class StripeWebhook(APIView):
             'max_members_per_group': self._coerce_int(payload.get('max_members_per_group')),
             'max_admins_per_group': self._coerce_int(payload.get('max_admins_per_group')),
             'storage_gb': self._coerce_int(payload.get('storage_gb')),
+            **self._call_defaults(payload),
             'has_whatsapp': self._coerce_bool(payload.get('has_whatsapp')),
             'has_telegram': self._coerce_bool(payload.get('has_telegram')),
             'features': payload.get('features') if isinstance(payload.get('features'), list) else [],
@@ -442,6 +444,30 @@ class StripeWebhook(APIView):
                 return package
 
         return None
+
+    def _call_defaults(self, payload):
+        """The calling fields, read from the same `metadata.data` payload.
+
+        Shared by both upsert paths so a product with only a name and no price
+        yet (`_upsert_plan_from_product_only`) gets the same fields a priced
+        one does, once its price arrives and this runs again.
+
+        `has_calls`/`has_video_calls` default to True - matching
+        `Plan.has_calls`'s own db_default - so a product whose metadata has
+        never mentioned calling at all is not silently switched off calling
+        the next time somebody edits its price for an unrelated reason. Every
+        other field here defaults the way `Plan`'s own column does: off, or
+        no limit.
+        """
+        return {
+            'has_calls': self._coerce_bool(payload.get('has_calls'), default=True),
+            'has_video_calls': self._coerce_bool(payload.get('has_video_calls'), default=True),
+            'max_call_participants': self._coerce_int(payload.get('max_call_participants')),
+            'has_call_recording': self._coerce_bool(payload.get('has_call_recording')),
+            'call_recording_retention_days': self._coerce_int(
+                payload.get('call_recording_retention_days')
+            ),
+        }
 
     def _coerce_int(self, value):
         if value in (None, ''):

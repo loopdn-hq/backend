@@ -234,6 +234,23 @@ class StartCallTests(CallTestBase):
         # And nothing was written for a call that could never be joined.
         self.assertFalse(CallRoom.objects.exists())
 
+    def test_a_plan_with_no_calling_refuses_audio_too(self):
+        Plan.objects.filter(code='free').update(has_calls=False)
+        body = self.assertFailure(self.start(), 403)
+        self.assertIn('does not include calling', body['message'])
+        self.assertFalse(CallRoom.objects.exists())
+
+    def test_a_plan_with_calls_but_no_video_refuses_video_only(self):
+        Plan.objects.filter(code='free').update(has_calls=True, has_video_calls=False)
+        self.assertFailure(self.start(call_type='video'), 403)
+        self.assertSuccess(self.start(call_type='audio'), 201)
+
+    def test_the_video_gate_is_the_group_owners_plan_not_the_starters(self):
+        Plan.objects.filter(code='free').update(has_video_calls=False)
+        put_on_plan(self.bob, 'premium')
+        # bob has video on his own plan, but alice's Free plan owns the group.
+        self.assertFailure(self.start(call_type='video', user=self.bob), 403)
+
     def test_a_blocked_direct_call_is_refused(self):
         from user.blocks import block
 

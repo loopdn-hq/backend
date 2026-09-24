@@ -271,6 +271,84 @@ class StripeWebhookTests(TestCase):
         self.assertEqual(plan.max_groups, 25)
         self.assertEqual(plan.features, ['Search'])
 
+    def test_price_metadata_syncs_the_calling_fields(self):
+        event = {
+            'id': 'evt_plan_calls_1',
+            'type': 'price.created',
+            'data': {'object': {
+                'id': 'price_calls_1',
+                'product': 'prod_calls_1',
+                'unit_amount': 4999,
+                'currency': 'usd',
+                'recurring': {'interval': 'month'},
+                'metadata': {
+                    'data': json.dumps({
+                        'type': 'plan',
+                        'code': 'callsplan',
+                        'max_groups': 10,
+                        'max_members_per_group': 10,
+                        'max_admins_per_group': 5,
+                        'storage_gb': 10,
+                        'has_calls': False,
+                        'has_video_calls': False,
+                        'max_call_participants': 50,
+                        'has_call_recording': True,
+                        'call_recording_retention_days': 60,
+                    })
+                },
+            }},
+        }
+        with mock.patch('stripe.Product.retrieve', return_value={
+            'id': 'prod_calls_1', 'name': 'Calls Plan', 'active': True, 'metadata': {},
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan = Plan.objects.get(stripe_product_id='prod_calls_1')
+        self.assertFalse(plan.has_calls)
+        self.assertFalse(plan.has_video_calls)
+        self.assertEqual(plan.max_call_participants, 50)
+        self.assertTrue(plan.has_call_recording)
+        self.assertEqual(plan.call_recording_retention_days, 60)
+
+    def test_metadata_silent_on_calling_leaves_it_on(self):
+        """A product whose metadata has never mentioned calling keeps it on.
+
+        Without this, editing a plan's price for an unrelated reason (a
+        description change, say) would silently switch calling off for every
+        plan whose Stripe metadata predates this feature.
+        """
+        event = {
+            'id': 'evt_plan_calls_2',
+            'type': 'price.created',
+            'data': {'object': {
+                'id': 'price_calls_2',
+                'product': 'prod_calls_2',
+                'unit_amount': 2999,
+                'currency': 'usd',
+                'recurring': {'interval': 'month'},
+                'metadata': {
+                    'data': json.dumps({
+                        'type': 'plan', 'code': 'nocallsmeta',
+                        'max_groups': 10, 'max_members_per_group': 10,
+                        'max_admins_per_group': 5, 'storage_gb': 10,
+                    })
+                },
+            }},
+        }
+        with mock.patch('stripe.Product.retrieve', return_value={
+            'id': 'prod_calls_2', 'name': 'No Calls Metadata', 'active': True, 'metadata': {},
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan = Plan.objects.get(stripe_product_id='prod_calls_2')
+        self.assertTrue(plan.has_calls)
+        self.assertTrue(plan.has_video_calls)
+        self.assertIsNone(plan.max_call_participants)
+        self.assertFalse(plan.has_call_recording)
+        self.assertIsNone(plan.call_recording_retention_days)
+
     def test_product_created_without_price_concats_to_existing_plans(self):
         before_count = Plan.objects.count()
         event = {
