@@ -971,10 +971,22 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'sms.requeue_stalled_deliveries',
         'schedule': 600.0,
     },
-    'sms-provision-missing-numbers': {
-        'task': 'sms.provision_missing_numbers',
-        'schedule': 900.0,
-    },
+    # OFF (2026-09-25, Yul's call). This sweep buys a real number, from a real
+    # provider, for every group that has not got one - and a laptop running the
+    # staging env file has live Telnyx credentials, so starting the stack bought
+    # twenty numbers for twenty old test groups in three minutes.
+    #
+    # The task itself stays in sms/tasks.py and can be run by hand when a group
+    # genuinely needs a number the provider failed to sell at creation time.
+    # What is switched off is the part that spends money unattended.
+    #
+    # NOTE: the scheduler is DatabaseScheduler, so removing this entry does NOT
+    # remove the PeriodicTask row it already created. That row has to be
+    # disabled in each database as well - local, staging, prod.
+    # 'sms-provision-missing-numbers': {
+    #     'task': 'sms.provision_missing_numbers',
+    #     'schedule': 900.0,
+    # },
     # After the retry sweep, so nothing is announced that a retry was about to
     # fix - see sms/maintenance.py:announce_failed_deliveries.
     'sms-announce-failed-deliveries': {
