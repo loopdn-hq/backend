@@ -9,6 +9,11 @@ The rules, in one place:
 
     who may be in a call     the ACTIVE members of the conversation it was
                              started in, and nobody else
+    whether it may start     the plan's `has_calls` - one permission for audio
+                             and video together. Free through Business ship
+                             with it on; a custom Enterprise plan only has it
+                             if the contract bought it
+                             (enterprise.services.FEATURE_KEYS)
     how many                 the plan's `max_call_participants`, counted
                              under a row lock so two people cannot both take
                              the last place
@@ -322,6 +327,11 @@ def start_call(user, conversation, call_type):
     _refuse_if_blocked(user, conversation)
 
     plan = plan_for_call(conversation, initiator=user)
+    if not plan.has_calls:
+        raise PermissionDenied(
+            f'The {plan.name} plan does not include calling. Upgrade the '
+            'group owner\'s plan to make calls.'
+        )
 
     with transaction.atomic():
         try:

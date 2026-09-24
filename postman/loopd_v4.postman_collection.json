@@ -1949,10 +1949,49 @@
                 ""
               ]
             },
-            "description": "**Called by Stripe, not by a client.** Included so the shape of every event this project understands is documented in one place: `checkout.session.completed` (subscription activation or a credit top-up), `customer.subscription.updated` and `customer.subscription.deleted`.\n\nAuthenticated by a signature over the raw body (`Stripe-Signature` header, verified against `STRIPE_WEBHOOK_SECRET`), not a token - like the SMS webhook, this endpoint has no other way to prove Stripe sent it. Running this request as written returns `400`: Postman cannot mint a valid signature, only the Stripe CLI (`stripe trigger ...`) or a real event can.\n\n### Status codes are the contract\n| Code | When |\n| --- | --- |\n| `200` | understood and handled, including a duplicate event |\n| `400` | bad signature or unparseable body - never retried |\n| `500` | a known event failed to process - Stripe retries |\n\nRepeat with the same event `id` to see de-duplication: the second call returns `duplicate: true` and changes nothing.",
+            "description": "**Called by Stripe, not by a client.** Included so the shape of the account-facing events this project understands is documented in one place: `checkout.session.completed` (subscription activation or a credit top-up), `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed` and `charge.refunded`. The catalog-sync events (`product.*`, `price.*`) are a separate example below.\n\nAuthenticated by a signature over the raw body (`Stripe-Signature` header, verified against `STRIPE_WEBHOOK_SECRET`), not a token - like the SMS webhook, this endpoint has no other way to prove Stripe sent it. Running this request as written returns `400`: Postman cannot mint a valid signature, only the Stripe CLI (`stripe trigger ...`) or a real event can.\n\n### Status codes are the contract\n| Code | When |\n| --- | --- |\n| `200` | understood and handled, including a duplicate event |\n| `400` | bad signature or unparseable body - never retried |\n| `500` | a known event failed to process - Stripe retries |\n\nRepeat with the same event `id` to see de-duplication: the second call returns `duplicate: true` and changes nothing.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"id\": \"evt_1\",\n  \"type\": \"checkout.session.completed\",\n  \"data\": {\n    \"object\": {\n      \"id\": \"cs_1\",\n      \"mode\": \"payment\",\n      \"customer\": \"cus_1\",\n      \"payment_intent\": \"pi_1\",\n      \"client_reference_id\": \"{{user_id}}\",\n      \"metadata\": {\n        \"credit_package_id\": \"{{credit_package_id}}\"\n      }\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Stripe webhook: plan catalog sync (provider callback)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/billing/webhooks/stripe/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "billing",
+                "webhooks",
+                "stripe",
+                ""
+              ]
+            },
+            "description": "The same endpoint again - Stripe is the one place plan pricing and limits are meant to be edited going forward, not a Django admin form. Set `metadata.data` (a JSON string) on a Price - or a Product, before it has a price - to this shape, and `product.created/updated` or `price.created/updated` upserts the matching `Plan` row from it.\n\n**Calling fields**, read from the same payload: `has_calls` is one permission for audio and video together, not two - it defaults to `true` (matching the column's own default) when a product's metadata has never mentioned calling at all, so editing a price for an unrelated reason cannot silently switch calling off for a plan nobody has touched calling on. `max_call_participants`, `has_call_recording` and `call_recording_retention_days` are read the same way. `has_screen_share` is never read from metadata - it always just equals `has_calls`, the same rule the Enterprise Plan Builder uses (see `10. Enterprise`).\n\nMatched to a `Plan` by `code` for a `product.created` with no price yet, and by `stripe_product_id` afterwards - a second `price.updated` for the SAME product updates that plan in place rather than creating another one. Running this as written returns `400` for the same signature reason as *Stripe webhook (provider callback)*.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"evt_catalog_1\",\n  \"type\": \"price.updated\",\n  \"data\": {\n    \"object\": {\n      \"id\": \"price_premium_live\",\n      \"product\": \"prod_premium_live\",\n      \"unit_amount\": 999,\n      \"currency\": \"usd\",\n      \"recurring\": {\n        \"interval\": \"month\"\n      },\n      \"metadata\": {\n        \"data\": \"{\\\"type\\\": \\\"plan\\\", \\\"code\\\": \\\"premium\\\", \\\"max_groups\\\": 25, \\\"max_members_per_group\\\": 250, \\\"max_admins_per_group\\\": 5, \\\"storage_gb\\\": 10, \\\"has_calls\\\": true, \\\"max_call_participants\\\": 25, \\\"has_call_recording\\\": true, \\\"call_recording_retention_days\\\": 30, \\\"has_whatsapp\\\": true, \\\"has_telegram\\\": true, \\\"is_custom_pricing\\\": false}\"\n      }\n    }\n  }\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2084,7 +2123,7 @@
                 ""
               ]
             },
-            "description": "Everything the Plan Builder needs to price a configuration client-side: the base fee, each limit tier (`max_groups`, `max_members_per_group`, `max_admins_per_group`, `storage_gb`), the four toggleable features, the analytics tiers, the Communication Credit packages, and the billing intervals with their period discounts.\n\nPublic, so the builder can quote a price before anyone signs up. Everything here is database-driven (`PricingCatalogVersion`) - a price change is a new catalog version, never an edit to a live one, so a plan someone already checked out never moves under them.",
+            "description": "Everything the Plan Builder needs to price a configuration client-side: the base fee, each limit tier (`max_groups`, `max_members_per_group`, `max_admins_per_group`, `storage_gb`), the six toggleable features - including `calls` (one price for audio and video together, matching `billing.Plan.has_calls` being a single flag) and `call_recording` - the analytics tiers, the Communication Credit packages, and the billing intervals with their period discounts.\n\nPublic, so the builder can quote a price before anyone signs up. Everything here is database-driven (`PricingCatalogVersion`) - a price change is a new catalog version, never an edit to a live one, so a plan someone already checked out never moves under them.",
             "auth": {
               "type": "noauth"
             }
@@ -2113,10 +2152,10 @@
                 ""
               ]
             },
-            "description": "Prices `configuration` against the active catalog and upserts a draft. Omit `draft_id` to create one (returned as `data.draft_id`, format `ent_draft_<12 hex chars>`); include it to update that same draft again.\n\n**Anonymous-allowed.** Called with no `Authorization` header, the draft is owned by the caller's session instead of an account - only that session (or, once *Attach a draft* is called, that account) can read it back. Called signed in, as this request is when it runs after *Login* earlier in this collection, the account is attached immediately - no separate attach step needed.\n\nEvery value in `limits`, `features` and `credits` is checked against the catalog's active options - an unknown or retired selection is rejected with a `400` and field errors under `data`, never silently clamped to the nearest valid one. The returned `pricing` block is always computed server-side; nothing about price is ever taken from this request body.",
+            "description": "Prices `configuration` against the active catalog and upserts a draft. Omit `draft_id` to create one (returned as `data.draft_id`, format `ent_draft_<12 hex chars>`); include it to update that same draft again.\n\n**Anonymous-allowed.** Called with no `Authorization` header, the draft is owned by the caller's session instead of an account - only that session (or, once *Attach a draft* is called, that account) can read it back. Called signed in, as this request is when it runs after *Login* earlier in this collection, the account is attached immediately - no separate attach step needed.\n\n`features` now has six keys, all required: the four content ones plus `calls` and `call_recording` - calling, for a custom plan, is priced and bought exactly like any other feature here, unlike the four platform plans (*List plans*), which ship with it on by default. `calls` covers audio AND video together - one price, matching `billing.Plan.has_calls` being a single flag rather than two.\n\nEvery value in `limits`, `features` and `credits` is checked against the catalog's active options - an unknown or retired selection is rejected with a `400` and field errors under `data`, never silently clamped to the nearest valid one. The returned `pricing` block is always computed server-side; nothing about price is ever taken from this request body.",
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"configuration\": {\n    \"type\": \"plan\",\n    \"code\": \"enterprise\",\n    \"billing_interval\": \"annual\",\n    \"limits\": {\n      \"max_groups\": 500,\n      \"max_members_per_group\": 1000,\n      \"max_admins_per_group\": 20,\n      \"storage_gb\": 50\n    },\n    \"features\": {\n      \"extended_message_history\": false,\n      \"search\": false,\n      \"advanced_notifications\": false,\n      \"moderation_tools\": true,\n      \"analytics\": \"advanced\"\n    },\n    \"credits\": {\n      \"monthly_messages\": 100000\n    }\n  }\n}",
+              "raw": "{\n  \"configuration\": {\n    \"type\": \"plan\",\n    \"code\": \"enterprise\",\n    \"billing_interval\": \"annual\",\n    \"limits\": {\n      \"max_groups\": 500,\n      \"max_members_per_group\": 1000,\n      \"max_admins_per_group\": 20,\n      \"storage_gb\": 50\n    },\n    \"features\": {\n      \"extended_message_history\": false,\n      \"search\": false,\n      \"advanced_notifications\": false,\n      \"moderation_tools\": true,\n      \"analytics\": \"advanced\",\n      \"calls\": true,\n      \"call_recording\": false\n    },\n    \"credits\": {\n      \"monthly_messages\": 100000\n    }\n  }\n}",
               "options": {
                 "raw": {
                   "language": "json"

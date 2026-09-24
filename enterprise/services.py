@@ -30,7 +30,13 @@ from enterprise.models import (
 logger = logging.getLogger(__name__)
 
 LIMIT_CATEGORIES = ['max_groups', 'max_members_per_group', 'max_admins_per_group', 'storage_gb']
-FEATURE_KEYS = ['extended_message_history', 'search', 'advanced_notifications', 'moderation_tools']
+FEATURE_KEYS = [
+    'extended_message_history', 'search', 'advanced_notifications', 'moderation_tools',
+    # Calling: one line item for audio and video together (billing.Plan.has_calls
+    # is a single flag too, not two), plus recording as its own. See
+    # `_sync_account_plan` for how these become `billing.Plan` flags.
+    'calls', 'call_recording',
+]
 CURRENCY = 'usd'
 DRAFT_LIFETIME = timedelta(days=30)
 
@@ -578,8 +584,12 @@ def _sync_entitlements(contract):
             limit_type='gb' if category == 'storage_gb' else 'count',
         ))
     for key in FEATURE_KEYS:
+        # .get, not [key]: a contract frozen before a key existed in
+        # FEATURE_KEYS has no opinion on it, and that reads as "not bought"
+        # rather than a KeyError the next time this contract is touched.
         rows.append(EnterpriseEntitlement(
-            contract=contract, feature_key=key, enabled=bool(configuration['features'][key]),
+            contract=contract, feature_key=key,
+            enabled=bool(configuration['features'].get(key)),
         ))
     analytics_tier = configuration['features'].get('analytics', 'none')
     rows.append(EnterpriseEntitlement(
@@ -638,6 +648,11 @@ def _sync_account_plan(contract, *, current_period_end=None):
     entitlements say otherwise.
     """
     limits = contract.configuration_snapshot['limits']
+    # .get, not [key]: see the same comment in _sync_entitlements.
+    features = contract.configuration_snapshot['features']
+    calls = bool(features.get('calls'))
+    call_recording = bool(features.get('call_recording'))
+
     plan, _ = Plan.objects.update_or_create(
         code=contract.contract_number.lower(),
         defaults={
@@ -647,13 +662,22 @@ def _sync_account_plan(contract, *, current_period_end=None):
             'max_members_per_group': limits['max_members_per_group'],
             'max_admins_per_group': limits['max_admins_per_group'],
             'storage_gb': limits['storage_gb'],
-            # The catalog has no call options yet, so a contract gets what the
-            # seeded Enterprise plan has: no participant cap, screen sharing
-            # and recording on, recordings kept until somebody deletes them.
+            # Calling is priced per feature for a custom plan, unlike the four
+            # platform plans, where it ships as standard - see the comment on
+            # `Plan.has_calls`. One flag for audio and video together, same as
+            # the platform plans - a contract does not buy video separately.
+            'has_calls': calls,
+            # Bundled with calling rather than sold separately: whoever bought
+            # calling gets screen sharing on top at no extra charge, so it is
+            # not its own FEATURE_KEYS entry and is never read from the
+            # configuration.
+            'has_screen_share': calls,
+            'has_call_recording': call_recording,
+            # A flat 90 days when bought. Not yet its own priced tier the way
+            # storage_gb is - the whole retention PERIOD is currently included
+            # in the flat `call_recording` fee, not sold in slices.
+            'call_recording_retention_days': 90 if call_recording else None,
             'max_call_participants': None,
-            'has_screen_share': True,
-            'has_call_recording': True,
-            'call_recording_retention_days': None,
             'features': _feature_labels_for_contract(contract),
             'is_custom_pricing': True,
             'active': True,

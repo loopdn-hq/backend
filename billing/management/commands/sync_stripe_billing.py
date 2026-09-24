@@ -206,6 +206,15 @@ class Command(BaseCommand):
             'max_members_per_group': plan.max_members_per_group,
             'max_admins_per_group': plan.max_admins_per_group,
             'storage_gb': plan.storage_gb,
+            # Calling. Read back by the same names in
+            # billing/webhooks.py:_call_defaults - keep the two in step, or a
+            # price edited from the Stripe dashboard for an unrelated reason
+            # round-trips through that webhook and wipes whatever this command
+            # last pushed.
+            'has_calls': plan.has_calls,
+            'max_call_participants': plan.max_call_participants,
+            'has_call_recording': plan.has_call_recording,
+            'call_recording_retention_days': plan.call_recording_retention_days,
             'has_whatsapp': plan.has_whatsapp,
             'has_telegram': plan.has_telegram,
             'features': plan.features or [],

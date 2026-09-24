@@ -271,6 +271,118 @@ class StripeWebhookTests(TestCase):
         self.assertEqual(plan.max_groups, 25)
         self.assertEqual(plan.features, ['Search'])
 
+    def test_price_metadata_syncs_the_calling_fields(self):
+        event = {
+            'id': 'evt_plan_calls_1',
+            'type': 'price.created',
+            'data': {'object': {
+                'id': 'price_calls_1',
+                'product': 'prod_calls_1',
+                'unit_amount': 4999,
+                'currency': 'usd',
+                'recurring': {'interval': 'month'},
+                'metadata': {
+                    'data': json.dumps({
+                        'type': 'plan',
+                        'code': 'callsplan',
+                        'max_groups': 10,
+                        'max_members_per_group': 10,
+                        'max_admins_per_group': 5,
+                        'storage_gb': 10,
+                        'has_calls': False,
+                        'max_call_participants': 50,
+                        'has_call_recording': True,
+                        'call_recording_retention_days': 60,
+                    })
+                },
+            }},
+        }
+        with mock.patch('stripe.Product.retrieve', return_value={
+            'id': 'prod_calls_1', 'name': 'Calls Plan', 'active': True, 'metadata': {},
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan = Plan.objects.get(stripe_product_id='prod_calls_1')
+        self.assertFalse(plan.has_calls)
+        self.assertFalse(plan.has_screen_share)
+        self.assertEqual(plan.max_call_participants, 50)
+        self.assertTrue(plan.has_call_recording)
+        self.assertEqual(plan.call_recording_retention_days, 60)
+
+    def test_screen_share_is_bundled_with_calling_and_not_independently_settable(self):
+        """Screen share comes free with calling. A metadata key cannot turn it
+        off on its own - there is no such key at all."""
+        event = {
+            'id': 'evt_plan_calls_3',
+            'type': 'price.created',
+            'data': {'object': {
+                'id': 'price_calls_3',
+                'product': 'prod_calls_3',
+                'unit_amount': 1999,
+                'currency': 'usd',
+                'recurring': {'interval': 'month'},
+                'metadata': {
+                    'data': json.dumps({
+                        'type': 'plan', 'code': 'bundledscreen',
+                        'max_groups': 10, 'max_members_per_group': 10,
+                        'max_admins_per_group': 5, 'storage_gb': 10,
+                        'has_calls': True,
+                        # No screen-share key exists to read - this is here to
+                        # prove an attempt to set one has no effect.
+                        'has_screen_share': False,
+                    })
+                },
+            }},
+        }
+        with mock.patch('stripe.Product.retrieve', return_value={
+            'id': 'prod_calls_3', 'name': 'Bundled Screen Share', 'active': True, 'metadata': {},
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan = Plan.objects.get(stripe_product_id='prod_calls_3')
+        self.assertTrue(plan.has_calls)
+        self.assertTrue(plan.has_screen_share)
+
+    def test_metadata_silent_on_calling_leaves_it_on(self):
+        """A product whose metadata has never mentioned calling keeps it on.
+
+        Without this, editing a plan's price for an unrelated reason (a
+        description change, say) would silently switch calling off for every
+        plan whose Stripe metadata predates this feature.
+        """
+        event = {
+            'id': 'evt_plan_calls_2',
+            'type': 'price.created',
+            'data': {'object': {
+                'id': 'price_calls_2',
+                'product': 'prod_calls_2',
+                'unit_amount': 2999,
+                'currency': 'usd',
+                'recurring': {'interval': 'month'},
+                'metadata': {
+                    'data': json.dumps({
+                        'type': 'plan', 'code': 'nocallsmeta',
+                        'max_groups': 10, 'max_members_per_group': 10,
+                        'max_admins_per_group': 5, 'storage_gb': 10,
+                    })
+                },
+            }},
+        }
+        with mock.patch('stripe.Product.retrieve', return_value={
+            'id': 'prod_calls_2', 'name': 'No Calls Metadata', 'active': True, 'metadata': {},
+        }):
+            response = self._post_event(event)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan = Plan.objects.get(stripe_product_id='prod_calls_2')
+        self.assertTrue(plan.has_calls)
+        self.assertTrue(plan.has_screen_share)
+        self.assertIsNone(plan.max_call_participants)
+        self.assertFalse(plan.has_call_recording)
+        self.assertIsNone(plan.call_recording_retention_days)
+
     def test_product_created_without_price_concats_to_existing_plans(self):
         before_count = Plan.objects.count()
         event = {
@@ -610,6 +722,56 @@ class StripeWebhookTests(TestCase):
         package.refresh_from_db()
         self.assertFalse(plan.active)
         self.assertFalse(package.active)
+
+
+class SyncStripeBillingMetadataTests(TestCase):
+    """`_plan_metadata` is the push side of the same contract
+    `billing.webhooks.StripeWebhook._call_defaults` reads back - see the
+    round-trip test below.
+    """
+
+    def setUp(self):
+        from billing.management.commands.sync_stripe_billing import Command
+
+        self.command = Command()
+
+    def test_calling_fields_are_included(self):
+        plan = Plan.objects.get(code=Plan.Code.PREMIUM)
+        payload = json.loads(self.command._plan_metadata(plan)['data'])
+
+        self.assertEqual(payload['has_calls'], plan.has_calls)
+        self.assertEqual(payload['max_call_participants'], plan.max_call_participants)
+        self.assertEqual(payload['has_call_recording'], plan.has_call_recording)
+        self.assertEqual(
+            payload['call_recording_retention_days'], plan.call_recording_retention_days
+        )
+        # Never pushed: has_screen_share is derived on the way back in
+        # (StripeWebhook._call_defaults), not read from metadata at all.
+        self.assertNotIn('has_screen_share', payload)
+
+    def test_round_trips_through_the_webhooks_own_reader(self):
+        """What this command pushes, `_call_defaults` reads back unchanged -
+        the failure mode this closes is a plan's calling settings silently
+        reverting the next time somebody edits its Stripe price for an
+        unrelated reason and this webhook fires.
+        """
+        from billing.webhooks import StripeWebhook
+
+        plan = Plan.objects.get(code=Plan.Code.BUSINESS)
+        plan.max_call_participants = 42
+        plan.save(update_fields=['max_call_participants'])
+
+        payload = json.loads(self.command._plan_metadata(plan)['data'])
+        webhook = StripeWebhook()
+        read_back = webhook._call_defaults(payload)
+
+        self.assertEqual(read_back['has_calls'], plan.has_calls)
+        self.assertEqual(read_back['max_call_participants'], 42)
+        self.assertEqual(read_back['has_call_recording'], plan.has_call_recording)
+        self.assertEqual(
+            read_back['call_recording_retention_days'], plan.call_recording_retention_days
+        )
+        self.assertEqual(read_back['has_screen_share'], plan.has_calls)
 
 
 class BillingAnalyticsTests(TestCase):
