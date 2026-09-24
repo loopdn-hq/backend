@@ -3576,14 +3576,62 @@ class ClearHistoryTests(EnvelopeAssertions, APITestCase):
 
     # --- refusals -----------------------------------------------------------
 
-    def test_clearing_an_empty_conversation_is_harmless(self):
+    def test_clearing_an_empty_conversation_hides_it_too(self):
+        """The case the message pointer alone could not express.
+
+        A group nobody has posted in has no newest message to point at, so the
+        clear used to write nothing at all and the row came back on the next
+        refresh - which is what somebody clearing a group they never used
+        reports as broken. `Participant.cleared_at` is what answers it.
+        """
         empty = Conversation.start_group(self.alice, name='Quiet')
 
-        self.assertSuccess(
+        body = self.assertSuccess(
             self.client.post(
                 reverse('chat:conversation-clear', args=[empty.id]), {}
             )
         )
+        self.assertTrue(body['cleared'])
+
+        listed = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        row = [r for r in rows if r['id'] == empty.id][0]
+        self.assertTrue(row['cleared'])
+
+    def test_an_emptied_conversation_comes_back_when_somebody_posts(self):
+        empty = Conversation.start_group(self.alice, name='Quiet')
+        empty.add_participant(self.bob)
+        self.client.post(
+            reverse('chat:conversation-clear', args=[empty.id]), {}
+        )
+
+        create_message(empty, self.bob, text='anybody there?')
+
+        listed = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        row = [r for r in rows if r['id'] == empty.id][0]
+        self.assertFalse(row['cleared'])
+        # And it carries only what arrived after - there was nothing before.
+        self.assertEqual(row['last_message']['text'], 'anybody there?')
+
+    def test_clearing_an_empty_conversation_hides_nothing_from_anybody_else(self):
+        empty = Conversation.start_group(self.alice, name='Quiet')
+        empty.add_participant(self.bob)
+        self.client.post(
+            reverse('chat:conversation-clear', args=[empty.id]), {}
+        )
+
+        self.client.force_authenticate(self.bob)
+        listed = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        row = [r for r in rows if r['id'] == empty.id][0]
+        self.assertFalse(row['cleared'])
 
     def test_a_non_member_cannot_clear(self):
         self.client.force_authenticate(make_user('mallory'))

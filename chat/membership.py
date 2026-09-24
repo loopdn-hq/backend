@@ -427,15 +427,25 @@ def clear_history(participant):
     The read pointer moves with it. Otherwise the cleared messages would still
     be counted as unread, and the conversation would come back carrying a badge
     for messages the member can no longer see.
+
+    An EMPTY conversation is cleared too. There is no message to point at, so
+    only the timestamp is written; the row leaves their list all the same, and
+    returns when somebody finally posts.
     """
     if participant.status != Participant.Status.ACTIVE:
         raise NotAMember('You are not a member of that conversation.')
 
+    # Recorded on every clear, and the ONLY thing recorded when there are no
+    # messages to point at - see Participant.cleared_at. Without it, clearing
+    # an empty conversation wrote nothing and the row returned on refresh.
+    fields = ['cleared_at']
+    participant.cleared_at = timezone.now()
+
     newest = participant.conversation.messages.order_by('-pk').first()
     if newest is None:
+        participant.save(update_fields=fields)
         return participant
 
-    fields = []
     if participant.cleared_before_message_id != newest.pk:
         participant.cleared_before_message = newest
         fields.append('cleared_before_message')
@@ -443,8 +453,7 @@ def clear_history(participant):
         participant.last_read_message = newest
         fields.append('last_read_message')
 
-    if fields:
-        participant.save(update_fields=fields)
+    participant.save(update_fields=fields)
     return participant
 
 

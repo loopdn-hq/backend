@@ -848,6 +848,21 @@ class Participant(models.Model):
         related_name='+',
     )
 
+    # WHEN they cleared, beside the message id above - and it exists for the
+    # one case the id cannot express: a conversation with NO messages in it.
+    #
+    # Clearing works by pointing at the newest message, so an empty
+    # conversation gave the pointer nothing to hold and the clear silently did
+    # nothing - the row came back on the next refresh, which is exactly what
+    # somebody clearing a group they have never used reports as broken.
+    #
+    # The id still decides everything once there IS a message: only the empty
+    # case reads this, and it stops mattering the moment somebody posts,
+    # because that message is newer than this timestamp. Wall clock is sound
+    # enough for that question - it is "has anything at all happened since",
+    # not an ordering of messages against each other.
+    cleared_at = models.DateTimeField(null=True, blank=True)
+
     # Tidied out of this member's own list. Theirs alone - nobody else can
     # tell, and it neither leaves the group nor stops anything being
     # delivered. That last part matters here more than in a pure chat app:

@@ -733,16 +733,32 @@ class ConversationSerializer(serializers.ModelSerializer):
 
         Read off the prefetched newest message rather than counting, so this
         costs nothing on a list of any length.
+
+        Two markers, because one cannot answer both cases. The message id
+        settles it whenever the conversation has messages. `cleared_at` exists
+        for the conversation that had NONE when it was cleared: there was
+        nothing to point at, so the id is still null and only the timestamp
+        says the member ever cleared it.
         """
         participant = self._own_participation(obj)
-        if participant is None or participant.cleared_before_message_id is None:
+        if participant is None:
+            return False
+
+        cleared_before = participant.cleared_before_message_id
+        cleared_at = participant.cleared_at
+        if cleared_before is None and cleared_at is None:
             return False
 
         latest = getattr(obj, 'latest_messages', None)
-        newest_id = latest[0].pk if latest else None
-        if newest_id is None:
+        newest = latest[0] if latest else obj.messages.first()
+        if newest is None:
+            # Nothing in here at all: cleared exactly when they said so.
+            return cleared_at is not None
+
+        if cleared_before is not None and newest.pk <= cleared_before:
             return True
-        return newest_id <= participant.cleared_before_message_id
+        # Cleared while empty, and still nothing since.
+        return cleared_at is not None and newest.created_at <= cleared_at
 
     def get_unread_count(self, obj):
         """Messages past the caller's read pointer, not counting their own.
