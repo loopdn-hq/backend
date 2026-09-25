@@ -1,9 +1,9 @@
-"""Guarantee every User has a Profile and MessagingSettings.
+"""Guarantee every User has a Profile, MessagingSettings and an account role.
 
-Registration creates one explicitly, but users also arrive from
+Registration creates them explicitly, but users also arrive from
 `createsuperuser`, the admin, fixtures and the shell. Hanging this off
 post_save means no code path anywhere can produce a user whose
-`user.profile` raises RelatedObjectDoesNotExist.
+`user.profile` raises RelatedObjectDoesNotExist, or who holds no role at all.
 """
 from django.conf import settings
 from django.db.models.signals import post_save
@@ -30,3 +30,22 @@ def create_profile_for_new_user(sender, instance, created, **kwargs):
         # code reads them for every member of a group - so the row exists from
         # the start, not made lazily in the middle of a send.
         MessagingSettings.objects.get_or_create(user=instance)
+
+        # The baseline account role. Stored rather than implied by an absent
+        # row, so that having NO rows stays a detectable bug rather than a
+        # state something has to interpret - see rbac/models.py.
+        #
+        # Imported here rather than at module level: this module is imported
+        # from user/apps.py:ready(), and a top-level import of another app's
+        # models runs before the registry is populated.
+        #
+        # `admin` is deliberately NOT granted alongside is_superuser. The
+        # backfill in rbac/0003 was a one-time bootstrap; syncing the two on
+        # every save would rebuild the coupling rbac exists to remove, and
+        # would mean a Django-admin account silently carried every product
+        # capability.
+        from rbac.models import UserRole
+
+        UserRole.objects.get_or_create(
+            user=instance, role=UserRole.Role.STANDARD
+        )

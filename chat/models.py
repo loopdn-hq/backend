@@ -632,10 +632,24 @@ class Conversation(models.Model):
         Broadcast is the only thing that says no today. Membership itself is
         checked long before here - by the queryset that found the conversation
         at all.
+
+        Asked of the PARTICIPANT rather than the user, because the sender may
+        have no account: somebody who joined by texting JOIN posts through
+        `sms/inbound.py` with a membership and nothing else. `can()` would find
+        no account for them and refuse, which would silently stop inbound SMS
+        reaching the group.
+
+        A None participant is not a membership at all - a system message, or a
+        sender with no row. Those were only ever allowed outside broadcast
+        mode, and still are.
         """
-        if self.mode != self.Mode.BROADCAST:
-            return True
-        return participant is not None and participant.role == Participant.Role.ADMIN
+        from rbac.resolver import can_participant
+
+        if participant is None:
+            return self.mode != self.Mode.BROADCAST
+        return can_participant(
+            participant, 'group.message.send', conversation=self
+        )
 
     def has_participant(self, user):
         return self.active_participants.filter(user=user).exists()
@@ -644,20 +658,27 @@ class Conversation(models.Model):
         return self.active_participants.filter(phone_number=phone_number).exists()
 
     def may_add_members(self, user):
-        """Whether this person may add or invite people."""
-        if self.add_member_permission == self.MemberAddPermission.MEMBERS:
-            return self.has_participant(user)
-        return self.is_admin(user)
+        """Whether this person may add or invite people.
+
+        The rule itself lives in `rbac/policy.py` now: the role grant is the
+        floor - a member is permitted in principle - and
+        `add_member_permission` is what decides. Both must pass.
+        """
+        from rbac.resolver import can
+
+        return can(user, 'group.member.add', self)
 
     def may_edit_group(self, user):
         """Whether this person may change the name, image or description.
 
-        Never covers the policy settings - see ADMIN_ONLY_SETTINGS. A member who
-        could grant themselves permissions would make this setting pointless.
+        Never covers the policy settings - see ADMIN_ONLY_SETTINGS, which is a
+        separate feature (`group.settings.policy`) with no second layer, so no
+        setting can ever open it. A member who could grant themselves
+        permissions would make this setting pointless.
         """
-        if self.edit_group_permission == self.EditGroupPermission.MEMBERS:
-            return self.has_participant(user)
-        return self.is_admin(user)
+        from rbac.resolver import can
+
+        return can(user, 'group.settings.edit', self)
 
     def is_admin(self, user):
         return self.active_participants.filter(
@@ -668,15 +689,21 @@ class Conversation(models.Model):
         """Whether this person may pin or unpin a message here.
 
         A pin is the one thing every member sees above the thread, so in a
-        group it is an admin's call - the same standing as renaming it. There
-        is no moderator role to give it to, and no setting has been asked for.
+        group it is an admin's call - the same standing as renaming it.
 
-        A one-to-one has no admins at all, so either person may pin: refusing
-        both would make the feature unreachable in half the app.
+        The DIRECT branch stays OUTSIDE the role check, and deliberately. Both
+        sides of a one-to-one are MEMBER - there are no admins to give it to -
+        so "may I pin in a DM?" is really "am I one of the two people?", which
+        is a MEMBERSHIP question, not a role one. `rbac/policy.py` may only
+        narrow a grant, never widen it, and seeding `group.message.pin` open
+        for `member` to cover this would make the permissions matrix claim
+        members can pin, which is false in every group.
         """
+        from rbac.resolver import can
+
         if self.kind == self.Kind.DIRECT:
             return self.has_participant(user)
-        return self.is_admin(user)
+        return can(user, 'group.message.pin', self)
 
 
 class Participant(models.Model):

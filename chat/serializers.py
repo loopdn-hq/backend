@@ -644,6 +644,12 @@ class ConversationSerializer(serializers.ModelSerializer):
     settings = serializers.SerializerMethodField()
     created_by = serializers.SerializerMethodField()
     is_admin = serializers.SerializerMethodField()
+    # What the viewer may do IN THIS conversation, for driving the UI. Inline
+    # rather than a second endpoint: the list already carries everything else
+    # a client needs, and a round trip per group would cost more than the
+    # boolean it replaces. `is_admin` stays beside it until the last client
+    # call site has moved - see docs/rbac_plan.md step 6.
+    features = serializers.SerializerMethodField()
     admin_details = serializers.SerializerMethodField()
     # The number members text to reach this group. Read-only everywhere and
     # for everybody: it is fixed for the life of the group, so there is no
@@ -677,6 +683,7 @@ class ConversationSerializer(serializers.ModelSerializer):
             'settings',
             'created_by',
             'is_admin',
+            'features',
             'admin_details',
             'sms_number',
             'last_message',
@@ -898,6 +905,46 @@ class ConversationSerializer(serializers.ModelSerializer):
     def get_created_by(self, obj):
         """Whoever started this conversation."""
         return self._person(obj.created_by)
+
+    def get_features(self, obj):
+        """The viewer's feature keys for this conversation.
+
+        Not access control - that is `get_queryset`, which is why an outsider
+        never reaches this method at all. This says what to SHOW someone who is
+        already in the room, and every write is re-checked server-side.
+
+        The role comes from the SAME prefetched rows `get_is_admin` walks, and
+        is handed to the resolver rather than looked up: this runs once per
+        conversation on a page that lists twenty, and
+        `test_the_new_fields_do_not_cost_a_query_per_conversation` is what
+        holds the line.
+        """
+        from rbac.resolver import features_for_roles
+
+        viewer = self._viewer()
+        if viewer is None or not getattr(viewer, 'is_authenticated', False):
+            return []
+
+        roles = {
+            row.role for row in obj.participants.all()
+            if row.user_id == viewer.pk
+        }
+        keys = features_for_roles(roles, obj, 'conversation', user=viewer)
+
+        # A one-to-one has no admins, so pinning there is a MEMBERSHIP question
+        # rather than a role one - `Conversation.may_pin` answers it with an
+        # early return before any role is consulted, and rbac/policy.py may
+        # only narrow a grant, never widen one.
+        #
+        # This field has to say what the person can actually DO, or a client
+        # reading it would hide the pin control on every direct message. The
+        # special case lives here, next to the one place it is true, rather
+        # than being smuggled into the role grants - where it would make the
+        # permissions matrix claim members can pin, false in every group.
+        if obj.kind == Conversation.Kind.DIRECT and roles:
+            keys = keys | {'group.message.pin'}
+
+        return sorted(keys)
 
     def get_is_admin(self, obj):
         """Whether the person asking administers this group.

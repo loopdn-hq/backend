@@ -59,6 +59,11 @@ urlpatterns = [
     path('api/v1/billing/', include('billing.urls')),
     path('api/v1/enterprise/', include('enterprise.urls')),
 
+    # Granting and revoking account roles, and the log of who did. Account
+    # admins only - the gate is in the viewset, because there is no subset of
+    # this resource that belongs to anybody else to narrow the queryset to.
+    path('api/v1/rbac/', include('rbac.urls')),
+
     # Deliberately NOT under /api/v1/. This URL is printed into email and lives
     # in a mailbox for as long as the mail does; an unsubscribe link that dies
     # when v1 is retired is not an unsubscribe link. Keeping it short also
