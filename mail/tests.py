@@ -2451,10 +2451,12 @@ class BridgeConsentTests(TransactionTestCase):
     def test_it_starts_pending_and_stamps_what_was_asked(self):
         self.open_bridge()
 
-        self.assertEqual(self.consent().status, ChannelConsent.Status.PENDING)
-        self.row.refresh_from_db()
-        self.assertIsNotNone(self.row.consent_sent_at)
-        self.assertIn('still playing', self.row.consent_text)
+        consent = self.consent()
+        self.assertEqual(consent.status, ChannelConsent.Status.PENDING)
+        # Recorded against the EMAIL row. A text invitation to the same member
+        # would be a separate question with its own date and wording.
+        self.assertIsNotNone(consent.asked_at)
+        self.assertIn('still playing', consent.consent_text)
 
     def test_the_from_line_names_the_sender_not_a_blank_group(self):
         sent = self.open_bridge()

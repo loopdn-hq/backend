@@ -5,7 +5,7 @@ from unittest import mock
 
 from channels.db import database_sync_to_async
 from django.db import connection
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 from django.test.utils import CaptureQueriesContext
 from channels.testing import WebsocketCommunicator
 from django.contrib.auth.models import User
@@ -6219,3 +6219,106 @@ class ExternalRekeyTests(TestCase):
             Conversation.objects.filter(pk=self.conversation.pk).exists()
         )
         self.assertEqual(pair.messages.filter(text='sent by email').count(), 1)
+
+
+class ConsentIsRecordedPerChannelTests(TestCase):
+    """The question, and the answer, belong to one channel each.
+
+    This is the whole point of moving the record off Participant. The same
+    person can be invited to a group by text in January and emailed about it in
+    March. Those are two different questions, asked on two different days, in
+    two different sets of words - and a single pair of fields on the member
+    could only ever hold whichever came last.
+
+    Silently overwriting the first is worse than never recording it, because
+    nothing afterwards shows that anything was lost.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.participant = self.group.add_phone_participant(
+            '+639170000002', display_name='Mom'
+        )
+
+    def test_two_channels_keep_two_separate_questions(self):
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.SMS, 'Reply YES to get texts.'
+        )
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.EMAIL, 'Reply YES to get emails.'
+        )
+
+        sms = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+        email = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.EMAIL
+        )
+
+        self.assertEqual(sms.consent_text, 'Reply YES to get texts.')
+        self.assertEqual(email.consent_text, 'Reply YES to get emails.')
+        self.assertIsNotNone(sms.asked_at)
+        self.assertIsNotNone(email.asked_at)
+
+    def test_asking_again_does_not_rewrite_the_first_question(self):
+        # A resend is the same question. The date that matters is when they
+        # were first put on notice, and the wording is what they first saw.
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.SMS, 'The original wording.'
+        )
+        first = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.SMS, 'A later, different wording.'
+        )
+
+        again = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+        self.assertEqual(again.consent_text, 'The original wording.')
+        self.assertEqual(again.asked_at, first.asked_at)
+
+    def test_answering_one_channel_leaves_the_other_alone(self):
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.SMS, 'Reply YES to get texts.'
+        )
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.EMAIL, 'Reply YES to get emails.'
+        )
+
+        membership.set_channel_consent(
+            self.participant,
+            ChannelConsent.Channel.SMS,
+            ChannelConsent.Status.OPTED_IN,
+        )
+
+        sms = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+        email = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.EMAIL
+        )
+        self.assertEqual(sms.status, ChannelConsent.Status.OPTED_IN)
+        self.assertIsNotNone(sms.consented_at)
+        # Agreeing to texts is not agreeing to email.
+        self.assertEqual(email.status, ChannelConsent.Status.PENDING)
+        self.assertIsNone(email.consented_at)
+
+    def test_a_texted_yes_records_when_they_agreed(self):
+        # The gap that started this: YES set the status and nothing recorded
+        # the date, because the only writer was a member-wide field the SMS
+        # path never touched.
+        membership.set_channel_consent(
+            self.participant,
+            ChannelConsent.Channel.SMS,
+            ChannelConsent.Status.OPTED_IN,
+        )
+
+        sms = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+        self.assertIsNotNone(sms.consented_at)

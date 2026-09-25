@@ -1908,7 +1908,13 @@ class InviteAndNotifyTests(TransactionTestCase):
 
         self.assertEqual(row.display_label, 'Mom')
         self.assertEqual(sms_consent_of(row), ChannelConsent.Status.PENDING)
-        self.assertTrue(row.consent_text)
+        # The wording lives on the SMS consent row, not on the member: the same
+        # person can be asked a different question on a different channel.
+        asked = ChannelConsent.objects.get(
+            participant=row, channel=ChannelConsent.Channel.SMS
+        )
+        self.assertTrue(asked.consent_text)
+        self.assertIsNotNone(asked.asked_at)
 
     def test_the_invitation_is_texted_and_logged(self):
         membership.invite_by_phone(self.group, self.number, 'Mom', self.alice)

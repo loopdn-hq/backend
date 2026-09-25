@@ -421,7 +421,9 @@ def _deliver(record, message, participant, sender, body):
         # asked again, and a send that failed must not count as having asked.
         from chat.membership import record_consent_asked
 
-        record_consent_asked(participant, context.get('body', ''))
+        record_consent_asked(
+            participant, ChannelConsent.Channel.EMAIL, context.get('body', '')
+        )
 
     record.status = EmailDelivery.Status.SENT
     record.reason = ''

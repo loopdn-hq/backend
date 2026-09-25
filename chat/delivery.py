@@ -145,7 +145,10 @@ def _is_the_consent_request(participant, consent):
         return False
     if participant.user_id is not None or not participant.email:
         return False
-    if participant.consent_sent_at is not None:
+    # Asked already, on THIS channel. Per channel rather than per member: a
+    # group invitation by text must not silence the first email in an external
+    # one-to-one, which is a different question on a different channel.
+    if consent.asked_at is not None:
         return False
     return participant.conversation.is_external_direct
 

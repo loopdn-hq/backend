@@ -1361,6 +1361,21 @@ class ChannelConsent(models.Model):
         on_delete=models.CASCADE,
     )
     channel = models.CharField(max_length=8, choices=Channel.choices)
+
+    # When this member was ASKED about this channel, and in exactly what words.
+    #
+    # Per channel, beside the answer they gave, because the question differs by
+    # channel and so does the date. The same person can be invited to a group
+    # by text in January and emailed about it in March; one field on Participant
+    # could only hold whichever came last, and would silently overwrite the
+    # record of the first.
+    #
+    # That matters more than tidiness: "what exactly were they agreeing to" is
+    # the question a consent complaint turns on, and the template will have
+    # changed by the time anybody asks. A wording overwritten by a later,
+    # different channel is evidence destroyed.
+    asked_at = models.DateTimeField(null=True, blank=True)
+    consent_text = models.TextField(blank=True, default='', db_default='')
     status = models.CharField(
         max_length=10,
         choices=Status.choices,

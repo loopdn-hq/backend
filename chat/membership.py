@@ -174,8 +174,14 @@ def request_to_join(conversation, *, user=None, phone_number=None,
         # which is the whole reason JOIN is a better front door than adding
         # somebody's number on their behalf and hoping they consent later.
         sms_enabled=True,
-        consent_at=timezone.now(),
-        consent_text='Sent JOIN to the group number.',
+    )
+    # Texting JOIN is both the question and the answer, so both are recorded:
+    # what they sent, and that it counted as agreement. set_channel_consent
+    # stamps `consented_at` itself.
+    record_consent_asked(
+        created_by_text,
+        ChannelConsent.Channel.SMS,
+        'Sent JOIN to the group number.',
     )
     set_channel_consent(
         created_by_text,
@@ -517,34 +523,47 @@ def accept_email_consent(participant):
     set_channel_consent(
         participant, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.OPTED_IN
     )
-    if participant.consent_at is None:
-        participant.consent_at = timezone.now()
-        participant.save(update_fields=['consent_at'])
+    # No Participant.consent_at write. set_channel_consent above already
+    # stamped `consented_at` on the email row, which is the per-channel record
+    # this used to duplicate onto a single member-wide field.
     return already != ChannelConsent.Status.OPTED_IN
 
 
-def record_consent_asked(participant, wording):
-    """Stamp when this member was asked to agree, and to exactly what.
+def record_consent_asked(participant, channel, wording):
+    """Stamp when this member was asked about THIS channel, and in what words.
 
     Called once the consent request has actually been accepted by the provider,
-    not when it was composed: `consent_sent_at` gates whether a bounced first
-    attempt may be asked again, and a send that never happened must not count
-    as an ask.
+    not when it was composed: `asked_at` gates whether a bounced first attempt
+    may be asked again, and a send that never happened must not count as an ask.
 
     `consent_text` keeps the wording verbatim because "what exactly were they
     agreeing to" is the question a complaint turns on, and the template will
     have changed by the time anybody asks.
+
+    PER CHANNEL, on the row that holds the answer. The same person can be
+    invited to a group by text and later emailed about it, and those are two
+    different questions asked on two different days. One pair of fields on
+    Participant could hold only whichever came last, so the earlier record was
+    silently overwritten - which for consent evidence is worse than never
+    having kept it, because nothing shows that it happened.
+
+    First ask wins for both fields: a resend is the same question, and the date
+    that matters is when they were first put on notice.
     """
+    consent, _ = ChannelConsent.objects.get_or_create(
+        participant=participant, channel=channel
+    )
+
     fields = []
-    if participant.consent_sent_at is None:
-        participant.consent_sent_at = timezone.now()
-        fields.append('consent_sent_at')
-    if wording and not participant.consent_text:
-        participant.consent_text = wording
+    if consent.asked_at is None:
+        consent.asked_at = timezone.now()
+        fields.append('asked_at')
+    if wording and not consent.consent_text:
+        consent.consent_text = wording
         fields.append('consent_text')
     if fields:
-        participant.save(update_fields=fields)
-    return participant
+        consent.save(update_fields=fields)
+    return consent
 
 
 def decline_email(participant):
@@ -1370,11 +1389,10 @@ def invite_by_phone(conversation, phone_number, display_name, by):
     set_channel_consent(
         participant, ChannelConsent.Channel.SMS, ChannelConsent.Status.PENDING
     )
-    participant.consent_sent_at = timezone.now()
-    # The exact words they were shown. A consent complaint turns on what was
-    # actually sent, and the template will have changed by the time anyone asks.
-    participant.consent_text = text
-    participant.save(update_fields=['consent_sent_at', 'consent_text'])
+    # The exact words they were shown, on the SMS consent row. A complaint
+    # turns on what was actually sent, and the template will have changed by
+    # the time anyone asks.
+    record_consent_asked(participant, ChannelConsent.Channel.SMS, text)
 
     transaction.on_commit(
         lambda: send_notice(conversation, participant, text, kind='invitation')
