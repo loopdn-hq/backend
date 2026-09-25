@@ -63,6 +63,10 @@ urlpatterns = [
     # admins only - the gate is in the viewset, because there is no subset of
     # this resource that belongs to anybody else to narrow the queryset to.
     path('api/v1/rbac/', include('rbac.urls')),
+    # /api/v1/calls/ and /api/v1/recordings/ - two sibling resources, so the app
+    # is mounted at the version root. Its LiveKit webhook is under calls/ and is
+    # authenticated by signature, like the Stripe and Telnyx ones.
+    path('api/v1/', include('calls.urls')),
 
     # Deliberately NOT under /api/v1/. This URL is printed into email and lives
     # in a mailbox for as long as the mail does; an unsubscribe link that dies

@@ -57,6 +57,7 @@ def get_free_plan():
             'name': 'Free', 'monthly_price_cents': 0,
             'max_groups': 3, 'max_members_per_group': 20, 'max_admins_per_group': 1,
             'storage_gb': 1,
+            'max_call_participants': 4,
         },
     )
     return plan

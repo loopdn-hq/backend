@@ -195,6 +195,9 @@ INSTALLED_APPS = [
     # Account roles and the feature matrix. Schema only for now - nothing
     # reads these tables yet; see docs/rbac_plan.md for the build order.
     'rbac',
+    # Voice and video calls. Django authorises and records; LiveKit carries the
+    # media - see calls/livekit.py.
+    'calls',
 ]
 
 MIDDLEWARE = [
@@ -265,6 +268,24 @@ else:
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': BASE_DIR / 'db.sqlite3',
+            'OPTIONS': {
+                # Take the write lock when a transaction BEGINS, not when it
+                # first writes. The default (DEFERRED) starts every transaction
+                # as a reader; two that both read and then try to write - which
+                # is what any `select_for_update` flow does, and SQLite ignores
+                # that clause - deadlock on the upgrade, and SQLite answers the
+                # loser at once with "database is locked" rather than waiting.
+                # A runserver/Daphne process handles requests on several
+                # threads, so a page that fires two calls at once (a call
+                # started and joined together, a double-fired effect) hit it
+                # as a 500. IMMEDIATE makes them queue instead.
+                #
+                # Development only: Postgres, used in staging and production,
+                # serialises on the row lock and has no such failure.
+                'transaction_mode': 'IMMEDIATE',
+                # How long a queued writer waits for the lock, in seconds.
+                'timeout': 20,
+            },
         }
     }
 
@@ -824,6 +845,13 @@ REST_FRAMEWORK = {
         'billing_checkout': '10/hour',
         'billing_portal': '20/hour',
         'enterprise_checkout': '10/hour',
+        # Calls. Starting one rings everybody in the conversation, so it is
+        # capped harder than joining, which only mints a token for a call the
+        # caller is already entitled to. Recording is a real request to
+        # LiveKit's egress service, which is what costs money.
+        'call_start': '60/hour',
+        'call_join': '300/hour',
+        'call_recording': '30/hour',
         # Per-IP ceilings on the password reset endpoints - user/throttles.py
         # explains why these exist alongside the per-email limits below, which
         # bound a single address rather than a walk through many.
@@ -1019,6 +1047,16 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'mail.purge_old_deliveries',
         'schedule': 86400.0,
     },
+    # Calls: the sweep is what un-sticks a call whose client vanished without
+    # telling anybody, so it runs often. Retention deletes files, so daily.
+    'calls-sweep-stale-calls': {
+        'task': 'calls.sweep_stale_calls',
+        'schedule': 60.0,
+    },
+    'calls-purge-expired-recordings': {
+        'task': 'calls.purge_expired_recordings',
+        'schedule': 86400.0,
+    },
 }
 
 
@@ -1040,3 +1078,75 @@ STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 import stripe  # noqa: E402
 
 stripe.api_key = STRIPE_SECRET_KEY
+
+
+# LiveKit (voice and video calls)
+#
+# LiveKit is its own service - self-hosted on ECS - and carries every byte of
+# audio and video. Django only decides who may take part and hands out a
+# short-lived token; it never proxies media.
+#
+# API_KEY and API_SECRET are credentials. In staging and production they are
+# injected into the task from AWS Secrets Manager (the task definition's
+# `secrets`, alongside STRIPE_SECRET_KEY), never written into a file in the
+# repository, and the secret is never sent to a client: only tokens signed with
+# it are. Unset in development - calls then answer 503 rather than failing
+# oddly - the same "empty means development" convention as the providers above.
+LIVEKIT_API_KEY = os.environ.get('LIVEKIT_API_KEY', '')
+LIVEKIT_API_SECRET = os.environ.get('LIVEKIT_API_SECRET', '')
+
+# The address a BROWSER connects to, e.g. wss://livekit.loopdn.com. Handed to
+# the client with its token.
+LIVEKIT_URL = os.environ.get('LIVEKIT_URL', '').rstrip('/')
+
+# The address DJANGO calls the server API on. Defaults to LIVEKIT_URL; set it
+# when the service is reachable inside the VPC at a different (cheaper, private)
+# address than the one browsers use.
+LIVEKIT_API_URL = os.environ.get('LIVEKIT_API_URL', '').rstrip('/') or LIVEKIT_URL
+
+# How long one request to LiveKit's server API may take before it is given up
+# on, in seconds. Only ending a call and recording use it - tokens are signed
+# locally and never touch the network.
+LIVEKIT_API_TIMEOUT_SECONDS = int(os.environ.get('LIVEKIT_API_TIMEOUT_SECONDS', '10'))
+
+# How long a participant token is good for, in seconds. A token is only checked
+# when somebody connects - an established session outlives it, and the client
+# is refreshed by LiveKit itself - so this only has to cover the gap between
+# asking to join and connecting. It is also how long a slot is held for
+# somebody who asked and never connected (calls/services.py:sweep_stale_calls).
+LIVEKIT_TOKEN_TTL_SECONDS = int(os.environ.get('LIVEKIT_TOKEN_TTL_SECONDS', '600'))
+
+# How long a one-to-one call rings before it is given up as unanswered.
+CALL_RING_TIMEOUT_SECONDS = int(os.environ.get('CALL_RING_TIMEOUT_SECONDS', '90'))
+
+# The backstop for a call nobody ended. Every normal way out is handled sooner.
+CALL_MAX_DURATION_HOURS = int(os.environ.get('CALL_MAX_DURATION_HOURS', '24'))
+
+# Recording. LiveKit's egress service writes the file straight to S3 - it never
+# passes through Django - and Django keeps only the metadata. Recording is
+# offered only where a bucket is configured, so it stays off on a laptop.
+#
+# Defaults to the media bucket, under its own prefix; point it at a separate
+# bucket to give recordings their own lifecycle and access rules.
+LIVEKIT_RECORDING_BUCKET = os.environ.get(
+    'LIVEKIT_RECORDING_BUCKET', AWS_STORAGE_BUCKET_NAME
+)
+LIVEKIT_RECORDING_REGION = os.environ.get(
+    'LIVEKIT_RECORDING_REGION', os.environ.get('AWS_REGION', 'us-west-2')
+)
+LIVEKIT_RECORDING_PREFIX = os.environ.get(
+    'LIVEKIT_RECORDING_PREFIX', 'call-recordings'
+).strip('/')
+
+# Optional. Blank means the egress service uses the credentials it already runs
+# with (its ECS task role), which is what production should do. Set them only
+# when it has none - and then from Secrets Manager, like the API secret above.
+LIVEKIT_RECORDING_ACCESS_KEY = os.environ.get('LIVEKIT_RECORDING_ACCESS_KEY', '')
+LIVEKIT_RECORDING_SECRET = os.environ.get('LIVEKIT_RECORDING_SECRET', '')
+
+# How long a download link for a recording works. Short on purpose: the link
+# alone is the credential, and it is minted per request for somebody who has
+# just passed the permission check.
+LIVEKIT_RECORDING_URL_TTL_SECONDS = int(
+    os.environ.get('LIVEKIT_RECORDING_URL_TTL_SECONDS', '300')
+)
