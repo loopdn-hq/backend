@@ -525,7 +525,9 @@ class WebhookSignatureTests(TestCase):
     def sign(self, body=None, timestamp=None):
         body = self.body if body is None else body
         timestamp = str(int(time.time())) if timestamp is None else str(timestamp)
-        sig = self.private.sign(timestamp.encode() + b'.' + body)
+        # The separator must match sms/signature.py exactly. This helper used
+        # a dot, which is what let the bug pass its own test for months.
+        sig = self.private.sign(timestamp.encode() + b'|' + body)
         return timestamp, base64.b64encode(sig).decode()
 
     def test_a_genuine_signature_is_accepted(self):
