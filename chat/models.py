@@ -1403,6 +1403,18 @@ class ChannelConsent(models.Model):
     # different channel is evidence destroyed.
     asked_at = models.DateTimeField(null=True, blank=True)
     consent_text = models.TextField(blank=True, default='', db_default='')
+
+    # When an admin last nudged them about an unanswered invitation.
+    #
+    # Separate from `asked_at`, which is the FIRST ask and never moves - the
+    # date somebody was first put on notice is the one a complaint turns on,
+    # and a reminder must not quietly reset it.
+    #
+    # This is what the rate limit reads. A nudge is a message to somebody who
+    # has not consented, which is the traffic carriers police hardest, so it is
+    # deliberately admin-initiated rather than automatic and cannot be repeated
+    # inside NUDGE_INTERVAL.
+    reminded_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(
         max_length=10,
         choices=Status.choices,

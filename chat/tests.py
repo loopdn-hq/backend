@@ -1,11 +1,12 @@
 """Tests for conversations, membership, messages and the realtime layer."""
 import shutil
 import tempfile
+from datetime import timedelta
 from unittest import mock
 
 from channels.db import database_sync_to_async
 from django.db import connection
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase
 from django.test.utils import CaptureQueriesContext
 from channels.testing import WebsocketCommunicator
 from django.contrib.auth.models import User
@@ -6322,3 +6323,122 @@ class ConsentIsRecordedPerChannelTests(TestCase):
             participant=self.participant, channel=ChannelConsent.Channel.SMS
         )
         self.assertIsNotNone(sms.consented_at)
+
+
+class NudgeAnUnansweredInvitationTests(EnvelopeAssertions, APITestCase):
+    """Asking again, once a day at most, and never after an answer.
+
+    A nudge is a message to somebody who has NOT consented, which is the
+    traffic carriers police hardest. So it is admin-triggered rather than
+    automatic, rate limited, and refused outright for anybody who has already
+    said no - a second ask after a NO is the behaviour that loses a campaign.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        membership.record_consent_asked(
+            self.row, ChannelConsent.Channel.SMS, 'You were added. Reply YES.'
+        )
+        self.client.force_authenticate(self.alice)
+        self.url = reverse('chat:conversation-nudge', args=[self.group.pk])
+
+    def send(self, channel=ChannelConsent.Channel.SMS, participant=None):
+        return self.client.post(
+            self.url,
+            {'participant': (participant or self.row).pk, 'channel': channel},
+            format='json',
+        )
+
+    def age_the_ask(self, hours):
+        consent = ChannelConsent.objects.get(
+            participant=self.row, channel=ChannelConsent.Channel.SMS
+        )
+        consent.asked_at = timezone.now() - timedelta(hours=hours)
+        consent.save(update_fields=['asked_at'])
+        return consent
+
+    # --- the rate limit ---------------------------------------------------
+
+    def test_a_fresh_invitation_cannot_be_nudged_yet(self):
+        self.assertFailure(self.send())
+
+    def test_a_day_later_it_can(self):
+        self.age_the_ask(25)
+
+        self.assertSuccess(self.send())
+
+        consent = ChannelConsent.objects.get(
+            participant=self.row, channel=ChannelConsent.Channel.SMS
+        )
+        self.assertIsNotNone(consent.reminded_at)
+
+    def test_nudging_twice_in_a_day_is_refused(self):
+        self.age_the_ask(25)
+        self.assertSuccess(self.send())
+
+        # The clock restarts from the nudge, not from the original ask.
+        self.assertFailure(self.send())
+
+    def test_the_first_ask_is_never_rewritten(self):
+        consent = self.age_the_ask(25)
+        first_asked, first_text = consent.asked_at, consent.consent_text
+
+        self.send()
+
+        consent.refresh_from_db()
+        self.assertEqual(consent.asked_at, first_asked)
+        self.assertEqual(consent.consent_text, first_text)
+
+    # --- never after an answer -------------------------------------------
+
+    def test_somebody_who_said_no_is_never_nudged(self):
+        self.age_the_ask(72)
+        membership.set_channel_consent(
+            self.row, ChannelConsent.Channel.SMS, ChannelConsent.Status.DECLINED
+        )
+
+        self.assertFailure(self.send())
+
+    def test_somebody_who_sent_stop_is_never_nudged(self):
+        self.age_the_ask(72)
+        membership.set_channel_consent(
+            self.row, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_OUT
+        )
+
+        self.assertFailure(self.send())
+
+    def test_somebody_who_already_agreed_is_not_nudged(self):
+        self.age_the_ask(72)
+        membership.set_channel_consent(
+            self.row, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
+        )
+
+        self.assertFailure(self.send())
+
+    # --- who may do it ----------------------------------------------------
+
+    def test_an_ordinary_member_cannot_nudge(self):
+        self.age_the_ask(25)
+        self.client.force_authenticate(self.bob)
+
+        self.assertFailure(self.send())
+
+    # --- per channel ------------------------------------------------------
+
+    def test_nudging_sms_does_not_touch_the_email_row(self):
+        membership.record_consent_asked(
+            self.row, ChannelConsent.Channel.EMAIL, 'Emailed invitation.'
+        )
+        self.age_the_ask(25)
+
+        self.send(ChannelConsent.Channel.SMS)
+
+        email = ChannelConsent.objects.get(
+            participant=self.row, channel=ChannelConsent.Channel.EMAIL
+        )
+        self.assertIsNone(email.reminded_at)

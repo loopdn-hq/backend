@@ -86,6 +86,7 @@ from chat.serializers import (
     ParticipantRoleSerializer,
     RenameMemberSerializer,
     ParticipantSerializer,
+    NudgeMemberSerializer,
     RemoveMemberSerializer,
 )
 from chat.services import broadcast_conversation_updated, broadcast_message_updated
@@ -125,6 +126,7 @@ class ConversationViewSet(
         'join': JoinGroupSerializer,
         'requests': JoinRequestDecisionSerializer,
         'remove': RemoveMemberSerializer,
+        'nudge': NudgeMemberSerializer,
         'delivery': DeliveryPreferenceSerializer,
         'read': MarkReadSerializer,
         'archive': ArchiveSerializer,
@@ -150,6 +152,7 @@ class ConversationViewSet(
         'requests:GET': 'Pending requests fetched.',
         'requests:POST': 'Request handled.',
         'remove': 'Member removed.',
+        'nudge': 'Reminder sent.',
         'delivery': 'Delivery settings saved.',
         'read': 'Marked as read.',
         'archive': 'Conversation updated.',
@@ -553,6 +556,35 @@ class ConversationViewSet(
         )
         participant = decide(serializer.participant, request.user)
         return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['post'])
+    def nudge(self, request, pk=None):
+        """Ask a member again about an invitation they never answered.
+
+        ADMIN-TRIGGERED, never automatic, and at most once a day per channel.
+        A nudge is a message to somebody who has not consented, which is the
+        traffic carriers police hardest - so a person decides to send each one,
+        and `membership.nudge` refuses anybody who has already answered.
+        """
+        conversation = self.get_object()
+        serializer = self.get_serializer(
+            data=request.data,
+            context={**self.get_serializer_context(), 'conversation': conversation},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        membership.nudge(
+            serializer.participant,
+            serializer.validated_data['channel'],
+            request.user,
+        )
+        # The participant, so a client can re-render the row it just acted on
+        # with its new `reminded_at` and the refusal that now applies.
+        return Response(
+            ParticipantSerializer(
+                serializer.participant, context=self.get_serializer_context()
+            ).data
+        )
 
     @action(detail=True, methods=['post'])
     def remove(self, request, pk=None):

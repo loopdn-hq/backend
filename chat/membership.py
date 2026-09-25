@@ -20,6 +20,8 @@ from urllib.parse import quote
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import Q
+from datetime import timedelta
+
 from django.utils import timezone
 
 from chat.models import (
@@ -563,6 +565,100 @@ def record_consent_asked(participant, channel, wording):
         fields.append('consent_text')
     if fields:
         consent.save(update_fields=fields)
+    return consent
+
+
+# How long an admin must wait before asking the same person again. A nudge is a
+# message to somebody who has not consented, so the floor is a real protection
+# rather than a nicety.
+NUDGE_INTERVAL = timedelta(hours=24)
+
+
+def nudge_refusal(participant, channel, *, now=None):
+    """Why this member must not be nudged about `channel`, or None if they may.
+
+    A string rather than a boolean, for the reason `refusal_reason` gives: the
+    UI has to explain a disabled button, and "they said no" and "asked an hour
+    ago" are very different things to tell an admin.
+
+    NEVER after an answer. Somebody who replied NO has answered the question,
+    and somebody who sent STOP has told the carrier. Asking either of them
+    again is the behaviour that gets a campaign shut down, so both are refused
+    here rather than left to the caller to remember.
+    """
+    now = now or timezone.now()
+
+    if participant.status != Participant.Status.ACTIVE:
+        return 'They are not an active member.'
+
+    consent = ChannelConsent.objects.filter(
+        participant=participant, channel=channel
+    ).first()
+    if consent is None:
+        return 'They have never been asked about this channel.'
+
+    if consent.status == ChannelConsent.Status.OPTED_IN:
+        return 'They have already agreed.'
+    if consent.status == ChannelConsent.Status.DECLINED:
+        return 'They declined. Asking again is not ours to do.'
+    if consent.status == ChannelConsent.Status.OPTED_OUT:
+        return 'They opted out. Only they can undo that.'
+
+    # PENDING from here. `asked_at` is the first ask and never moves, so the
+    # clock runs from whichever contact was most recent.
+    last = max(filter(None, (consent.asked_at, consent.reminded_at)), default=None)
+    if last is None:
+        return 'Nothing has been sent to them yet.'
+
+    waited = now - last
+    if waited < NUDGE_INTERVAL:
+        remaining = NUDGE_INTERVAL - waited
+        hours = int(remaining.total_seconds() // 3600) + 1
+        return f'Asked recently. You can nudge again in about {hours}h.'
+
+    return None
+
+
+def nudge(participant, channel, by, *, text=None):
+    """Ask an unanswered invitation again. Admins only, once a day at most.
+
+    Returns the ChannelConsent row. Raises JoinRefused with the reason when the
+    member may not be nudged, so a caller cannot send by forgetting to check.
+
+    `asked_at` and `consent_text` are left alone deliberately - they record the
+    FIRST time somebody was put on notice and in what words, which is what a
+    consent complaint turns on. Only `reminded_at` moves.
+    """
+    if not participant.conversation.may_add_members(by):
+        raise JoinRefused('You cannot nudge people in this group.')
+
+    refusal = nudge_refusal(participant, channel)
+    if refusal is not None:
+        raise JoinRefused(refusal)
+
+    consent = ChannelConsent.objects.get(participant=participant, channel=channel)
+    consent.reminded_at = timezone.now()
+    consent.save(update_fields=['reminded_at', 'updated_at'])
+
+    if text is None:
+        conversation = participant.conversation
+        text = (
+            f'Reminder: you were added to {conversation.name} on LoopD. '
+            'Reply YES to receive this group by text, NO to decline. '
+            'STOP to never hear from us.'
+        )
+
+    # Through send_notice like the invitation it repeats, so the kill switch,
+    # the spend ceilings and the delivery log all apply. A reminder that
+    # bypassed them would be an unrecorded way to spend money on the one kind
+    # of message that most needs a record.
+    from sms.outbound import send_notice
+
+    transaction.on_commit(
+        lambda: send_notice(
+            participant.conversation, participant, text, kind='invitation'
+        )
+    )
     return consent
 
 

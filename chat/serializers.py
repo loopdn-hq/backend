@@ -1623,6 +1623,20 @@ class JoinRequestDecisionSerializer(ParticipantActionSerializer):
     decision = serializers.ChoiceField(choices=['approve', 'decline'])
 
 
+class NudgeMemberSerializer(ParticipantActionSerializer):
+    """Ask one member again about one channel.
+
+    The channel is explicit rather than assumed to be SMS: the same member can
+    be pending on email too, and which one an admin meant is not for the server
+    to guess.
+    """
+
+    channel = serializers.ChoiceField(
+        choices=ChannelConsent.Channel.choices,
+        default=ChannelConsent.Channel.SMS,
+    )
+
+
 class RemoveMemberSerializer(ParticipantActionSerializer):
     block = serializers.BooleanField(
         required=False,
