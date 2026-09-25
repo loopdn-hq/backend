@@ -486,6 +486,7 @@ class ParticipantSerializer(serializers.ModelSerializer):
     display_label = serializers.CharField(read_only=True)
     is_phone_only = serializers.BooleanField(read_only=True)
     email_enabled = serializers.SerializerMethodField()
+    channels = serializers.SerializerMethodField()
 
     class Meta:
         model = Participant
@@ -499,6 +500,12 @@ class ParticipantSerializer(serializers.ModelSerializer):
             'muted',
             'sms_enabled',
             'email_enabled',
+            # The full per-channel consent record. `sms_enabled` and
+            # `email_enabled` above are the two booleans a toggle needs;
+            # this is what actually happened, which is a different question
+            # - "off" and "never answered" look identical as a boolean and
+            # are very different things to show an admin.
+            'channels',
             # How far this member has read, so a client can show a sender
             # whether their message has been seen. Null for anybody who has
             # read nothing - and permanently null for a phone-only member,
@@ -524,6 +531,37 @@ class ParticipantSerializer(serializers.ModelSerializer):
 
         consent = consent_for(obj, ChannelConsent.Channel.EMAIL)
         return bool(consent and consent.allows_delivery)
+
+    def get_channels(self, obj):
+        """Where this member stands on every channel, keyed by channel.
+
+        Built by walking ChannelConsent.Channel rather than naming sms and
+        email, so a channel added to the enum appears here without anyone
+        remembering to widen this method.
+
+        A channel the member was never asked about reports status None rather
+        than being omitted: "we have not asked" is a real state an admin screen
+        needs to distinguish from "they said no", and a missing key reads as
+        neither.
+
+        Reads the prefetch - see the queryset in ConversationViewSet.participants,
+        without which this is one query per channel per member.
+        """
+        from chat.delivery import consent_for
+
+        record = {}
+        for channel, _label in ChannelConsent.Channel.choices:
+            consent = consent_for(obj, channel)
+            record[channel] = {
+                'status': consent.status if consent else None,
+                # The decision the fan-out actually makes, so a client does not
+                # have to re-derive it from status and get it subtly wrong.
+                'allows_delivery': bool(consent and consent.allows_delivery),
+                'asked_at': consent.asked_at if consent else None,
+                'consented_at': consent.consented_at if consent else None,
+                'opted_out_at': consent.opted_out_at if consent else None,
+            }
+        return record
 
     def to_representation(self, instance):
         data = super().to_representation(instance)

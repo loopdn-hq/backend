@@ -426,6 +426,10 @@ class ConversationViewSet(
             # their read receipts may be shown, and without this that is a
             # query per row.
             .select_related('user__profile', 'user__privacy_settings')
+            # Consent is read per channel for every row - `email_enabled` and
+            # `channels` both walk it. Without this that is a query per member,
+            # and it was one before `channels` existed.
+            .prefetch_related('channel_consents')
             .order_by('joined_at', 'pk')
         )
 
