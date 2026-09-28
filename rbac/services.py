@@ -94,6 +94,27 @@ def revoke(user, role, *, by=None, note=''):
 
 
 @transaction.atomic
+def start_as_commercial(user, *, note='Signed up on the commercial site.'):
+    """Make a brand-new account a commercial one rather than a standard one.
+
+    For signup only. Every account is created holding `standard`, by the signal
+    in user/signals.py. One made on the commercial site (commercial.loopdn.com)
+    holds `commercial` instead: the ads area and nothing else, so it has no
+    chat (docs/rbac_plan.md, open question 1).
+
+    The `standard` row is deleted rather than revoked. It has existed only for
+    the length of this transaction, its creation was never audited either, and
+    a REVOKE entry would record a change nobody made. The `commercial` grant is
+    audited like any other.
+
+    Never call this for an account that has been used: it takes `standard`, and
+    with it chat, away.
+    """
+    UserRole.objects.filter(user=user, role=UserRole.Role.STANDARD).delete()
+    return grant(user, UserRole.Role.COMMERCIAL, note=note)
+
+
+@transaction.atomic
 def set_grant(feature_key, role, allowed, *, by=None, note=''):
     """Change one cell of the permissions matrix.
 

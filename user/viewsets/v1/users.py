@@ -38,6 +38,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from otp.models import OtpError
 from otp.services import start_email_verification
+from rbac.services import start_as_commercial
 from user import blocks
 from user.lookups import search_users
 from user.models import Profile, UserBlock
@@ -217,7 +218,8 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user, created = self._get_or_create_google_user(
-            serializer.validated_data['credential']
+            serializer.validated_data['credential'],
+            serializer.validated_data['account_type'],
         )
 
         if not user.is_active:
@@ -238,7 +240,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
 
     @staticmethod
     @transaction.atomic
-    def _get_or_create_google_user(claims):
+    def _get_or_create_google_user(claims, account_type='standard'):
         email = claims['email'].strip()
         user = User.objects.filter(email__iexact=email).first()
         if user:
@@ -269,6 +271,11 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         user.profile.save(
             update_fields=['display_name', 'email_verified', 'updated_at']
         )
+        # Only here, where the account is being created. An existing account
+        # signing in from the commercial site keeps the roles it has: taking
+        # `standard` would take its chat away.
+        if account_type == 'commercial':
+            start_as_commercial(user)
         return user, True
 
     @action(

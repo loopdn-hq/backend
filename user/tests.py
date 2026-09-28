@@ -28,6 +28,7 @@ from rest_framework.test import APITestCase
 
 from otp.models import EmailOtp
 from otp.services import verify_email
+from rbac.models import RoleAuditLog, UserRole
 from user.models import (
     AppearanceSettings,
     MessagingSettings,
@@ -2896,3 +2897,110 @@ class EmailBlockFollowsTheAccountTests(TestCase):
         self.verify(stewart)
 
         self.assertEqual(blocks.link_email_to_account(stewart), 0)
+
+
+@override_settings(REQUIRE_EMAIL_VERIFICATION=False)
+class CommercialSignupTests(EnvelopeAssertions, APITestCase):
+    """An account made on commercial.loopdn.com is a commercial one.
+
+    The frontend sends `account_type: commercial` from that host. The account
+    starts with the `commercial` role INSTEAD of `standard` - the ads area and
+    nothing else - and only when it is created: signing in never changes roles.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.register_url = reverse('user:user-register')
+        self.google_url = reverse('user:user-google')
+        self.payload = {
+            'username': 'joe',
+            'email': 'joe@example.com',
+            'password': 'a-strong-passphrase-42',
+            'confirm_password': 'a-strong-passphrase-42',
+            'first_name': 'Joe',
+            'display_name': "Joe's Pizza",
+            'phone_number': '+639171234599',
+        }
+        self.claims = {
+            'sub': 'google-subject-joe',
+            'email': 'joe@example.com',
+            'email_verified': True,
+            'given_name': 'Joe',
+            'family_name': 'P',
+            'name': 'Joe P',
+        }
+
+    def roles(self, email):
+        return set(
+            UserRole.objects.filter(user__email=email).values_list('role', flat=True)
+        )
+
+    def test_a_commercial_signup_holds_commercial_and_not_standard(self):
+        self.assertSuccess(
+            self.client.post(
+                self.register_url, {**self.payload, 'account_type': 'commercial'}
+            ),
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(self.roles('joe@example.com'), {'commercial'})
+
+    def test_the_commercial_grant_is_audited_and_the_dropped_standard_is_not(self):
+        """`standard` existed only inside the signup transaction; logging its
+        removal would record a change nobody made."""
+        self.client.post(
+            self.register_url, {**self.payload, 'account_type': 'commercial'}
+        )
+        entries = RoleAuditLog.objects.filter(subject__email='joe@example.com')
+        self.assertEqual(
+            list(entries.values_list('action', 'role')), [('grant', 'commercial')]
+        )
+        self.assertIn('commercial site', entries.get().note)
+
+    def test_a_signup_that_says_nothing_is_standard(self):
+        self.assertSuccess(
+            self.client.post(self.register_url, self.payload),
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(self.roles('joe@example.com'), {'standard'})
+
+    def test_an_account_type_that_is_not_offered_is_refused(self):
+        """Self-serve reaches `commercial` and no further."""
+        self.assertFailure(
+            self.client.post(
+                self.register_url, {**self.payload, 'account_type': 'admin'}
+            )
+        )
+        self.assertFalse(User.objects.filter(email='joe@example.com').exists())
+
+    @override_settings(GOOGLE_CLIENT_IDS=['web-client-id'])
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_a_new_google_account_from_the_commercial_site_is_commercial(
+        self, verify_token
+    ):
+        verify_token.return_value = self.claims
+        self.assertSuccess(
+            self.client.post(
+                self.google_url,
+                {'credential': 'id-token', 'account_type': 'commercial'},
+            ),
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(self.roles('joe@example.com'), {'commercial'})
+
+    @override_settings(GOOGLE_CLIENT_IDS=['web-client-id'])
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_signing_in_from_the_commercial_site_never_changes_an_account(
+        self, verify_token
+    ):
+        """Taking `standard` from an existing account would take its chat."""
+        User.objects.create_user(username='joe', email='joe@example.com')
+        verify_token.return_value = self.claims
+
+        self.assertSuccess(
+            self.client.post(
+                self.google_url,
+                {'credential': 'id-token', 'account_type': 'commercial'},
+            )
+        )
+        self.assertEqual(self.roles('joe@example.com'), {'standard'})
+
