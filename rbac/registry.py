@@ -35,7 +35,7 @@ exactly what the catalogue-in-code rule exists to prevent. They arrive with
 that app (step 9 and `docs/advertising_integration_plan.md`).
 
 `ads.access` is the one exception, and only because it gates a menu item this
-plan itself adds in step 6. When the campaign features do arrive, `advertiser`
+plan itself adds in step 6. When the campaign features do arrive, `commercial`
 is the role that gets them - confirmed, not assumed.
 """
 
@@ -45,7 +45,7 @@ CONVERSATION = 'conversation'
 
 #: Account roles, from `rbac.models.UserRole.Role`.
 ADMIN = 'admin'
-ADVERTISER = 'advertiser'
+COMMERCIAL = 'commercial'
 STANDARD = 'standard'
 
 #: Group roles, from `chat.models.Participant.Role`. The conversation axis
@@ -58,9 +58,9 @@ GROUP_MEMBER = 'member'
 # ---------------------------------------------------------------------------
 # ACCOUNT AXIS - which areas of the product a person may reach. Drives menus.
 #
-# `advertiser` is purely ADDITIVE here: it grants the advertising area and
-# nothing else. A business that also uses Loopd'n normally holds `standard` as
-# well and gets chat through that, while an ads-only account holds `advertiser`
+# `commercial` is purely ADDITIVE here: it grants the advertising area and
+# nothing else. A company that also uses Loopd'n normally holds `standard` as
+# well and gets chat through that, while an ads-only account holds `commercial`
 # alone and reaches only the ads area. That makes the ads-only question a
 # per-account grant rather than a schema decision - see open question 1.
 # ---------------------------------------------------------------------------
@@ -70,27 +70,27 @@ ACCOUNT_FEATURES = [
         key='chat.access', label='Open chat', area='Messaging',
         description='Reach the Chats area and take part in conversations.',
         sort_order=10,
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: True},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: True},
     ),
     dict(
         key='chat.group.create', label='Create a group', area='Messaging',
         description='Start a new Loop. Also bounded by the plan limit in '
                     'billing/limits.py, which is a separate question.',
         sort_order=20,
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: True},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: True},
     ),
     dict(
         key='chat.direct.start', label='Start a direct message', area='Messaging',
         description='Open a one-to-one conversation.',
         sort_order=30,
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: True},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: True},
     ),
     dict(
         key='broadcast.access', label='Open the broadcast area', area='Messaging',
         description='Reach the Broadcast section, where admin-only '
                     'announcement Loops are listed.',
         sort_order=32,
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: True},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: True},
     ),
     dict(
         key='activity.access', label='Open the activity feed', area='Messaging',
@@ -98,14 +98,14 @@ ACCOUNT_FEATURES = [
                     'failures. The notification app already decides WHAT lands '
                     'there; this is whether the area is reachable at all.',
         sort_order=34,
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: True},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: True},
     ),
     dict(
         key='find_groups.access', label='Discover and join public groups',
         area='Messaging', sort_order=36,
         description='Reach Find groups. Joining an individual Loop is still '
                     'governed by that Loop\'s own join_mode.',
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: True},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: True},
     ),
     dict(
         key='analytics.access', label='Open group analytics', area='Messaging',
@@ -114,21 +114,21 @@ ACCOUNT_FEATURES = [
                     'decides whether they have paid for it. Two different '
                     'questions; billing is out of scope here.',
         sort_order=38,
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: True},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: True},
     ),
     dict(
         key='billing.manage', label='Manage own billing', area='Billing',
         description='View and change this account\'s own plan, credits and '
                     'payment method. Never anybody else\'s.',
         sort_order=40,
-        grants={ADMIN: True, ADVERTISER: True, STANDARD: True},
+        grants={ADMIN: True, COMMERCIAL: True, STANDARD: True},
     ),
     dict(
         key='ads.access', label='Open the advertising area', area='Advertising',
         description='Reach the Advertise section. The campaign features '
                     'themselves arrive with the ads app.',
         sort_order=50,
-        grants={ADMIN: True, ADVERTISER: True, STANDARD: False},
+        grants={ADMIN: True, COMMERCIAL: True, STANDARD: False},
     ),
 
     # Platform tools. default_allowed=False on every one: these are where
@@ -138,7 +138,7 @@ ACCOUNT_FEATURES = [
         key='platform.permissions.view', label='View the permissions matrix',
         area='Platform', sort_order=60, default_allowed=False,
         description='Read which role may use which feature. Step 7.',
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: False},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: False},
     ),
     dict(
         key='platform.permissions.edit', label='Change the permissions matrix',
@@ -146,20 +146,20 @@ ACCOUNT_FEATURES = [
         description='Change which role may use which feature. Lockable and '
                     'separate from viewing, so a support role can read the '
                     'matrix without being able to rewrite it.',
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: False},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: False},
     ),
     dict(
         key='platform.role.grant', label='Grant and revoke account roles',
         area='Platform', sort_order=70, default_allowed=False, is_lockable=True,
         description='Add or remove a UserRole. Lockable: never grantable below '
                     'admin, or the matrix screen becomes the escalation path.',
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: False},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: False},
     ),
     dict(
         key='platform.settings', label='Change platform settings',
         area='Platform', sort_order=80, default_allowed=False, is_lockable=True,
         description='Global switches such as the SMS and ads kill switches.',
-        grants={ADMIN: True, ADVERTISER: False, STANDARD: False},
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: False},
     ),
 ]
 

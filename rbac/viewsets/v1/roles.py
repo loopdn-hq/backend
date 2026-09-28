@@ -13,7 +13,7 @@ own access arrives as features from `/users/me/features/` in step 6, which is
 what a client actually needs.
 
 `platform.role.grant` is `is_lockable`, so no matrix edit can ever open this to
-`standard` or `advertiser` - see rbac/checks.py:lockable_features_are_admin_only.
+`standard` or `commercial` - see rbac/checks.py:lockable_features_are_admin_only.
 """
 from django.contrib.auth.models import User
 from rest_framework import mixins, viewsets

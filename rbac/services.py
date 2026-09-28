@@ -120,7 +120,7 @@ def set_grant(feature_key, role, allowed, *, by=None, note=''):
     if role not in valid:
         # Roles come from three different vocabularies depending on the axis,
         # so `RoleFeature.role` is a plain CharField and nothing at the database
-        # level would stop `advertiser` being written onto a group feature. The
+        # level would stop `commercial` being written onto a group feature. The
         # row would never match anything and would sit in the matrix reading
         # like a real denial.
         raise RoleChangeRefused(

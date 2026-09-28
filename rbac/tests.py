@@ -32,11 +32,11 @@ class UserRoleTests(TestCase):
 
     def test_a_user_holds_several_roles_at_once(self):
         # `standard` is already there - the signup signal grants it.
-        UserRole.objects.create(user=self.user, role=UserRole.Role.ADVERTISER)
+        UserRole.objects.create(user=self.user, role=UserRole.Role.COMMERCIAL)
 
         self.assertEqual(
             set(self.user.account_roles.values_list('role', flat=True)),
-            {'standard', 'advertiser'},
+            {'standard', 'commercial'},
         )
 
     def test_the_same_role_cannot_be_held_twice(self):
@@ -46,7 +46,7 @@ class UserRoleTests(TestCase):
     def test_granted_by_survives_the_granter_being_deleted(self):
         granter = User.objects.create_user(username='admin', password='pw')
         role = UserRole.objects.create(
-            user=self.user, role=UserRole.Role.ADVERTISER, granted_by=granter
+            user=self.user, role=UserRole.Role.COMMERCIAL, granted_by=granter
         )
 
         granter.delete()
@@ -58,7 +58,7 @@ class UserRoleTests(TestCase):
         self.assertTrue(UserRole.objects.filter(pk=role.pk).exists())
 
     def test_roles_go_when_the_user_does(self):
-        UserRole.objects.create(user=self.user, role=UserRole.Role.ADVERTISER)
+        UserRole.objects.create(user=self.user, role=UserRole.Role.COMMERCIAL)
         user_id = self.user.pk
 
         self.user.delete()
@@ -123,12 +123,12 @@ class RoleFeatureTests(TestCase):
 
     def test_one_answer_per_cell(self):
         RoleFeature.objects.create(
-            role=UserRole.Role.ADVERTISER, feature=self.feature, allowed=True
+            role=UserRole.Role.COMMERCIAL, feature=self.feature, allowed=True
         )
 
         with self.assertRaises(IntegrityError), transaction.atomic():
             RoleFeature.objects.create(
-                role=UserRole.Role.ADVERTISER, feature=self.feature, allowed=False
+                role=UserRole.Role.COMMERCIAL, feature=self.feature, allowed=False
             )
 
     def test_the_same_role_may_answer_for_different_features(self):
@@ -139,15 +139,15 @@ class RoleFeatureTests(TestCase):
         )
 
         RoleFeature.objects.create(
-            role=UserRole.Role.ADVERTISER, feature=self.feature, allowed=True
+            role=UserRole.Role.COMMERCIAL, feature=self.feature, allowed=True
         )
         RoleFeature.objects.create(
-            role=UserRole.Role.ADVERTISER, feature=other, allowed=False
+            role=UserRole.Role.COMMERCIAL, feature=other, allowed=False
         )
 
         self.assertEqual(
             RoleFeature.objects.filter(
-                role='advertiser', feature__area='Testing'
+                role='commercial', feature__area='Testing'
             ).count(),
             2,
         )
@@ -166,7 +166,7 @@ class RoleFeatureTests(TestCase):
 
     def test_str_says_whether_the_role_may(self):
         allowed = RoleFeature.objects.create(
-            role=UserRole.Role.ADVERTISER, feature=self.feature, allowed=True
+            role=UserRole.Role.COMMERCIAL, feature=self.feature, allowed=True
         )
         self.assertIn('may test.thing.create', str(allowed))
 
@@ -295,20 +295,20 @@ class SeedTests(TestCase):
                 f'{key} floor must permit a member; policy narrows it',
             )
 
-    def test_advertiser_is_additive_and_carries_no_messaging(self):
-        """`advertiser` grants the ads area and nothing else.
+    def test_commercial_is_additive_and_carries_no_messaging(self):
+        """`commercial` grants the ads area and nothing else.
 
-        A business that also uses Loopd'n normally holds `standard` too and
-        gets chat through that. An ads-only account holds `advertiser` alone
+        A company that also uses Loopd'n normally holds `standard` too and
+        gets chat through that. An ads-only account holds `commercial` alone
         and reaches only the ads area - which is what makes that a per-account
         grant rather than a schema decision.
         """
         self.assertTrue(
-            RoleFeature.objects.get(feature__key='ads.access', role='advertiser').allowed
+            RoleFeature.objects.get(feature__key='ads.access', role='commercial').allowed
         )
         for key in ['chat.access', 'chat.group.create', 'chat.direct.start']:
             self.assertFalse(
-                RoleFeature.objects.get(feature__key=key, role='advertiser').allowed
+                RoleFeature.objects.get(feature__key=key, role='commercial').allowed
             )
             self.assertTrue(
                 RoleFeature.objects.get(feature__key=key, role='standard').allowed
@@ -372,17 +372,17 @@ class AccountAxisTests(TestCase):
         self.assertTrue(can(self.user, 'chat.group.create'))
         self.assertFalse(can(self.user, 'ads.access'))
 
-    def test_advertiser_reaches_ads_and_keeps_chat_through_standard(self):
-        UserRole.objects.create(user=self.user, role=UserRole.Role.ADVERTISER)
+    def test_commercial_reaches_ads_and_keeps_chat_through_standard(self):
+        UserRole.objects.create(user=self.user, role=UserRole.Role.COMMERCIAL)
 
         self.assertTrue(can(self.user, 'ads.access'))
-        # Chat comes from the `standard` row, not from `advertiser`.
+        # Chat comes from the `standard` row, not from `commercial`.
         self.assertTrue(can(self.user, 'chat.access'))
 
     def test_an_ads_only_account_reaches_ads_and_nothing_else(self):
-        """`advertiser` alone, without `standard` - the per-account choice."""
+        """`commercial` alone, without `standard` - the per-account choice."""
         self.user.account_roles.filter(role=UserRole.Role.STANDARD).delete()
-        UserRole.objects.create(user=self.user, role=UserRole.Role.ADVERTISER)
+        UserRole.objects.create(user=self.user, role=UserRole.Role.COMMERCIAL)
 
         self.assertTrue(can(self.user, 'ads.access'))
         self.assertFalse(can(self.user, 'chat.access'))
@@ -427,9 +427,9 @@ class AccountAxisTests(TestCase):
         )
 
     def test_the_new_area_features_follow_the_same_rule_as_chat(self):
-        """Areas are `standard`'s, not `advertiser`'s.
+        """Areas are `standard`'s, not `commercial`'s.
 
-        An advertiser who also uses Loopd'n normally holds `standard` too and
+        A commercial user who also uses Loopd'n normally holds `standard` too and
         reaches them through that; an ads-only account does not.
         """
         for key in ['broadcast.access', 'activity.access',
@@ -437,7 +437,7 @@ class AccountAxisTests(TestCase):
             self.assertTrue(can(self.user, key), key)
 
         self.user.account_roles.filter(role=UserRole.Role.STANDARD).delete()
-        UserRole.objects.create(user=self.user, role=UserRole.Role.ADVERTISER)
+        UserRole.objects.create(user=self.user, role=UserRole.Role.COMMERCIAL)
 
         for key in ['broadcast.access', 'activity.access',
                     'find_groups.access', 'analytics.access']:
@@ -818,33 +818,33 @@ class GrantAndRevokeTests(TestCase):
         self.target = User.objects.create_user(username='tess', password='pw')
 
     def test_granting_adds_the_row_and_records_who(self):
-        services.grant(self.target, UserRole.Role.ADVERTISER, by=self.actor)
+        services.grant(self.target, UserRole.Role.COMMERCIAL, by=self.actor)
 
         self.assertTrue(
-            self.target.account_roles.filter(role='advertiser').exists()
+            self.target.account_roles.filter(role='commercial').exists()
         )
-        entry = RoleAuditLog.objects.filter(action='grant', role='advertiser').get()
+        entry = RoleAuditLog.objects.filter(action='grant', role='commercial').get()
         self.assertEqual(entry.actor_label, 'root3')
         self.assertEqual(entry.subject_label, 'tess')
 
     def test_granting_twice_changes_nothing_and_logs_once(self):
-        services.grant(self.target, UserRole.Role.ADVERTISER, by=self.actor)
-        services.grant(self.target, UserRole.Role.ADVERTISER, by=self.actor)
+        services.grant(self.target, UserRole.Role.COMMERCIAL, by=self.actor)
+        services.grant(self.target, UserRole.Role.COMMERCIAL, by=self.actor)
 
         self.assertEqual(
-            self.target.account_roles.filter(role='advertiser').count(), 1
+            self.target.account_roles.filter(role='commercial').count(), 1
         )
         # A log full of no-ops is a log nobody reads.
         self.assertEqual(
-            RoleAuditLog.objects.filter(action='grant', role='advertiser').count(), 1
+            RoleAuditLog.objects.filter(action='grant', role='commercial').count(), 1
         )
 
     def test_revoking_removes_the_row_and_records_it(self):
-        services.grant(self.target, UserRole.Role.ADVERTISER, by=self.actor)
-        services.revoke(self.target, UserRole.Role.ADVERTISER, by=self.actor)
+        services.grant(self.target, UserRole.Role.COMMERCIAL, by=self.actor)
+        services.revoke(self.target, UserRole.Role.COMMERCIAL, by=self.actor)
 
         self.assertFalse(
-            self.target.account_roles.filter(role='advertiser').exists()
+            self.target.account_roles.filter(role='commercial').exists()
         )
         self.assertTrue(RoleAuditLog.objects.filter(action='revoke').exists())
 
@@ -882,19 +882,19 @@ class GrantAndRevokeTests(TestCase):
         "granted admin to <nobody>" answers nothing, which is why the names are
         copied in as text at write time.
         """
-        services.grant(self.target, UserRole.Role.ADVERTISER, by=self.actor)
+        services.grant(self.target, UserRole.Role.COMMERCIAL, by=self.actor)
 
         self.target.delete()
 
-        entry = RoleAuditLog.objects.filter(action='grant', role='advertiser').get()
+        entry = RoleAuditLog.objects.filter(action='grant', role='commercial').get()
         self.assertIsNone(entry.subject_id)
         self.assertEqual(entry.subject_label, 'tess')
 
     def test_a_system_grant_records_no_actor(self):
         """Blank is a fact: a migration or the signup signal did it."""
-        services.grant(self.target, UserRole.Role.ADVERTISER)
+        services.grant(self.target, UserRole.Role.COMMERCIAL)
 
-        entry = RoleAuditLog.objects.filter(action='grant', role='advertiser').get()
+        entry = RoleAuditLog.objects.filter(action='grant', role='commercial').get()
         self.assertIsNone(entry.actor_id)
         self.assertEqual(entry.actor_label, '')
 
@@ -930,7 +930,7 @@ class RoleApiTests(EnvelopeAssertions, TestCase):
     def test_an_admin_grants_and_the_target_gains_the_feature(self):
         self.assertSuccess(self._as(self.admin).post(
             '/api/v1/rbac/roles/grant/',
-            {'user': self.plain.pk, 'role': 'advertiser'}, format='json',
+            {'user': self.plain.pk, 'role': 'commercial'}, format='json',
         ))
 
         self.assertTrue(can(self.plain, 'ads.access'))
@@ -959,7 +959,7 @@ class RoleApiTests(EnvelopeAssertions, TestCase):
     def test_the_audit_endpoint_shows_what_happened(self):
         self._as(self.admin).post(
             '/api/v1/rbac/roles/grant/',
-            {'user': self.plain.pk, 'role': 'advertiser', 'note': 'signed up'},
+            {'user': self.plain.pk, 'role': 'commercial', 'note': 'signed up'},
             format='json',
         )
 
@@ -1052,8 +1052,8 @@ class FeaturesEndpointTests(EnvelopeAssertions, TestCase):
         self.assertNotIn('ads.access', data['account'])
         self.assertNotIn('platform.role.grant', data['account'])
 
-    def test_granting_advertiser_adds_the_ads_area(self):
-        services.grant(self.user, UserRole.Role.ADVERTISER)
+    def test_granting_commercial_adds_the_ads_area(self):
+        services.grant(self.user, UserRole.Role.COMMERCIAL)
 
         data = self.assertSuccess(self.client.get('/api/v1/users/me/features/'))
 
@@ -1178,7 +1178,7 @@ class MatrixEndpointTests(EnvelopeAssertions, TestCase):
         data = self._fetch(self.admin)
         account = next(a for a in data['axes'] if a['axis'] == 'account')
 
-        self.assertEqual(account['roles'], ['admin', 'advertiser', 'standard'])
+        self.assertEqual(account['roles'], ['admin', 'commercial', 'standard'])
 
     def test_roles_are_plain_strings(self):
         """They become JSON keys and dict lookups; a TextChoices member reprs
@@ -1197,7 +1197,7 @@ class MatrixEndpointTests(EnvelopeAssertions, TestCase):
             if f['key'] == 'ads.access'
         )
 
-        self.assertTrue(ads['grants']['advertiser'])
+        self.assertTrue(ads['grants']['commercial'])
         self.assertFalse(ads['grants']['standard'])
 
     def test_lockable_features_say_so(self):
@@ -1227,7 +1227,7 @@ class MatrixEndpointTests(EnvelopeAssertions, TestCase):
         """A cell the seeder never wrote denies, exactly like False - but it
         means something different, and rbac/checks.py warns about it."""
         RoleFeature.objects.filter(
-            feature__key='chat.access', role='advertiser'
+            feature__key='chat.access', role='commercial'
         ).delete()
 
         data = self._fetch(self.admin)
@@ -1237,7 +1237,7 @@ class MatrixEndpointTests(EnvelopeAssertions, TestCase):
             if f['key'] == 'chat.access'
         )
 
-        self.assertIsNone(chat['grants']['advertiser'])
+        self.assertIsNone(chat['grants']['commercial'])
 
     def test_it_costs_a_bounded_number_of_queries(self):
         """One page load for the whole product's permissions.
@@ -1324,11 +1324,11 @@ class SetGrantTests(TestCase):
 
     def test_a_role_from_the_wrong_axis_is_refused(self):
         """`RoleFeature.role` is a CharField, so nothing at the database level
-        stops `advertiser` landing on a group feature. The row would match
+        stops `commercial` landing on a group feature. The row would match
         nothing and read like a real denial in the matrix."""
         with self.assertRaises(services.RoleChangeRefused):
             services.set_grant(
-                'group.message.pin', 'advertiser', True, by=self.actor
+                'group.message.pin', 'commercial', True, by=self.actor
             )
 
     def test_an_unknown_feature_is_refused(self):
@@ -1479,3 +1479,55 @@ class DirectConversationFeaturesTests(EnvelopeAssertions, TestCase):
                 feature__key='group.message.pin', role='member'
             ).allowed
         )
+
+
+class AdvertiserRoleRenameTests(TestCase):
+    """rbac/0008 renames the account role `advertiser` to `commercial`.
+
+    Its data step is called directly: by the time any test runs, every
+    migration has already run over an empty database, so the case that matters
+    - old rows beside fresh defaults - never happens on its own.
+    """
+
+    def setUp(self):
+        import importlib
+
+        from django.apps import apps
+
+        migration = importlib.import_module(
+            'rbac.migrations.0008_rename_advertiser_role_to_commercial'
+        )
+        self.rename = lambda: migration.forwards(apps, None)
+        self.user = User.objects.create_user(username='shop', password='pw')
+
+    def test_a_held_role_is_renamed(self):
+        UserRole.objects.create(user=self.user, role='advertiser')
+
+        self.rename()
+
+        self.assertEqual(
+            set(self.user.account_roles.values_list('role', flat=True)),
+            {'standard', 'commercial'},
+        )
+
+    def test_an_operators_edit_to_the_old_role_beats_a_fresh_default(self):
+        """0007's ensure_catalogue() may already have seeded `commercial`."""
+        feature = Feature.objects.get(key='ads.access')
+        self.assertTrue(
+            RoleFeature.objects.get(feature=feature, role='commercial').allowed
+        )
+        RoleFeature.objects.create(feature=feature, role='advertiser', allowed=False)
+
+        self.rename()
+
+        self.assertFalse(
+            RoleFeature.objects.get(feature=feature, role='commercial').allowed
+        )
+        self.assertFalse(RoleFeature.objects.filter(role='advertiser').exists())
+
+    def test_the_audit_log_keeps_the_name_the_grant_was_made_under(self):
+        RoleAuditLog.objects.create(action='grant', role='advertiser')
+
+        self.rename()
+
+        self.assertTrue(RoleAuditLog.objects.filter(role='advertiser').exists())
