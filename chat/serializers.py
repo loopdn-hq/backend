@@ -2,6 +2,8 @@
 import logging
 
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import validate_email as validate_email_address
 from django.db import transaction
 from rest_framework import serializers
 
@@ -23,7 +25,7 @@ from chat.services import (
     subscribe_to_conversation,
 )
 from user import privacy
-from user.blocks import has_blocked
+from user.blocks import blocks_email, has_blocked
 from user.lookups import find_user
 from user.models import phone_number_validator
 from user.serializers import PublicUserSerializer
@@ -477,6 +479,20 @@ class MessageReactionSerializer(serializers.Serializer):
     emoji = serializers.ChoiceField(choices=[(e, e) for e in REACTION_EMOJI])
 
 
+def _reachable(participant, channel):
+    """Whether this member has anywhere to receive `channel` at all.
+
+    Only a member without an account is ruled out: they were added at one
+    number or one address, and that is all there is. An account holder is left
+    to their own answer, which they gave in settings.
+    """
+    if participant.is_phone_only:
+        return channel != ChannelConsent.Channel.EMAIL
+    if participant.is_email_only:
+        return channel == ChannelConsent.Channel.EMAIL
+    return True
+
+
 class ParticipantSerializer(serializers.ModelSerializer):
     # Null for a member who has no account. `display_label` is the field a
     # client should render: it works for both kinds and needs no branching.
@@ -484,6 +500,7 @@ class ParticipantSerializer(serializers.ModelSerializer):
     display_label = serializers.CharField(read_only=True)
     is_phone_only = serializers.BooleanField(read_only=True)
     email_enabled = serializers.SerializerMethodField()
+    channels = serializers.SerializerMethodField()
 
     class Meta:
         model = Participant
@@ -497,6 +514,12 @@ class ParticipantSerializer(serializers.ModelSerializer):
             'muted',
             'sms_enabled',
             'email_enabled',
+            # The full per-channel consent record. `sms_enabled` and
+            # `email_enabled` above are the two booleans a toggle needs;
+            # this is what actually happened, which is a different question
+            # - "off" and "never answered" look identical as a boolean and
+            # are very different things to show an admin.
+            'channels',
             # How far this member has read, so a client can show a sender
             # whether their message has been seen. Null for anybody who has
             # read nothing - and permanently null for a phone-only member,
@@ -522,6 +545,51 @@ class ParticipantSerializer(serializers.ModelSerializer):
 
         consent = consent_for(obj, ChannelConsent.Channel.EMAIL)
         return bool(consent and consent.allows_delivery)
+
+    def get_channels(self, obj):
+        """Where this member stands on every channel, keyed by channel.
+
+        Built by walking ChannelConsent.Channel rather than naming sms and
+        email, so a channel added to the enum appears here without anyone
+        remembering to widen this method.
+
+        A channel the member was never asked about reports status None rather
+        than being omitted: "we have not asked" is a real state an admin screen
+        needs to distinguish from "they said no", and a missing key reads as
+        neither.
+
+        So does a channel a member without an account cannot be reached on,
+        whatever its row says. Every such member is seeded a PENDING row per
+        channel, and the 0028 backfill copied their invitation date onto all of
+        them - which had somebody added by phone reading "Email pending" for an
+        address that does not exist.
+
+        Reads the prefetch - see the queryset in ConversationViewSet.participants,
+        without which this is one query per channel per member.
+        """
+        from chat.delivery import consent_for
+
+        record = {}
+        for channel, _label in ChannelConsent.Channel.choices:
+            consent = (
+                consent_for(obj, channel) if _reachable(obj, channel) else None
+            )
+            record[channel] = {
+                'status': consent.status if consent else None,
+                # The decision the fan-out actually makes, so a client does not
+                # have to re-derive it from status and get it subtly wrong.
+                'allows_delivery': bool(consent and consent.allows_delivery),
+                'asked_at': consent.asked_at if consent else None,
+                'consented_at': consent.consented_at if consent else None,
+                'opted_out_at': consent.opted_out_at if consent else None,
+                # Whether to offer a nudge here at all, for the same reason.
+                # The once-a-day floor is left to the endpoint: its refusal
+                # says how long to wait, which a missing entry could not.
+                'can_nudge': membership.standing_nudge_refusal(
+                    obj, channel, consent
+                ) is None,
+            }
+        return record
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -642,6 +710,12 @@ class ConversationSerializer(serializers.ModelSerializer):
     settings = serializers.SerializerMethodField()
     created_by = serializers.SerializerMethodField()
     is_admin = serializers.SerializerMethodField()
+    # What the viewer may do IN THIS conversation, for driving the UI. Inline
+    # rather than a second endpoint: the list already carries everything else
+    # a client needs, and a round trip per group would cost more than the
+    # boolean it replaces. `is_admin` stays beside it until the last client
+    # call site has moved - see docs/rbac_plan.md step 6.
+    features = serializers.SerializerMethodField()
     admin_details = serializers.SerializerMethodField()
     # The number members text to reach this group. Read-only everywhere and
     # for everybody: it is fixed for the life of the group, so there is no
@@ -675,6 +749,7 @@ class ConversationSerializer(serializers.ModelSerializer):
             'settings',
             'created_by',
             'is_admin',
+            'features',
             'admin_details',
             'sms_number',
             'last_message',
@@ -731,16 +806,32 @@ class ConversationSerializer(serializers.ModelSerializer):
 
         Read off the prefetched newest message rather than counting, so this
         costs nothing on a list of any length.
+
+        Two markers, because one cannot answer both cases. The message id
+        settles it whenever the conversation has messages. `cleared_at` exists
+        for the conversation that had NONE when it was cleared: there was
+        nothing to point at, so the id is still null and only the timestamp
+        says the member ever cleared it.
         """
         participant = self._own_participation(obj)
-        if participant is None or participant.cleared_before_message_id is None:
+        if participant is None:
+            return False
+
+        cleared_before = participant.cleared_before_message_id
+        cleared_at = participant.cleared_at
+        if cleared_before is None and cleared_at is None:
             return False
 
         latest = getattr(obj, 'latest_messages', None)
-        newest_id = latest[0].pk if latest else None
-        if newest_id is None:
+        newest = latest[0] if latest else obj.messages.first()
+        if newest is None:
+            # Nothing in here at all: cleared exactly when they said so.
+            return cleared_at is not None
+
+        if cleared_before is not None and newest.pk <= cleared_before:
             return True
-        return newest_id <= participant.cleared_before_message_id
+        # Cleared while empty, and still nothing since.
+        return cleared_at is not None and newest.created_at <= cleared_at
 
     def get_unread_count(self, obj):
         """Messages past the caller's read pointer, not counting their own.
@@ -820,10 +911,14 @@ class ConversationSerializer(serializers.ModelSerializer):
 
         viewer = self._viewer()
         for participant in obj.participants.all():
-            # A direct conversation cannot contain a phone-only member today,
-            # but titling one after a member with no account would crash on
-            # `.user.profile` rather than degrade, so it is skipped explicitly.
             if participant.user_id is None:
+                # An EXTERNAL thread is titled after exactly this row - the
+                # address on the far side - and `display_label` already falls
+                # back to the local part for it. A phone-only row is still
+                # skipped: it cannot occur in a one-to-one, and titling one
+                # after it would be a guess.
+                if obj.is_external_direct and participant.email:
+                    return participant.display_label
                 continue
             if viewer is None or participant.user_id != viewer.pk:
                 return participant.display_label
@@ -876,6 +971,46 @@ class ConversationSerializer(serializers.ModelSerializer):
     def get_created_by(self, obj):
         """Whoever started this conversation."""
         return self._person(obj.created_by)
+
+    def get_features(self, obj):
+        """The viewer's feature keys for this conversation.
+
+        Not access control - that is `get_queryset`, which is why an outsider
+        never reaches this method at all. This says what to SHOW someone who is
+        already in the room, and every write is re-checked server-side.
+
+        The role comes from the SAME prefetched rows `get_is_admin` walks, and
+        is handed to the resolver rather than looked up: this runs once per
+        conversation on a page that lists twenty, and
+        `test_the_new_fields_do_not_cost_a_query_per_conversation` is what
+        holds the line.
+        """
+        from rbac.resolver import features_for_roles
+
+        viewer = self._viewer()
+        if viewer is None or not getattr(viewer, 'is_authenticated', False):
+            return []
+
+        roles = {
+            row.role for row in obj.participants.all()
+            if row.user_id == viewer.pk
+        }
+        keys = features_for_roles(roles, obj, 'conversation', user=viewer)
+
+        # A one-to-one has no admins, so pinning there is a MEMBERSHIP question
+        # rather than a role one - `Conversation.may_pin` answers it with an
+        # early return before any role is consulted, and rbac/policy.py may
+        # only narrow a grant, never widen one.
+        #
+        # This field has to say what the person can actually DO, or a client
+        # reading it would hide the pin control on every direct message. The
+        # special case lives here, next to the one place it is true, rather
+        # than being smuggled into the role grants - where it would make the
+        # permissions matrix claim members can pin, false in every group.
+        if obj.kind == Conversation.Kind.DIRECT and roles:
+            keys = keys | {'group.message.pin'}
+
+        return sorted(keys)
 
     def get_is_admin(self, obj):
         """Whether the person asking administers this group.
@@ -985,7 +1120,9 @@ class DirectConversationSerializer(serializers.Serializer):
     """Start (or find) a one-to-one conversation with somebody."""
 
     identifier = serializers.CharField(
-        help_text='A username, or a phone number in +E.164 form.'
+        help_text=(
+            'A username, a phone number in +E.164 form, or an email address.'
+        )
     )
 
     #: What the blocker is told. Only ever shown to the person who made the
@@ -994,6 +1131,10 @@ class DirectConversationSerializer(serializers.Serializer):
 
     #: What everybody else is told, blocked or simply mistyped.
     NOT_FOUND = 'No user found with that username or number.'
+
+    #: Set by `validate_identifier` when the identifier is an address nobody
+    #: has. `create` reads it to open an external thread rather than refusing.
+    external_address = None
 
     #: What somebody is told when the other person's Privacy settings refuse.
     #: Plain, unlike the block wording above: a privacy setting is not a secret.
@@ -1033,10 +1174,53 @@ class DirectConversationSerializer(serializers.Serializer):
         if candidate is not None and has_blocked(viewer, candidate):
             raise serializers.ValidationError(self.BLOCKED_BY_ME)
 
+        # Nobody has it - and if it is an address, that is not a dead end any
+        # more. AFTER the two branches above, deliberately: an address whose
+        # owner hid it in Settings → Privacy, or who is on the far side of a
+        # block, is answered by them and never reaches here, so this cannot
+        # become the account lookup `user/invites.py` exists to refuse.
+        #
+        # `find_user` treats '@' as a TRY and falls through to the username
+        # branch, because Django allows '@' in a username - so a real address
+        # is the thing that is left once BOTH have missed, and it still has to
+        # validate. Without that check a mistyped username containing '@'
+        # would open a bridge to a mailbox nobody owns.
+        address = value.strip().lower()
+        if '@' in address:
+            try:
+                validate_email_address(address)
+            except DjangoValidationError:
+                raise serializers.ValidationError(self.NOT_FOUND)
+            if address == (viewer.email or '').strip().lower():
+                raise serializers.ValidationError(self.NOT_FOUND)
+            if blocks_email(viewer, address):
+                raise serializers.ValidationError(self.BLOCKED_BY_ME)
+            self.external_address = address
+            return value
+
         raise serializers.ValidationError(self.NOT_FOUND)
 
     def create(self, validated_data):
         starter = self.context['request'].user
+
+        address = getattr(self, 'external_address', None)
+        if address is not None:
+            from user.invites import TooManyInvites, consume_invite_allowance
+
+            # The same bucket `user/invites.py` counts against, not a second
+            # one beside it: two doors onto one cap, or the real limit is
+            # double what either says. Counted as an ATTEMPT, so a probe costs
+            # the prober the same whether or not anything is sent.
+            if not consume_invite_allowance(starter):
+                raise TooManyInvites
+
+            conversation, created = Conversation.start_direct_external(
+                starter, address
+            )
+            if created:
+                subscribe_to_conversation(conversation, [starter])
+            return conversation
+
         conversation, created = Conversation.start_direct(starter, self.other)
         if created:
             announce_added_to_conversation(conversation, [self.other])
@@ -1289,9 +1473,28 @@ class GroupSettingsSerializer(serializers.ModelSerializer):
 
 
 class AddMembersSerializer(serializers.Serializer):
-    """Add people to a group by username or phone number."""
+    """Add people to a group by username or phone number, or invite by email.
 
-    members = serializers.ListField(child=serializers.CharField(), allow_empty=False)
+    `invite_email` is for addresses with no account behind them, and goes
+    through `membership.invite_by_email` exactly as it does when a group is
+    created: a row against the address, and an invitation that asks them to
+    reply YES or sign up. An address that turns out to be an account's is
+    added outright, and one whose owner hid it is silently skipped - see there.
+    """
+
+    members = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
+    # Capped, because every entry is an email to a stranger.
+    invite_email = serializers.ListField(
+        child=serializers.EmailField(), required=False, default=list,
+        max_length=20,
+    )
+
+    def validate(self, attrs):
+        if not attrs.get('members') and not attrs.get('invite_email'):
+            raise serializers.ValidationError('Name at least one person to add.')
+        return attrs
 
     def validate_members(self, values):
         # `exclude=None`, so `find_user` does NOT drop a blocked pair here.
@@ -1337,6 +1540,10 @@ class AddMembersSerializer(serializers.Serializer):
         """
         conversation = self.context['conversation']
         users = self.validated_data['members']
+        addresses = sorted({
+            address.strip().lower()
+            for address in self.validated_data['invite_email']
+        })
 
         # add_participant is idempotent, so re-adding an existing member is
         # a no-op rather than an error - but they should not be told they
@@ -1344,13 +1551,30 @@ class AddMembersSerializer(serializers.Serializer):
         added = [
             user for user in users if not conversation.has_participant(user)
         ]
+        # Re-inviting an address already in the group re-sends its invitation
+        # and adds nobody, so it does not count against the plan.
+        already_invited = set(
+            Participant.objects.filter(
+                conversation=conversation,
+                email__in=addresses,
+                status=Participant.Status.ACTIVE,
+            ).values_list('email', flat=True)
+        )
+        new_invites = [a for a in addresses if a not in already_invited]
 
-        if added:
+        if added or new_invites:
             from billing.limits import check_can_add_members
-            check_can_add_members(conversation, len(added))
+            check_can_add_members(conversation, len(added) + len(new_invites))
 
         for user in added:
             conversation.add_participant(user)
+
+        # Inside the same transaction, so a refused address undoes the whole
+        # add rather than leaving half of it done - the rule above. The emails
+        # themselves go out on commit, so a rollback sends none of them.
+        adder = getattr(self.context.get('request'), 'user', None)
+        for address in addresses:
+            membership.invite_by_email(conversation, address, adder)
 
         if added:
             announce_added_to_conversation(conversation, added)
@@ -1394,6 +1618,140 @@ def resolve_members(identifiers, exclude=None):
             f'No user found for: {", ".join(unknown)}.'
         )
     return users
+
+
+# How many people the add-members search shows at once. Enough to pick from
+# after a couple of letters; past that the answer is to keep typing, not to
+# scroll a directory inside a dialog.
+MEMBER_SEARCH_LIMIT = 5
+
+
+def member_candidates(conversation, term, adder, context=None):
+    """People `adder` could add to `conversation`, from what they typed.
+
+    Returns (results, has_more, invite). Each result is the person as anybody may see
+    them - name, handle, picture - with what adding them would do:
+
+        ready           the add would go through
+        already_member  in this Loop already, and re-adding is a no-op
+        refused         the add would be refused, and `detail` says why
+
+    Found the ways the rest of the product finds people, and no further:
+
+        a username      by prefix, as `search_users` does
+        an email        exact and verified only, as `find_user` does. A
+                        prefix over addresses would let anybody walk the
+                        directory a letter at a time, so a half-typed address
+                        finds nobody.
+        a number        exact and verified only, as `search_users` does
+
+    Both obey Settings > Privacy and leave out either side of a block, so
+    nobody can be found here who could not already be found by the search box,
+    or added by typing their username, address or number.
+
+    Every check the add endpoint makes is made here, in the same order, so a
+    "ready" is not contradicted a moment later by the add.
+
+    `invite` is set when a whole address found nobody: the address, offered for
+    an email invitation, with the same status and detail a person gets.
+    """
+    from user.lookups import search_users
+
+    term = (term or '').strip()
+    invite = None
+    if '@' in term:
+        user = find_user(term, exclude=adder)
+        if user is None and _is_own_address(adder, term):
+            # Their own address. Already here - not somebody to invite.
+            user = adder
+        users, has_more = ([user] if user else []), False
+        if user is None:
+            invite = _email_invite_offer(conversation, term)
+    else:
+        found = list(search_users(term, exclude=adder)[:MEMBER_SEARCH_LIMIT + 1])
+        users = found[:MEMBER_SEARCH_LIMIT]
+        has_more = len(found) > MEMBER_SEARCH_LIMIT
+
+    # One query for where every candidate stands in this Loop, rather than one
+    # each - the page is small, but it is re-asked on every pause in typing.
+    # From the table, not `conversation.participants`: the viewset prefetches
+    # that as ACTIVE rows only, and a filter on it inherits the prefetch, so a
+    # blocked row would never be seen.
+    standing = dict(
+        Participant.objects.filter(
+            conversation=conversation, user__in=users
+        ).values_list('user_id', 'status')
+    )
+
+    results = []
+    for user in users:
+        status, detail = _candidate_status(user, standing.get(user.pk), adder)
+        results.append({
+            'user': PublicUserSerializer(user, context=context or {}).data,
+            'status': status,
+            'detail': detail,
+        })
+    return results, has_more, invite
+
+
+def _is_own_address(adder, term):
+    address = (getattr(adder, 'email', '') or '').strip().lower()
+    return bool(address) and address == term.strip().lower()
+
+
+def _email_invite_offer(conversation, term):
+    """An address nobody could be found at, as something to invite, or None.
+
+    Offered for an address that belongs to a hidden account too, and that is
+    deliberate: saying otherwise would say an account is there. Inviting one
+    does nothing - `invite_by_email` adds nobody and emails nobody - which is
+    the same answer the rest of the product gives.
+    """
+    from django.core.exceptions import ValidationError as DjangoValidationError
+    from django.core.validators import validate_email
+
+    address = term.strip().lower()
+    try:
+        validate_email(address)
+    except DjangoValidationError:
+        return None
+
+    row = Participant.objects.filter(
+        conversation=conversation, email__iexact=address, user__isnull=True
+    ).first()
+    status, detail = 'ready', ''
+    if row is not None and row.status == Participant.Status.ACTIVE:
+        status, detail = 'already_member', 'Already invited to this Loop.'
+    elif row is not None and row.status == Participant.Status.BLOCKED:
+        status, detail = 'refused', 'Blocked from this Loop.'
+    return {'email': address, 'status': status, 'detail': detail}
+
+
+def _candidate_status(user, standing, adder):
+    """What adding `user` would do, as (status, detail).
+
+    `standing` is their Participant status in this Loop, or None.
+    """
+    if standing == Participant.Status.ACTIVE:
+        return 'already_member', 'Already in this Loop.'
+
+    # `add_participant` refuses this row whatever anybody else allows. The
+    # admin looking is the kind of person who put it there, so saying so
+    # reveals nothing to them.
+    if standing == Participant.Status.BLOCKED:
+        return 'refused', 'Blocked from this Loop.'
+
+    try:
+        membership._refuse_blocked_invite(adder, user)
+    except membership.JoinRefused as refusal:
+        # The add endpoint's own generic wording, so nothing here tells a
+        # block apart from any other refusal.
+        return 'refused', str(refusal)
+
+    if not privacy.allows_group_add(user, adder):
+        return 'refused', privacy.group_add_refusal([user])
+
+    return 'ready', ''
 
 
 class JoinGroupSerializer(serializers.Serializer):
@@ -1465,6 +1823,20 @@ class ParticipantActionSerializer(serializers.Serializer):
 
 class JoinRequestDecisionSerializer(ParticipantActionSerializer):
     decision = serializers.ChoiceField(choices=['approve', 'decline'])
+
+
+class NudgeMemberSerializer(ParticipantActionSerializer):
+    """Ask one member again about one channel.
+
+    The channel is explicit rather than assumed to be SMS: the same member can
+    be pending on email too, and which one an admin meant is not for the server
+    to guess.
+    """
+
+    channel = serializers.ChoiceField(
+        choices=ChannelConsent.Channel.choices,
+        default=ChannelConsent.Channel.SMS,
+    )
 
 
 class RemoveMemberSerializer(ParticipantActionSerializer):

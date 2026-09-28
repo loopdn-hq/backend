@@ -55,6 +55,11 @@ class UserBlock(models.Model):
         validators=[phone_number_validator],
     )
 
+    # The third shape a person can have here, for the same reason the second
+    # one exists: most people an email conversation reaches have no account, so
+    # a block keyed only on accounts and numbers could not name them at all.
+    blocked_email = models.EmailField(max_length=254, null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -72,14 +77,25 @@ class UserBlock(models.Model):
                 condition=models.Q(blocked_phone_number__isnull=False),
                 name='unique_phone_block',
             ),
-            # Exactly one target, never both and never neither. Both set is the
-            # dangerous state: the rule would have two answers for one row.
+            models.UniqueConstraint(
+                fields=['blocker', 'blocked_email'],
+                condition=models.Q(blocked_email__isnull=False),
+                name='unique_email_block',
+            ),
+            # Exactly one target, never two and never none. More than one set
+            # is the dangerous state: the rule would have two answers for one
+            # row. Three shapes now, and the reasoning is unchanged.
             models.CheckConstraint(
                 condition=(
                     models.Q(blocked_user__isnull=False,
-                             blocked_phone_number__isnull=True)
+                             blocked_phone_number__isnull=True,
+                             blocked_email__isnull=True)
                     | models.Q(blocked_user__isnull=True,
-                               blocked_phone_number__isnull=False)
+                               blocked_phone_number__isnull=False,
+                               blocked_email__isnull=True)
+                    | models.Q(blocked_user__isnull=True,
+                               blocked_phone_number__isnull=True,
+                               blocked_email__isnull=False)
                 ),
                 name='block_identifies_someone',
             ),
@@ -94,8 +110,11 @@ class UserBlock(models.Model):
             # "did they block me", and the symmetric read asks both every time.
             models.Index(fields=['blocked_user']),
             models.Index(fields=['blocked_phone_number']),
+            models.Index(fields=['blocked_email']),
         ]
 
     def __str__(self):
-        target = self.blocked_user or self.blocked_phone_number
+        target = (
+            self.blocked_user or self.blocked_phone_number or self.blocked_email
+        )
         return f'{self.blocker} blocked {target}'

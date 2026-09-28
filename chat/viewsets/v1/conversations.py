@@ -86,7 +86,9 @@ from chat.serializers import (
     ParticipantRoleSerializer,
     RenameMemberSerializer,
     ParticipantSerializer,
+    NudgeMemberSerializer,
     RemoveMemberSerializer,
+    member_candidates,
 )
 from chat.services import broadcast_conversation_updated, broadcast_message_updated
 
@@ -125,6 +127,7 @@ class ConversationViewSet(
         'join': JoinGroupSerializer,
         'requests': JoinRequestDecisionSerializer,
         'remove': RemoveMemberSerializer,
+        'nudge': NudgeMemberSerializer,
         'delivery': DeliveryPreferenceSerializer,
         'read': MarkReadSerializer,
         'archive': ArchiveSerializer,
@@ -150,6 +153,8 @@ class ConversationViewSet(
         'requests:GET': 'Pending requests fetched.',
         'requests:POST': 'Request handled.',
         'remove': 'Member removed.',
+        'search_members': 'Search complete.',
+        'nudge': 'Reminder sent.',
         'delivery': 'Delivery settings saved.',
         'read': 'Marked as read.',
         'archive': 'Conversation updated.',
@@ -426,6 +431,10 @@ class ConversationViewSet(
             # their read receipts may be shown, and without this that is a
             # query per row.
             .select_related('user__profile', 'user__privacy_settings')
+            # Consent is read per channel for every row - `email_enabled` and
+            # `channels` both walk it. Without this that is a query per member,
+            # and it was one before `channels` existed.
+            .prefetch_related('channel_consents')
             .order_by('joined_at', 'pk')
         )
 
@@ -549,6 +558,60 @@ class ConversationViewSet(
         )
         participant = decide(serializer.participant, request.user)
         return Response(ParticipantSerializer(participant).data)
+
+    @action(
+        detail=True, methods=['get'], url_path='members/search',
+        url_name='search-members',
+    )
+    def search_members(self, request, pk=None):
+        """Find people to add, and say what adding each one would do.
+
+        READ-ONLY, and for whoever may add people - the same standing the add
+        needs, since this is its first half. `member_candidates` has the rules:
+        username by prefix, email and number exact, at most a handful at once.
+        """
+        conversation = self.get_object()
+        if not conversation.may_add_members(request.user):
+            raise PermissionDenied('You cannot add people to this group.')
+
+        results, has_more, invite = member_candidates(
+            conversation,
+            request.query_params.get('q'),
+            request.user,
+            context=self.get_serializer_context(),
+        )
+        return Response(
+            {'results': results, 'has_more': has_more, 'invite': invite}
+        )
+
+    @action(detail=True, methods=['post'])
+    def nudge(self, request, pk=None):
+        """Ask a member again about an invitation they never answered.
+
+        ADMIN-TRIGGERED, never automatic, and at most once a day per channel.
+        A nudge is a message to somebody who has not consented, which is the
+        traffic carriers police hardest - so a person decides to send each one,
+        and `membership.nudge` refuses anybody who has already answered.
+        """
+        conversation = self.get_object()
+        serializer = self.get_serializer(
+            data=request.data,
+            context={**self.get_serializer_context(), 'conversation': conversation},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        membership.nudge(
+            serializer.participant,
+            serializer.validated_data['channel'],
+            request.user,
+        )
+        # The participant, so a client can re-render the row it just acted on
+        # with its new `reminded_at` and the refusal that now applies.
+        return Response(
+            ParticipantSerializer(
+                serializer.participant, context=self.get_serializer_context()
+            ).data
+        )
 
     @action(detail=True, methods=['post'])
     def remove(self, request, pk=None):

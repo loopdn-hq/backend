@@ -1,0 +1,30 @@
+{% extends "email/base.html" %}
+
+{% block title %}{{ sender_name }} messaged you on {{ product_name }}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 8px; color:#52525b; font-size:14px;">
+  <strong>{{ sender_name }}</strong> sent you this on {{ product_name }}:
+</p>
+<p style="margin:0 0 24px; padding:12px 16px; background-color:#f4f4f5; border-radius:8px;">
+  {{ body }}
+</p>
+<p style="margin:0 0 8px;">
+  Would you like to carry on this conversation by email?
+</p>
+<p style="margin:0 0 24px; font-size:14px; color:#52525b;">
+  Reply with just the word <strong>YES</strong> to receive and reply to
+  messages from {{ sender_name }}, or <strong>NO</strong> to stop.
+  Wait for our confirmation before writing anything else.
+</p>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  You do not need an account &mdash; replying to these emails is enough.
+</p>
+{% endblock %}
+
+{% block footer %}
+You are getting this because {{ sender_name }} messaged this address on
+{{ product_name }}. Reply <strong>NO</strong>{% if unsubscribe_url %} or use
+<a href="{{ unsubscribe_url }}">this link</a>{% endif %} and we will not email
+you about this conversation again.
+{% endblock %}

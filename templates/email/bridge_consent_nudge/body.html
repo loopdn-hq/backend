@@ -1,0 +1,26 @@
+{% extends "email/base.html" %}
+
+{% block title %}Reply YES or NO{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;">
+  We didn&rsquo;t catch that.
+</p>
+<p style="margin:0 0 24px;">
+  {% if group_name %}Reply with just the word <strong>YES</strong> to get
+  {{ group_name }}&rsquo;s messages by email, or <strong>NO</strong> to
+  stop.{% else %}Reply with just the word <strong>YES</strong> to carry on your
+  conversation with {{ sender_name }} by email, or <strong>NO</strong> to
+  stop.{% endif %}
+</p>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  Anything else will not reach {% if group_name %}the group{% else %}{{ sender_name }}{% endif %}
+  until you have answered. This is the only reminder we will send.
+</p>
+{% endblock %}
+
+{% block footer %}
+Reply <strong>NO</strong>{% if unsubscribe_url %} or use
+<a href="{{ unsubscribe_url }}">this link</a>{% endif %} and we will not email
+you about {% if group_name %}{{ group_name }}{% else %}this conversation{% endif %} again.
+{% endblock %}

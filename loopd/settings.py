@@ -129,7 +129,29 @@ CORS_ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
+# The desktop app's own page origin.
+#
+# A Tauri webview reports tauri://localhost on macOS and Linux, and
+# http://tauri.localhost on Windows - different origins to a browser, so both
+# are listed. Kept separate from the deployed frontend origins because this
+# list is reused below for payment redirects, where the desktop origin must
+# NOT appear: see BILLING_ALLOWED_REDIRECT_ORIGINS.
+DESKTOP_ORIGINS = ['tauri://localhost', 'http://tauri.localhost']
+
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '310157572832-e20tuelb23m2jbrier48hvg49i9kvg5t.apps.googleusercontent.com')
+
+# Every Google OAuth client whose ID tokens this API accepts.
+#
+# The web app signs in through a Web client; the desktop app cannot use that
+# flow (Google Identity Services validates window.location.origin, and
+# tauri://localhost cannot be registered) so it uses a Desktop client, whose
+# tokens carry a DIFFERENT `aud`. Verification compares `aud` against a single
+# value at a time, so the serializer tries each of these in turn.
+GOOGLE_CLIENT_IDS = [
+    client_id.strip()
+    for client_id in os.environ.get('GOOGLE_CLIENT_IDS', GOOGLE_CLIENT_ID).split(',')
+    if client_id.strip()
+]
 
 
 # Application definition
@@ -170,6 +192,9 @@ INSTALLED_APPS = [
     # Custom-priced plans sold through the Plan Builder - a dynamic,
     # catalog-driven configuration rather than billing's single plan code.
     'enterprise',
+    # Account roles and the feature matrix. Schema only for now - nothing
+    # reads these tables yet; see docs/rbac_plan.md for the build order.
+    'rbac',
     # Voice and video calls. Django authorises and records; LiveKit carries the
     # media - see calls/livekit.py.
     'calls',
@@ -384,6 +409,15 @@ RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 # inside a request the user is waiting on.
 EMAIL_REQUEST_TIMEOUT = 10
 
+# How long before a consent request to an address that never answered may be
+# sent a second time. A first attempt can bounce or be eaten by a spam filter,
+# so one retry is recoverable; anything shorter is pestering somebody who has
+# not agreed to hear from us at all. Never applies after DECLINED or OPTED_OUT,
+# which are answers and are final.
+MAIL_CONSENT_RESEND_HOURS = int(
+    os.environ.get('MAIL_CONSENT_RESEND_HOURS', '24')
+)
+
 # Available to every email template without the caller passing them.
 EMAIL_PRODUCT_NAME = os.environ.get('EMAIL_PRODUCT_NAME', 'Loopd')
 EMAIL_SUPPORT_ADDRESS = os.environ.get('EMAIL_SUPPORT_ADDRESS', DEFAULT_FROM_EMAIL)
@@ -517,7 +551,17 @@ FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://loopdn.com').rstrip('/')
 # "you just paid, now here is a look-alike login page"). CORS_ALLOWED_ORIGINS
 # is already the list of frontends this API trusts, so it doubles as the
 # redirect allowlist rather than inventing a second one to keep in sync.
-BILLING_ALLOWED_REDIRECT_ORIGINS = set(CORS_ALLOWED_ORIGINS) | {FRONTEND_URL}
+#
+# With one exception. Adding the desktop origins to CORS_ALLOWED_ORIGINS -
+# which they must be, or neither REST nor the chat socket works from the
+# desktop app - would silently make tauri://localhost a valid Stripe
+# success_url. It is not attacker-reachable, but it does not belong on a list
+# whose whole purpose is refusing redirect targets, and it is not needed: the
+# desktop build sends the public web origin for checkout, exactly because
+# Stripe rejects a custom scheme anyway.
+BILLING_ALLOWED_REDIRECT_ORIGINS = (
+    set(CORS_ALLOWED_ORIGINS) - set(DESKTOP_ORIGINS)
+) | {FRONTEND_URL}
 
 # How long a password-reset link stays valid. This is a real Django setting -
 # django.contrib.auth.tokens.default_token_generator reads it directly, so
@@ -955,10 +999,22 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'sms.requeue_stalled_deliveries',
         'schedule': 600.0,
     },
-    'sms-provision-missing-numbers': {
-        'task': 'sms.provision_missing_numbers',
-        'schedule': 900.0,
-    },
+    # OFF (2026-09-25, Yul's call). This sweep buys a real number, from a real
+    # provider, for every group that has not got one - and a laptop running the
+    # staging env file has live Telnyx credentials, so starting the stack bought
+    # twenty numbers for twenty old test groups in three minutes.
+    #
+    # The task itself stays in sms/tasks.py and can be run by hand when a group
+    # genuinely needs a number the provider failed to sell at creation time.
+    # What is switched off is the part that spends money unattended.
+    #
+    # NOTE: the scheduler is DatabaseScheduler, so removing this entry does NOT
+    # remove the PeriodicTask row it already created. That row has to be
+    # disabled in each database as well - local, staging, prod.
+    # 'sms-provision-missing-numbers': {
+    #     'task': 'sms.provision_missing_numbers',
+    #     'schedule': 900.0,
+    # },
     # After the retry sweep, so nothing is announced that a retry was about to
     # fix - see sms/maintenance.py:announce_failed_deliveries.
     'sms-announce-failed-deliveries': {

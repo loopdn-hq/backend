@@ -59,6 +59,10 @@ urlpatterns = [
     path('api/v1/billing/', include('billing.urls')),
     path('api/v1/enterprise/', include('enterprise.urls')),
 
+    # Granting and revoking account roles, and the log of who did. Account
+    # admins only - the gate is in the viewset, because there is no subset of
+    # this resource that belongs to anybody else to narrow the queryset to.
+    path('api/v1/rbac/', include('rbac.urls')),
     # /api/v1/calls/ and /api/v1/recordings/ - two sibling resources, so the app
     # is mounted at the version root. Its LiveKit webhook is under calls/ and is
     # authenticated by signature, like the Stripe and Telnyx ones.

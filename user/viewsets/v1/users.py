@@ -141,6 +141,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         'change_password': 'Password changed.',
         'me:GET': 'Account fetched.',
         'me:PATCH': 'Account updated.',
+        'me_features': 'Features fetched.',
         'profile:GET': 'Profile fetched.',
         'profile:PATCH': 'Profile updated.',
         'retrieve': 'User fetched.',
@@ -407,6 +408,26 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         """Read or update the signed-in account."""
         return self._retrieve_or_update(request, request.user)
 
+    @action(detail=False, methods=['get'], url_path='me/features',
+            url_name='me-features')
+    def me_features(self, request):
+        """What this account may reach, for driving menus.
+
+        Account-axis features only. Per-conversation features ride inline on
+        the conversation serializer instead - that list already carries
+        everything else a client needs, and a second round trip per group would
+        cost more than the boolean it replaces.
+
+        THIS IS NOT ACCESS CONTROL. It says what to SHOW. Every write is
+        re-checked on the server regardless, and the queryset is still what
+        decides whether an object is reachable at all - see rbac/resolver.py.
+        A client that hides a button it should not have is polite; a server
+        that trusts the client is broken.
+        """
+        from rbac.resolver import features_for
+
+        return Response({'account': sorted(features_for(request.user))})
+
     @action(
         detail=False,
         methods=['get', 'patch'],
@@ -473,6 +494,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
             request.user,
             user=serializer.validated_data['target_user'],
             phone_number=serializer.validated_data['target_number'],
+            email=serializer.validated_data['target_email'],
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -487,6 +509,7 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
             request.user,
             user=serializer.validated_data['target_user'],
             phone_number=serializer.validated_data['target_number'],
+            email=serializer.validated_data['target_email'],
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
 

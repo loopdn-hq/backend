@@ -102,38 +102,38 @@ services:
       - loopd-net
     restart: unless-stopped
 
-  # celery:
-  #   <<: *django
-  #   container_name: loopd_celery
-  #   command: celery -A loopd worker --loglevel=info
-  #   # The tag only ever exists locally, so never try to pull it.
-  #   pull_policy: never
-  #   depends_on:
-  #     db:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #     # Also guarantees the image has been built.
-  #     web:
-  #       condition: service_started
+  celery:
+    <<: *django
+    container_name: loopd_celery
+    command: celery -A loopd worker --loglevel=info
+    # The tag only ever exists locally, so never try to pull it.
+    pull_policy: never
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Also guarantees the image has been built.
+      web:
+        condition: service_started
 
-  # celery_beat:
-  #   <<: *django
-  #   container_name: loopd_celery_beat
-  #   # DatabaseScheduler keeps schedules in Postgres and editable from the
-  #   # Django admin, so changing one does not need a deploy.
-  #   command: >
-  #     celery -A loopd beat --loglevel=info
-  #     --scheduler django_celery_beat.schedulers:DatabaseScheduler
-  #   pull_policy: never
-  #   depends_on:
-  #     db:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #     # Beat only writes schedule rows; it relies on web having migrated.
-  #     web:
-  #       condition: service_started
+  celery_beat:
+    <<: *django
+    container_name: loopd_celery_beat
+    # DatabaseScheduler keeps schedules in Postgres and editable from the
+    # Django admin, so changing one does not need a deploy.
+    command: >
+      celery -A loopd beat --loglevel=info
+      --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    pull_policy: never
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Beat only writes schedule rows; it relies on web having migrated.
+      web:
+        condition: service_started
 
 networks:
   loopd-net:

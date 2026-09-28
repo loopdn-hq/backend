@@ -905,6 +905,26 @@ class PlanCheckoutSecurityTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('success_url', response.json()['data'])
 
+    @override_settings(
+        CORS_ALLOWED_ORIGINS=['https://loopdn.com', 'tauri://localhost'],
+        FRONTEND_URL='https://loopdn.com',
+        DESKTOP_ORIGINS=['tauri://localhost', 'http://tauri.localhost'],
+        BILLING_ALLOWED_REDIRECT_ORIGINS={'https://loopdn.com'},
+    )
+    def test_the_desktop_origin_is_not_a_valid_redirect_target(self):
+        """The desktop origin is a trusted CALLER, not a payment return target.
+
+        It has to be in CORS_ALLOWED_ORIGINS or neither REST nor the chat
+        socket works from the desktop app - and that list is reused to
+        validate Stripe redirects. Those two uses must not be conflated:
+        Stripe would reject a custom scheme anyway, and the desktop build
+        sends the public web origin for checkout precisely because of that.
+        """
+        payload = {**self.payload, 'success_url': 'tauri://localhost/billing/success'}
+        response = self.client.post(self.url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('success_url', response.json()['data'])
+
     def test_a_trusted_redirect_origin_passes_validation(self):
         # Mocks the whole checkout-session call, not just the low-level Stripe
         # request under it - get_or_create_stripe_customer would otherwise

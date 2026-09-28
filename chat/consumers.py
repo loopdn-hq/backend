@@ -217,11 +217,25 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         changes nothing about a conversation other people are also in.
         """
         from chat.models import Conversation, Participant
-        from user.blocks import blocks_between
-
+        from user.blocks import blocks_between, blocks_email
 
         if conversation.kind != Conversation.Kind.DIRECT:
             return False
+
+        # An external thread has one account in it, so there is no pair to
+        # compare - only whether that account blocked the address. Asked here
+        # as well as in `create_message` for the reason the whole method
+        # exists: the socket must refuse what the REST path refuses, or it is
+        # the door left open beside the one that was locked.
+        if conversation.is_external_direct:
+            address = (
+                Participant.objects.filter(
+                    conversation=conversation, user__isnull=True
+                )
+                .values_list('email', flat=True)
+                .first()
+            )
+            return bool(address) and blocks_email(self.user, address)
 
         other = (
             Participant.objects.filter(
@@ -239,6 +253,20 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
     async def message_new(self, event):
         await self.send_json({'type': 'message.new', 'message': event['message']})
+
+    async def conversation_consent(self, event):
+        """The far side of an external thread answered YES or NO.
+
+        Sent to the conversation group, which the sender's socket is already
+        in, so their composer unlocks or locks without a refresh. Nobody else
+        is in that group - an external thread has one account in it.
+        """
+        await self.send_json({
+            'type': 'conversation.consent',
+            'conversation_id': event['conversation_id'],
+            'participant_id': event['participant_id'],
+            'status': event['status'],
+        })
 
     async def message_updated(self, event):
         """A message already in the thread changed - edit, delete, reaction.

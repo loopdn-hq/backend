@@ -103,13 +103,56 @@ def record(event):
     return 0
 
 
+def _opt_out_account_less(rows, why):
+    """OPTED_OUT for every address-only recipient among these rows.
+
+    OPTED_OUT rather than DECLINED on purpose: a complaint or a hard bounce is
+    about this address everywhere, not about one conversation, and it is the
+    one state a later YES may never clear.
+    """
+    from chat.membership import set_channel_consent
+    from chat.models import ChannelConsent, Participant
+
+    participant_ids = {
+        row_id
+        for row_id in rows.values_list('participant_id', flat=True)
+        if row_id
+    }
+    if not participant_ids:
+        return
+
+    stopped = 0
+    for participant in Participant.objects.filter(
+        pk__in=participant_ids, user__isnull=True
+    ):
+        set_channel_consent(
+            participant,
+            ChannelConsent.Channel.EMAIL,
+            ChannelConsent.Status.OPTED_OUT,
+        )
+        stopped += 1
+
+    if stopped:
+        logger.warning(
+            'Opted %s address-only member(s) out of email: %s', stopped, why
+        )
+
+
 def _stop_mailing(rows, why, reason):
-    """Switch group email off for every account these rows were sent to.
+    """Switch email off for everybody these rows were sent to.
 
     With the record of when and why (`MessagingSettings.email_off`). Only rows
     still on are touched, so an account already off keeps the reason it was
     first turned off for.
+
+    A recipient with no account has no MessagingSettings to switch, so the
+    equivalent is written where their answer lives - `ChannelConsent`, as
+    OPTED_OUT. Without this a bounce or a spam complaint against an address-only
+    member changed nothing at all and the conversation kept emailing them,
+    which is precisely the event that gets a sending domain suppressed.
     """
+    _opt_out_account_less(rows, why)
+
     user_ids = {user_id for user_id in rows.values_list('user_id', flat=True) if user_id}
     if not user_ids:
         return

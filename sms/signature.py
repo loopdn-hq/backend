@@ -41,7 +41,11 @@ def verify(raw_body, timestamp, signature_b64):
     if not _timestamp_is_fresh(timestamp):
         return False
 
-    signed = timestamp.encode() + b'.' + (raw_body or b'')
+    # Telnyx signs `<timestamp>|<raw body>`. A PIPE, not a dot - signing with
+    # the wrong separator produces a signature that never verifies, so every
+    # inbound webhook is refused with 403 and the provider retries for ever.
+    # Confirmed against a live Telnyx-Signature-Ed25519 header, not the docs.
+    signed = timestamp.encode() + b'|' + (raw_body or b'')
     signature = _decode(signature_b64)
     if signature is None:
         return False

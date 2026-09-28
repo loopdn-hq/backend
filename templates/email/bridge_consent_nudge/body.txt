@@ -1,0 +1,13 @@
+{% autoescape off %}We didn't catch that.
+
+{% if group_name %}Reply with just the word YES to get {{ group_name }}'s messages by email,
+or NO to stop.{% else %}Reply with just the word YES to carry on your conversation with
+{{ sender_name }} by email, or NO to stop.{% endif %}
+
+Anything else will not reach {% if group_name %}the group{% else %}{{ sender_name }}{% endif %} until you have answered. This is
+the only reminder we will send.
+
+-- 
+Reply NO{% if unsubscribe_url %} or use this link: {{ unsubscribe_url }}{% endif %}
+and we will not email you about {% if group_name %}{{ group_name }}{% else %}this conversation{% endif %} again.
+{% endautoescape %}

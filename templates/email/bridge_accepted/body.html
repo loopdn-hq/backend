@@ -1,0 +1,30 @@
+{% extends "email/base.html" %}
+
+{% block title %}You&rsquo;re all set{% endblock %}
+
+{% block content %}
+{% if group_name %}
+<p style="margin:0 0 16px;">
+  You&rsquo;re in <strong>{{ group_name }}</strong>. Messages from the group
+  will arrive here, and replying to any of them posts to the group.
+</p>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  You still do not need an account. If you would rather use the app, sign up
+  on {{ product_name }} with this address.
+</p>
+{% else %}
+<p style="margin:0 0 16px;">
+  You&rsquo;re all set. Just reply to these emails to keep talking to
+  <strong>{{ sender_name }}</strong> &mdash; they will see your replies on
+  {{ product_name }}.
+</p>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  You still do not need an account. Everything happens here, in your inbox.
+</p>
+{% endif %}
+{% endblock %}
+
+{% block footer %}
+To stop these emails at any time, reply <strong>{{ stop_keyword }}</strong>{% if unsubscribe_url %}
+or use <a href="{{ unsubscribe_url }}">this link</a>{% endif %}.
+{% endblock %}

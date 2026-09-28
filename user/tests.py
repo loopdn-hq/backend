@@ -36,6 +36,8 @@ from user.models import (
     Profile,
     SecuritySettings,
 )
+from user import blocks
+from user.models import UserBlock
 from user.serializers import SETTINGS_SERIALIZERS
 from user.user_settings import SETTINGS_MODELS
 from utils.mail import EmailError
@@ -204,7 +206,7 @@ class RegisterTests(EnvelopeAssertions, APITestCase):
         )
 
 
-@override_settings(GOOGLE_CLIENT_ID='google-client-id')
+@override_settings(GOOGLE_CLIENT_IDS=['google-client-id'])
 class GoogleAuthTests(EnvelopeAssertions, APITestCase):
     def setUp(self):
         self.url = reverse('user:user-google')
@@ -216,6 +218,41 @@ class GoogleAuthTests(EnvelopeAssertions, APITestCase):
             'family_name': 'G',
             'name': 'Yul G',
         }
+
+    @override_settings(GOOGLE_CLIENT_IDS=['web-client-id', 'desktop-client-id'])
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_a_desktop_client_id_is_accepted(self, verify_token):
+        """The desktop app signs in with a different OAuth client.
+
+        Google Identity Services validates window.location.origin, and
+        tauri://localhost cannot be registered there - so the desktop build
+        uses a Desktop client, whose ID tokens carry a different `aud`.
+        Verification takes one audience at a time, so the first client ID
+        raises and the second must still be tried.
+        """
+        def verify(token, request, client_id):
+            if client_id != 'desktop-client-id':
+                raise ValueError('Token has wrong audience')
+            return self.claims
+
+        verify_token.side_effect = verify
+
+        data = self.assertSuccess(
+            self.client.post(self.url, {'credential': 'desktop-id-token'}),
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(data['user']['email'], 'yul@example.com')
+        self.assertEqual(verify_token.call_count, 2)
+
+    @override_settings(GOOGLE_CLIENT_IDS=['web-client-id', 'desktop-client-id'])
+    @patch('user.serializers.id_token.verify_oauth2_token')
+    def test_a_token_for_no_configured_client_is_rejected(self, verify_token):
+        """Trying several audiences must not become accepting any audience."""
+        verify_token.side_effect = ValueError('Token has wrong audience')
+
+        response = self.client.post(self.url, {'credential': 'someone-elses-token'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(verify_token.call_count, 2)
 
     @patch('user.serializers.id_token.verify_oauth2_token')
     def test_creates_an_account_and_returns_tokens(self, verify_token):
@@ -2729,3 +2766,133 @@ class PasswordResetTests(EnvelopeAssertions, APITestCase):
 
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password('an0ther-secret-pw'))
+
+
+@override_settings(REQUIRE_EMAIL_VERIFICATION=False)
+class EmailBlockTests(EnvelopeAssertions, APITestCase):
+    """Blocking a bare email address, which had no representation at all."""
+
+    def setUp(self):
+        cache.clear()
+        self.yul = User.objects.create_user('yul', 'yul@example.com', 'pw-123456789')
+        self.client.force_authenticate(self.yul)
+        self.address = 'stewart@gmail.com'
+
+    def add(self, **payload):
+        return self.client.post(reverse('user:user-me-block'), payload)
+
+    def remove(self, **payload):
+        return self.client.post(reverse('user:user-me-unblock'), payload)
+
+    def test_an_address_can_be_blocked_and_unblocked(self):
+        self.assertEqual(self.add(email=self.address).status_code, 204)
+        self.assertTrue(blocks.blocks_email(self.yul, self.address))
+
+        self.assertEqual(self.remove(email=self.address).status_code, 204)
+        self.assertFalse(blocks.blocks_email(self.yul, self.address))
+
+    def test_the_case_it_was_typed_in_does_not_matter(self):
+        self.add(email='Stewart@Gmail.com')
+
+        self.assertTrue(blocks.blocks_email(self.yul, self.address))
+
+    def test_blocking_it_twice_is_one_row(self):
+        self.add(email=self.address)
+        self.add(email=self.address)
+
+        self.assertEqual(
+            UserBlock.objects.filter(blocker=self.yul, blocked_email=self.address).count(),
+            1,
+        )
+
+    def test_naming_two_targets_is_refused(self):
+        self.assertFailure(self.add(email=self.address, username='somebody'))
+
+    def test_naming_none_is_refused(self):
+        self.assertFailure(self.add())
+
+    def test_blocking_your_own_address_is_refused(self):
+        self.assertFailure(self.add(email='yul@example.com'))
+
+    def test_something_that_is_not_an_address_is_refused(self):
+        self.assertFailure(self.add(email='not-an-address'))
+
+    def test_the_blocked_list_shows_it(self):
+        self.add(email=self.address)
+
+        rows = self.assertSuccess(self.client.get(reverse('user:user-me-blocks')))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['email'], self.address)
+        self.assertEqual(rows[0]['display_label'], self.address)
+
+    def test_it_is_one_directional(self):
+        """An address with no account has nobody who could have blocked back."""
+        self.add(email=self.address)
+        other = User.objects.create_user('ada', self.address, 'pw-123456789')
+
+        self.assertFalse(blocks.blocks_between(other, self.yul))
+
+    def test_the_database_refuses_a_row_naming_two_people(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            UserBlock.objects.create(
+                blocker=self.yul,
+                blocked_user=User.objects.create_user('x', 'x@example.com', 'p'),
+                blocked_email=self.address,
+            )
+
+
+class EmailBlockFollowsTheAccountTests(TestCase):
+    """`link_email_to_account`, the twin of link_number_to_account."""
+
+    def setUp(self):
+        self.blocker = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.address = 'stewart@gmail.com'
+
+    def verify(self, user):
+        user.profile.email_verified = True
+        user.profile.save(update_fields=['email_verified'])
+        return blocks.link_email_to_account(user)
+
+    def test_the_block_moves_onto_the_account(self):
+        blocks.block(self.blocker, email=self.address)
+        stewart = User.objects.create_user('stewart', self.address, 'x')
+
+        self.assertEqual(self.verify(stewart), 1)
+
+        row = UserBlock.objects.get(blocker=self.blocker)
+        self.assertEqual(row.blocked_user_id, stewart.pk)
+        self.assertIsNone(row.blocked_email)
+
+    def test_a_self_block_is_dropped_rather_than_converted(self):
+        stewart = User.objects.create_user('stewart', self.address, 'x')
+        UserBlock.objects.create(blocker=stewart, blocked_email=self.address)
+
+        self.verify(stewart)
+
+        self.assertFalse(UserBlock.objects.filter(blocker=stewart).exists())
+
+    def test_a_duplicate_is_dropped_rather_than_creating_two_rows(self):
+        stewart = User.objects.create_user('stewart', self.address, 'x')
+        blocks.block(self.blocker, user=stewart)
+        blocks.block(self.blocker, email=self.address)
+
+        self.verify(stewart)
+
+        rows = UserBlock.objects.filter(blocker=self.blocker)
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(rows.first().blocked_user_id, stewart.pk)
+
+    def test_an_unverified_address_moves_nothing(self):
+        blocks.block(self.blocker, email=self.address)
+        stewart = User.objects.create_user('stewart', self.address, 'x')
+
+        self.assertEqual(blocks.link_email_to_account(stewart), 0)
+
+    def test_running_it_twice_is_harmless(self):
+        blocks.block(self.blocker, email=self.address)
+        stewart = User.objects.create_user('stewart', self.address, 'x')
+
+        self.verify(stewart)
+
+        self.assertEqual(blocks.link_email_to_account(stewart), 0)
