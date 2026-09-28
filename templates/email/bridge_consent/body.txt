@@ -1,0 +1,21 @@
+{% comment %}
+Autoescape off for the whole file: this is the PLAIN-TEXT part, so there is no
+HTML for an entity to be decoded by, and an escaped '&' in a link or an
+apostrophe in a name arrives looking like a mistake.
+{% endcomment %}{% autoescape off %}{{ sender_name }} sent you this on {{ product_name }}:
+
+    {{ body }}
+
+Would you like to carry on this conversation by email?
+
+Reply with just the word YES to receive and reply to messages from
+{{ sender_name }}, or NO to stop. Wait for our confirmation before writing
+anything else.
+
+You do not need an account - replying to these emails is enough.
+
+-- 
+You are getting this because {{ sender_name }} messaged this address on
+{{ product_name }}. Reply NO{% if unsubscribe_url %} or use this link: {{ unsubscribe_url }}{% endif %}
+and we will not email you about this conversation again.
+{% endautoescape %}

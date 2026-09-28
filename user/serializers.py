@@ -13,6 +13,9 @@ from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth.tokens import default_token_generator
 from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
+# Aliased: this module already has several `validate_email` serializer methods,
+# and an unaliased import would read like one of them.
+from django.core.validators import validate_email as validate_email_address
 from django.db import transaction
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
@@ -22,6 +25,10 @@ from google.oauth2 import id_token
 from rest_framework import exceptions, serializers
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.token_blacklist.models import (
+    BlacklistedToken,
+    OutstandingToken,
+)
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from otp.models import OtpError
@@ -38,7 +45,12 @@ from user.models import (
     phone_number_validator,
 )
 from user.user_settings import ensure_settings
-from utils.email import EmailError, send_email
+from utils.mail import (
+    PASSWORD_CHANGED,
+    PASSWORD_RESET,
+    EmailError,
+    send_templated_email,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -363,16 +375,28 @@ class GoogleCredentialSerializer(serializers.Serializer):
     credential = serializers.CharField(trim_whitespace=True)
 
     def validate_credential(self, value):
-        if not settings.GOOGLE_CLIENT_ID:
+        if not settings.GOOGLE_CLIENT_IDS:
             raise serializers.ValidationError('Google sign-in is not configured.')
 
-        try:
-            claims = id_token.verify_oauth2_token(
-                value,
-                google_requests.Request(),
-                settings.GOOGLE_CLIENT_ID,
-            )
-        except (GoogleAuthError, ValueError):
+        # Tried one client ID at a time rather than passing audience=None and
+        # checking `aud` afterwards. Passing None turns Google's own audience
+        # verification OFF, leaving the only check in code a later edit could
+        # drop without anything failing - the token would still verify, just
+        # for somebody else's application. The loop is slower by nothing that
+        # matters (Google's certs are cached) and cannot be silently weakened.
+        claims = None
+        for client_id in settings.GOOGLE_CLIENT_IDS:
+            try:
+                claims = id_token.verify_oauth2_token(
+                    value,
+                    google_requests.Request(),
+                    client_id,
+                )
+                break
+            except (GoogleAuthError, ValueError):
+                continue
+
+        if claims is None:
             raise serializers.ValidationError('The Google credential is invalid.')
 
         if not claims.get('email') or claims.get('email_verified') is not True:
@@ -589,6 +613,11 @@ class ResetPasswordSerializer(serializers.Serializer):
     def save(self, **kwargs):
         self.user.set_password(self.validated_data['new_password'])
         self.user.save(update_fields=['password'])
+        # Order matters only in that both follow the save: the password is the
+        # thing that had to change, and neither a revoked session nor an
+        # undelivered notice should be able to undo it.
+        _revoke_all_sessions(self.user)
+        _send_password_changed_email(self.user)
         return self.user
 
 
@@ -621,6 +650,13 @@ class ChangePasswordSerializer(serializers.Serializer):
         user = self.context['request'].user
         user.set_password(self.validated_data['new_password'])
         user.save(update_fields=['password'])
+        # Sessions are NOT revoked here, unlike a reset. This caller is signed
+        # in and proved they know the old password, so there is no intruder
+        # implied - and revoking everything would sign the person out of the
+        # session they are typing in. Signing out the OTHER sessions is the
+        # thing worth having, and it needs the caller's own refresh token to
+        # exclude, which this request does not carry.
+        _send_password_changed_email(user)
         return user
 
 
@@ -634,25 +670,72 @@ def _send_password_reset_email(user):
     """
     uid = urlsafe_base64_encode(force_bytes(user.pk))
     token = default_token_generator.make_token(user)
-    reset_url = f'{settings.FRONTEND_URL}/reset-password?uid={uid}&token={token}'
+    # The slash before the query string is load-bearing: the frontend is a
+    # static export built with `trailingSlash: true`, so the page really is
+    # `/reset-password/index.html`. Without it the link depends on something
+    # upstream rewriting the path, which is not a thing to bet a reset email on.
+    reset_url = f'{settings.FRONTEND_URL}/reset-password/?uid={uid}&token={token}'
     minutes = settings.PASSWORD_RESET_TIMEOUT // 60
 
     try:
-        send_email(
+        send_templated_email(
+            PASSWORD_RESET,
             to=user.email,
-            subject="Reset your Loopd'n password",
-            html=(
-                f'<p>Tap the link below to set a new password. '
-                f'It expires in {minutes} minutes.</p>'
-                f'<p><a href="{reset_url}">{reset_url}</a></p>'
-                f'<p>If you did not request this, you can ignore this email.</p>'
-            ),
+            context={'reset_url': reset_url, 'expires_in_minutes': minutes},
         )
     except EmailError:
         # The provider failed, not the user, and the caller (forgot_password)
         # must answer identically either way - see ForgotPasswordSerializer -
         # so there is nothing useful to do with this here but log it.
         logger.warning('Password reset email to %s could not be sent.', user.email)
+
+
+def _send_password_changed_email(user):
+    """Tell the account its password just changed.
+
+    This is how somebody finds out that a reset they did not ask for has
+    happened - by the time an attacker holds a valid token there is nothing
+    left to refuse, so noticing is the only defence the real owner has.
+
+    Sent on BOTH routes a password moves by, reset and change, because "I did
+    not do that" is the same sentence either way.
+
+    Unlike the reset link this reveals nothing: whoever triggered it already
+    proved they hold the token or the old password, so there is no enumeration
+    concern and no reason to be quiet about a delivery failure beyond logging
+    it - the password has changed regardless, and raising here would fail a
+    request whose work is already committed.
+    """
+    # An account can reach here with no address on it - `createsuperuser` does
+    # not insist on one - and there is nothing to tell in that case.
+    if not user.email:
+        return
+
+    try:
+        send_templated_email(PASSWORD_CHANGED, to=user.email)
+    except EmailError:
+        logger.warning('Password change notice to %s could not be sent.', user.email)
+
+
+def _revoke_all_sessions(user):
+    """Blacklist every refresh token this account holds.
+
+    A password reset is what somebody does when they think another person is
+    inside their account, so it has to end that person's session and not only
+    change what the front door asks for. Without this the intruder keeps
+    rotating a refresh token for up to REFRESH_TOKEN_LIFETIME - thirty days -
+    and the reset accomplishes nothing against them.
+
+    `get_or_create` because ROTATE_REFRESH_TOKENS means some of these rows are
+    already blacklisted; blacklisting one twice is not an error worth raising.
+
+    What this CANNOT do is revoke an access token: they are stateless and
+    carry no database row, so one already issued stays good until it expires.
+    ACCESS_TOKEN_LIFETIME being thirty minutes is what bounds that, and it is
+    the same trade-off LogoutSerializer documents.
+    """
+    for token in OutstandingToken.objects.filter(user=user):
+        BlacklistedToken.objects.get_or_create(token=token)
 
 
 # --- forgot-password rate limiting ------------------------------------------
@@ -727,22 +810,42 @@ class BlockSerializer(serializers.Serializer):
     phone_number = serializers.CharField(
         required=False, allow_blank=True, max_length=16
     )
+    email = serializers.CharField(required=False, allow_blank=True, max_length=254)
 
     def validate(self, attrs):
         username = (attrs.get('username') or '').strip()
         number = (attrs.get('phone_number') or '').strip()
+        address = (attrs.get('email') or '').strip().lower()
 
-        if bool(username) == bool(number):
+        if len([value for value in (username, number, address) if value]) != 1:
             raise serializers.ValidationError(
-                'Name the person by exactly one of username or phone_number.'
+                'Name the person by exactly one of username, phone_number or email.'
             )
 
         viewer = self.context['request'].user
+
+        if address:
+            # NOT resolved through `find_user`, for the reason the module
+            # docstring gives for usernames and one more: resolving would make
+            # this endpoint answer "does this address have an account", which
+            # is the lookup `user/invites.py` exists to refuse. An address is
+            # blocked as an address, whoever may or may not be behind it.
+            try:
+                validate_email_address(address)
+            except DjangoValidationError:
+                raise serializers.ValidationError('That is not an email address.')
+            if address == (viewer.email or '').strip().lower():
+                raise serializers.ValidationError('You cannot block yourself.')
+            attrs['target_user'] = None
+            attrs['target_number'] = None
+            attrs['target_email'] = address
+            return attrs
 
         if number:
             phone_number_validator(number)
             attrs['target_user'] = None
             attrs['target_number'] = number
+            attrs['target_email'] = None
             return attrs
 
         target = active_users().filter(username__iexact=username).first()
@@ -753,6 +856,7 @@ class BlockSerializer(serializers.Serializer):
 
         attrs['target_user'] = target
         attrs['target_number'] = None
+        attrs['target_email'] = None
         return attrs
 
 
@@ -769,6 +873,7 @@ class BlockedEntrySerializer(serializers.Serializer):
     phone_number = serializers.CharField(
         source='blocked_phone_number', read_only=True
     )
+    email = serializers.CharField(source='blocked_email', read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
 
     def get_username(self, obj):
@@ -776,7 +881,7 @@ class BlockedEntrySerializer(serializers.Serializer):
 
     def get_display_label(self, obj):
         if not obj.blocked_user_id:
-            return obj.blocked_phone_number
+            return obj.blocked_phone_number or obj.blocked_email
         profile = getattr(obj.blocked_user, 'profile', None)
         return profile.display_label if profile else obj.blocked_user.username
 

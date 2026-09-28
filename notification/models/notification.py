@@ -48,6 +48,12 @@ class Notification(models.Model):
         EMAIL_SEND_FAILED = (
             'email.send_failed', 'A message did not reach everyone by email'
         )
+        # The two ends of the consent handshake with somebody who has no
+        # account. The sender asked a question and is waiting on it, so both
+        # answers are news - and without these the answer would only be visible
+        # to somebody who happened to reopen the thread.
+        EMAIL_OPTED_IN = 'email.opted_in', 'Someone accepted by email'
+        EMAIL_DECLINED = 'email.declined', 'Someone declined email messages'
 
         GENERAL = 'general', 'General'
 

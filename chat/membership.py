@@ -18,8 +18,10 @@ import logging
 from urllib.parse import quote
 
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
+from datetime import timedelta
+
 from django.utils import timezone
 
 from chat.models import (
@@ -174,8 +176,14 @@ def request_to_join(conversation, *, user=None, phone_number=None,
         # which is the whole reason JOIN is a better front door than adding
         # somebody's number on their behalf and hoping they consent later.
         sms_enabled=True,
-        consent_at=timezone.now(),
-        consent_text='Sent JOIN to the group number.',
+    )
+    # Texting JOIN is both the question and the answer, so both are recorded:
+    # what they sent, and that it counted as agreement. set_channel_consent
+    # stamps `consented_at` itself.
+    record_consent_asked(
+        created_by_text,
+        ChannelConsent.Channel.SMS,
+        'Sent JOIN to the group number.',
     )
     set_channel_consent(
         created_by_text,
@@ -427,15 +435,25 @@ def clear_history(participant):
     The read pointer moves with it. Otherwise the cleared messages would still
     be counted as unread, and the conversation would come back carrying a badge
     for messages the member can no longer see.
+
+    An EMPTY conversation is cleared too. There is no message to point at, so
+    only the timestamp is written; the row leaves their list all the same, and
+    returns when somebody finally posts.
     """
     if participant.status != Participant.Status.ACTIVE:
         raise NotAMember('You are not a member of that conversation.')
 
+    # Recorded on every clear, and the ONLY thing recorded when there are no
+    # messages to point at - see Participant.cleared_at. Without it, clearing
+    # an empty conversation wrote nothing and the row returned on refresh.
+    fields = ['cleared_at']
+    participant.cleared_at = timezone.now()
+
     newest = participant.conversation.messages.order_by('-pk').first()
     if newest is None:
+        participant.save(update_fields=fields)
         return participant
 
-    fields = []
     if participant.cleared_before_message_id != newest.pk:
         participant.cleared_before_message = newest
         fields.append('cleared_before_message')
@@ -443,8 +461,7 @@ def clear_history(participant):
         participant.last_read_message = newest
         fields.append('last_read_message')
 
-    if fields:
-        participant.save(update_fields=fields)
+    participant.save(update_fields=fields)
     return participant
 
 
@@ -477,6 +494,201 @@ def set_channel_consent(participant, channel, status, *, when=None):
         consent.opted_out_at = stamp
 
     consent.save(update_fields=['status', 'consented_at', 'opted_out_at', 'updated_at'])
+    return consent
+
+
+def accept_email_consent(participant):
+    """They replied YES. The one-way IN, and the mirror of `decline_email`.
+
+    Reached from PENDING - the ordinary case - and from DECLINED, because
+    changing your mind back is allowed and `invite_by_phone` already documents
+    the same pair on the other channel: NO turns a group off, YES turns it on
+    again.
+
+    NEVER from OPTED_OUT, and that is the whole guard. A provider complaint or
+    a STOP is about this address everywhere, not about one conversation, and a
+    YES to one sender must not quietly undo it. `sms/inbound.py` learned this
+    the expensive way - see the paragraph there about a word the carrier does
+    not recognise for that purpose.
+
+    Returns True when something actually changed, so a caller can stay quiet
+    about a repeat rather than sending a second acknowledgement.
+    """
+    already = consent_status(participant, ChannelConsent.Channel.EMAIL)
+    if already == ChannelConsent.Status.OPTED_OUT:
+        logger.info(
+            'Not accepting email consent for participant %s: opted out',
+            participant.pk,
+        )
+        return False
+
+    set_channel_consent(
+        participant, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.OPTED_IN
+    )
+    # No Participant.consent_at write. set_channel_consent above already
+    # stamped `consented_at` on the email row, which is the per-channel record
+    # this used to duplicate onto a single member-wide field.
+    return already != ChannelConsent.Status.OPTED_IN
+
+
+def record_consent_asked(participant, channel, wording):
+    """Stamp when this member was asked about THIS channel, and in what words.
+
+    Called once the consent request has actually been accepted by the provider,
+    not when it was composed: `asked_at` gates whether a bounced first attempt
+    may be asked again, and a send that never happened must not count as an ask.
+
+    `consent_text` keeps the wording verbatim because "what exactly were they
+    agreeing to" is the question a complaint turns on, and the template will
+    have changed by the time anybody asks.
+
+    PER CHANNEL, on the row that holds the answer. The same person can be
+    invited to a group by text and later emailed about it, and those are two
+    different questions asked on two different days. One pair of fields on
+    Participant could hold only whichever came last, so the earlier record was
+    silently overwritten - which for consent evidence is worse than never
+    having kept it, because nothing shows that it happened.
+
+    First ask wins for both fields: a resend is the same question, and the date
+    that matters is when they were first put on notice.
+    """
+    consent, _ = ChannelConsent.objects.get_or_create(
+        participant=participant, channel=channel
+    )
+
+    fields = []
+    if consent.asked_at is None:
+        consent.asked_at = timezone.now()
+        fields.append('asked_at')
+    if wording and not consent.consent_text:
+        consent.consent_text = wording
+        fields.append('consent_text')
+    if fields:
+        consent.save(update_fields=fields)
+    return consent
+
+
+# How long an admin must wait before asking the same person again. A nudge is a
+# message to somebody who has not consented, so the floor is a real protection
+# rather than a nicety.
+NUDGE_INTERVAL = timedelta(hours=24)
+
+
+def nudge_refusal(participant, channel, *, now=None):
+    """Why this member must not be nudged about `channel`, or None if they may.
+
+    A string rather than a boolean, for the reason `refusal_reason` gives: the
+    UI has to explain a disabled button, and "they said no" and "asked an hour
+    ago" are very different things to tell an admin.
+
+    NEVER after an answer. Somebody who replied NO has answered the question,
+    and somebody who sent STOP has told the carrier. Asking either of them
+    again is the behaviour that gets a campaign shut down, so both are refused
+    here rather than left to the caller to remember.
+    """
+    consent = ChannelConsent.objects.filter(
+        participant=participant, channel=channel
+    ).first()
+    refusal = standing_nudge_refusal(participant, channel, consent)
+    if refusal is not None:
+        return refusal
+
+    # PENDING and asked, from here. `asked_at` is the first ask and never
+    # moves, so the clock runs from whichever contact was most recent.
+    now = now or timezone.now()
+    waited = now - max(filter(None, (consent.asked_at, consent.reminded_at)))
+    if waited < NUDGE_INTERVAL:
+        remaining = NUDGE_INTERVAL - waited
+        hours = int(remaining.total_seconds() // 3600) + 1
+        return f'Asked recently. You can nudge again in about {hours}h.'
+
+    return None
+
+
+def standing_nudge_refusal(participant, channel, consent):
+    """Why `nudge_refusal` would refuse however long they waited, or None.
+
+    Everything but the once-a-day floor, which is the one refusal that passes
+    by itself. Split out so the member list can say whether to offer a nudge at
+    all without walking these rules again - a client that re-derived them from
+    `status` is how a member added by phone came to be offered a nudge about
+    email.
+
+    `consent` is this member's row for `channel`, or None. Passed in rather
+    than fetched, so a page of members reads the prefetch.
+    """
+    if participant.status != Participant.Status.ACTIVE:
+        return 'They are not an active member.'
+
+    # The reminder is a text: `nudge` sends it through send_notice, in SMS
+    # wording. Nudging "about email" would text them instead, and past the SMS
+    # row's floor, since the floor is kept per channel.
+    if channel != ChannelConsent.Channel.SMS:
+        return 'Only a text invitation can be sent again for now.'
+
+    if consent is None:
+        return 'They have never been asked about this channel.'
+
+    if consent.status == ChannelConsent.Status.OPTED_IN:
+        return 'They have already agreed.'
+    if consent.status == ChannelConsent.Status.DECLINED:
+        return 'They declined. Asking again is not ours to do.'
+    if consent.status == ChannelConsent.Status.OPTED_OUT:
+        return 'They opted out. Only they can undo that.'
+
+    if consent.asked_at is None and consent.reminded_at is None:
+        return 'Nothing has been sent to them yet.'
+
+    # Without a number, send_notice finds nobody to text and returns quietly -
+    # after `nudge` has stamped the reminder and told the admin it went out.
+    from sms.outbound import number_for
+
+    if not number_for(participant):
+        return 'They have no number to text.'
+
+    return None
+
+
+def nudge(participant, channel, by, *, text=None):
+    """Ask an unanswered invitation again. Admins only, once a day at most.
+
+    Returns the ChannelConsent row. Raises JoinRefused with the reason when the
+    member may not be nudged, so a caller cannot send by forgetting to check.
+
+    `asked_at` and `consent_text` are left alone deliberately - they record the
+    FIRST time somebody was put on notice and in what words, which is what a
+    consent complaint turns on. Only `reminded_at` moves.
+    """
+    if not participant.conversation.may_add_members(by):
+        raise JoinRefused('You cannot nudge people in this group.')
+
+    refusal = nudge_refusal(participant, channel)
+    if refusal is not None:
+        raise JoinRefused(refusal)
+
+    consent = ChannelConsent.objects.get(participant=participant, channel=channel)
+    consent.reminded_at = timezone.now()
+    consent.save(update_fields=['reminded_at', 'updated_at'])
+
+    if text is None:
+        conversation = participant.conversation
+        text = (
+            f'Reminder: you were added to {conversation.name} on LoopD. '
+            'Reply YES to receive this group by text, NO to decline. '
+            'STOP to never hear from us.'
+        )
+
+    # Through send_notice like the invitation it repeats, so the kill switch,
+    # the spend ceilings and the delivery log all apply. A reminder that
+    # bypassed them would be an unrecorded way to spend money on the one kind
+    # of message that most needs a record.
+    from sms.outbound import send_notice
+
+    transaction.on_commit(
+        lambda: send_notice(
+            participant.conversation, participant, text, kind='invitation'
+        )
+    )
     return consent
 
 
@@ -562,6 +774,96 @@ def grant_email_consent_on_claim(participant):
     return set_channel_consent(
         participant, ChannelConsent.Channel.EMAIL, ChannelConsent.Status.OPTED_IN
     )
+
+
+def rekey_external_direct(conversation, user):
+    """Re-file an external thread under its pair of accounts, once it has two.
+
+    The address has just become an account, so the conversation is now an
+    ordinary one-to-one - but it is still filed under `'<id>:email:<address>'`.
+    Left that way, the next `start_direct` between the two computes the id-pair
+    key, finds nothing, and opens a SECOND thread. That is exactly the
+    duplicate `direct_key` exists to prevent, arriving by the back door.
+
+    So the key is rewritten. Nothing else moves: same conversation, same
+    messages, same participants - only its filing name changes.
+
+    THE COLLISION IS REAL AND IS HANDLED. The pair may already have a thread,
+    if they got an account some other way and were messaged there while the
+    bridge also existed. The unique constraint refuses the rewrite, and the
+    bridge is folded into the older thread instead - the same "one human, two
+    rows, keep one and move the history" move `claim_email_invitations` makes
+    one level down, applied a level up.
+
+    Returns 'rekeyed', 'folded', or None when there was nothing to do. The
+    caller needs to tell the first two apart: folding DELETES this conversation
+    and the participant row with it, so anything that would go on to touch that
+    row - announcing the membership, say - must not.
+
+    Never raises: this runs inside email verification, which has already
+    succeeded by the time it is reached.
+    """
+    if not conversation.is_external_direct:
+        return None
+
+    other = (
+        Participant.objects.filter(conversation=conversation, user__isnull=False)
+        .exclude(user=user)
+        .select_related('user')
+        .first()
+    )
+    if other is None:
+        return None
+
+    key = Conversation.direct_key_for(other.user, user)
+    try:
+        with transaction.atomic():
+            conversation.direct_key = key
+            conversation.save(update_fields=['direct_key', 'updated_at'])
+        return 'rekeyed'
+    except IntegrityError:
+        pass
+
+    existing = Conversation.objects.filter(direct_key=key).first()
+    if existing is None or existing.pk == conversation.pk:
+        logger.warning(
+            'Could not re-key external conversation %s and found no thread to '
+            'fold it into', conversation.pk,
+        )
+        return None
+
+    try:
+        with transaction.atomic():
+            _fold_into(conversation, existing, user)
+    except Exception:
+        logger.exception(
+            'Could not fold external conversation %s into %s',
+            conversation.pk, existing.pk,
+        )
+        return None
+    return 'folded'
+
+
+def _fold_into(bridge, target, user):
+    """Move one external thread's messages into the pair's existing one.
+
+    `sender_participant` is SET_NULL, so the rows have to be re-pointed before
+    the bridge goes - deleting first would orphan everything posted through it.
+    """
+    rows = {
+        row.user_id: row
+        for row in Participant.objects.filter(
+            conversation=target, user__isnull=False
+        )
+    }
+    for row in Participant.objects.filter(conversation=bridge):
+        replacement = rows.get(row.user_id)
+        if replacement is not None:
+            row.messages_sent.update(sender_participant=replacement)
+
+    bridge.messages.update(conversation=target)
+    bridge.delete()
+    logger.info('Folded external conversation into %s for user %s', target.pk, user.pk)
 
 
 def consent_status(participant, channel):
@@ -1013,30 +1315,70 @@ def _email_invitation(conversation, participant, by):
     An invitation that cannot be sent must not undo a group that is already
     committed - and this runs in an on_commit callback, where an exception
     becomes a 500 on a request that already succeeded.
+
+    TWO WAYS IN, ONE EMAIL. Reply YES and the group's messages arrive by email,
+    where replying posts to the group - no account needed. Or sign up with this
+    address and they are in the app. The first only exists where replies can
+    reach us: with no reply domain there is nothing to reply TO, and the email
+    offers the link alone rather than a YES that lands nowhere.
+
+    It is a consent request, so it carries what the first contact of the
+    one-to-one bridge carries: a reply address that names this membership, the
+    unsubscribe link and its one-click header, and a record of exactly what
+    they were asked - stamped only once the send succeeded, since a question
+    that never arrived was not asked.
     """
+    from django.template.loader import render_to_string
+
+    from mail import commands
+    from mail.outbound import _headers_for, from_header
+    from mail.tokens import reply_address, unsubscribe_url
     from utils.mail import GROUP_INVITATION, EmailError, send_templated_email
 
-    inviter = getattr(getattr(by, 'profile', None), 'display_label', None)
     address = participant.email
     if not address:
         return
+
+    inviter = getattr(getattr(by, 'profile', None), 'display_label', None)
+    reply_to = reply_address(participant)
+    stop_url = unsubscribe_url(participant)
+    context = {
+        'group_name': conversation.name,
+        'inviter_name': inviter or 'Somebody',
+        # Deliberately not a token. Membership in the app is granted by
+        # verifying the address, so this only needs to carry them to the
+        # right form with the right address in it.
+        'join_url': f'{settings.FRONTEND_URL}/signup?email={quote(address)}',
+        'can_reply': bool(reply_to),
+        'stop_keyword': commands.KEYWORD,
+        'unsubscribe_url': stop_url,
+        'product_name': settings.EMAIL_PRODUCT_NAME,
+        'support_address': settings.EMAIL_SUPPORT_ADDRESS,
+    }
 
     try:
         send_templated_email(
             GROUP_INVITATION,
             to=address,
-            context={
-                'group_name': conversation.name,
-                'inviter_name': inviter or 'Somebody',
-                # Deliberately not a token. Membership is granted by verifying
-                # the address, so this only needs to carry them to the right
-                # form with the right address in it.
-                'join_url': f'{settings.FRONTEND_URL}/signup?email={quote(address)}',
-            },
+            context=context,
+            from_email=from_header(conversation),
+            reply_to=reply_to,
+            headers=_headers_for(conversation, stop_url),
         )
     except EmailError:
         logger.exception(
             'Could not email the invitation for conversation %s', conversation.pk
+        )
+        return
+
+    if reply_to:
+        # The plain-text part, word for word: "what exactly were they asked"
+        # is the question a complaint turns on, and the template will have
+        # changed by the time anybody asks it.
+        record_consent_asked(
+            participant,
+            ChannelConsent.Channel.EMAIL,
+            render_to_string(GROUP_INVITATION.text_template, context).strip(),
         )
 
 
@@ -1121,8 +1463,13 @@ def claim_email_invitations(user):
             row.status = Participant.Status.ACTIVE
             row.save(update_fields=['user', 'email', 'status'])
             grant_email_consent_on_claim(row)
+            outcome = rekey_external_direct(row.conversation, user)
             claimed += 1
-            _announce_membership(row)
+            if outcome != 'folded':
+                # Folding deleted this row along with its conversation, so
+                # there is no membership left to announce - and the pair were
+                # already talking in the thread it was folded into.
+                _announce_membership(row)
             continue
 
         # Already in as an account and as an address: one human, two rows.
@@ -1208,11 +1555,10 @@ def invite_by_phone(conversation, phone_number, display_name, by):
     set_channel_consent(
         participant, ChannelConsent.Channel.SMS, ChannelConsent.Status.PENDING
     )
-    participant.consent_sent_at = timezone.now()
-    # The exact words they were shown. A consent complaint turns on what was
-    # actually sent, and the template will have changed by the time anyone asks.
-    participant.consent_text = text
-    participant.save(update_fields=['consent_sent_at', 'consent_text'])
+    # The exact words they were shown, on the SMS consent row. A complaint
+    # turns on what was actually sent, and the template will have changed by
+    # the time anyone asks.
+    record_consent_asked(participant, ChannelConsent.Channel.SMS, text)
 
     transaction.on_commit(
         lambda: send_notice(conversation, participant, text, kind='invitation')

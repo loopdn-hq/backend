@@ -1,0 +1,23 @@
+{% extends "email/base.html" %}
+
+{% block title %}{{ sender_name }} on {{ product_name }}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 8px; color:#52525b; font-size:14px;">
+  <strong>{{ sender_name }}</strong>:
+</p>
+<p style="margin:0 0 24px;">
+  {{ body }}
+</p>
+<p style="margin:0; font-size:14px; color:#52525b;">
+  {% if can_reply %}Reply to this email to respond.{% else %}Open {{ product_name }} to respond.{% endif %}
+</p>
+{% endblock %}
+
+{% block footer %}
+You are getting this because you agreed to receive messages from
+{{ sender_name }} on {{ product_name }}.
+{% if can_reply %}To stop, reply <strong>{{ stop_keyword }}</strong>{% if unsubscribe_url %} or use
+<a href="{{ unsubscribe_url }}">this link</a>{% endif %}.{% elif unsubscribe_url %}To stop, use
+<a href="{{ unsubscribe_url }}">this link</a>.{% endif %}
+{% endblock %}

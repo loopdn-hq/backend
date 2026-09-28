@@ -17,4 +17,4 @@ class MailConfig(AppConfig):
         from mail import checks  # noqa: F401
         from mail.outbound import schedule
 
-        delivery.register_channel('email', schedule)
+        delivery.register_channel('email', schedule, external=True)

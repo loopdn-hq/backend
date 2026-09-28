@@ -1,4 +1,4 @@
-"""Generate the v4 Postman collection - v3 plus the billing endpoints.
+"""Generate the v4 Postman collection - v3 plus billing, and voice/video calls.
 
 Run:  python postman/build_v4.py
 """
@@ -686,8 +686,11 @@ BILLING = [
     req('List plans', 'GET', '/api/v1/billing/plans/', auth=False,
         desc=(
             'The pricing page: Free, Premium, Business, Enterprise - their '
-            'monthly price, group/member/admin limits, storage, and whether '
-            'WhatsApp/Telegram are included.\n\n'
+            'monthly price, group/member/admin limits, storage, call limits '
+            '(`has_calls` covers audio and video together, plus '
+            '`max_call_participants`, `has_screen_share`, `has_call_recording`, '
+            '`call_recording_retention_days` - `null` means unlimited / kept '
+            'until deleted), and whether WhatsApp/Telegram are included.\n\n'
             'Public, so a logged-out visitor sees pricing before signing up. '
             '`price_display` is `"Custom"` for Enterprise, which is quoted by '
             'sales rather than charged through Stripe - `monthly_price_cents` '
@@ -775,10 +778,13 @@ BILLING = [
                                   'metadata': {'credit_package_id': '{{credit_package_id}}'}}}},
         desc=(
             '**Called by Stripe, not by a client.** Included so the shape of '
-            'every event this project understands is documented in one '
-            'place: `checkout.session.completed` (subscription activation or '
-            'a credit top-up), `customer.subscription.updated` and '
-            '`customer.subscription.deleted`.\n\n'
+            'the account-facing events this project understands is '
+            'documented in one place: `checkout.session.completed` '
+            '(subscription activation or a credit top-up), '
+            '`customer.subscription.updated`, `customer.subscription.deleted`, '
+            '`invoice.paid`, `invoice.payment_failed` and `charge.refunded`. '
+            'The catalog-sync events (`product.*`, `price.*`) are a separate '
+            'example below.\n\n'
             'Authenticated by a signature over the raw body '
             '(`Stripe-Signature` header, verified against '
             '`STRIPE_WEBHOOK_SECRET`), not a token - like the SMS webhook, '
@@ -794,6 +800,51 @@ BILLING = [
             '| `500` | a known event failed to process - Stripe retries |\n\n'
             'Repeat with the same event `id` to see de-duplication: the '
             'second call returns `duplicate: true` and changes nothing.'
+        )),
+    req('Stripe webhook: plan catalog sync (provider callback)', 'POST',
+        '/api/v1/billing/webhooks/stripe/', auth=False,
+        body={
+            'id': 'evt_catalog_1', 'type': 'price.updated',
+            'data': {'object': {
+                'id': 'price_premium_live', 'product': 'prod_premium_live',
+                'unit_amount': 999, 'currency': 'usd',
+                'recurring': {'interval': 'month'},
+                'metadata': {
+                    'data': (
+                        '{"type": "plan", "code": "premium", "max_groups": 25, '
+                        '"max_members_per_group": 250, "max_admins_per_group": 5, '
+                        '"storage_gb": 10, "has_calls": true, '
+                        '"max_call_participants": 25, "has_call_recording": true, '
+                        '"call_recording_retention_days": 30, "has_whatsapp": true, '
+                        '"has_telegram": true, "is_custom_pricing": false}'
+                    ),
+                },
+            }},
+        },
+        desc=(
+            'The same endpoint again - Stripe is the one place plan pricing '
+            'and limits are meant to be edited going forward, not a Django '
+            'admin form. Set `metadata.data` (a JSON string) on a Price - or '
+            'a Product, before it has a price - to this shape, and '
+            '`product.created/updated` or `price.created/updated` upserts the '
+            'matching `Plan` row from it.\n\n'
+            '**Calling fields**, read from the same payload: `has_calls` is '
+            'one permission for audio and video together, not two - it '
+            'defaults to `true` (matching the column\'s own default) when a '
+            'product\'s metadata has never mentioned calling at all, so '
+            'editing a price for an unrelated reason cannot silently switch '
+            'calling off for a plan nobody has touched calling on. '
+            '`max_call_participants`, `has_call_recording` and '
+            '`call_recording_retention_days` are read the same way. '
+            '`has_screen_share` is never read from metadata - it always just '
+            'equals `has_calls`, the same rule the Enterprise Plan Builder '
+            'uses (see `10. Enterprise`).\n\n'
+            'Matched to a `Plan` by `code` for a `product.created` with no '
+            'price yet, and by `stripe_product_id` afterwards - a second '
+            '`price.updated` for the SAME product updates that plan in place '
+            'rather than creating another one. Running this as written '
+            'returns `400` for the same signature reason as *Stripe webhook '
+            '(provider callback)*.'
         )),
 ]
 
@@ -839,6 +890,211 @@ PUSH = [
 ]
 
 
+CALLS = [
+    req('Start a call', 'POST', '/api/v1/calls/',
+        body={'conversation': '{{conversation_id}}', 'call_type': 'video'},
+        tests=capture('call_id', 'body.data && body.data.call && body.data.call.id'),
+        desc=(
+            'Start an audio or video call in a conversation you are an active '
+            'member of, **and join it**. The caller is in the call from this '
+            'response on.\n\n'
+            '`call_type` is `audio` (the default) or `video`.\n\n'
+            '### The response\n'
+            '`data.call` is the call. `data.livekit` is what the browser needs '
+            'to connect to LiveKit **directly**: `url` (the `wss://` address), '
+            '`token` and `expires_at`. Media never passes through Django. The '
+            'token is a short-lived JWT for this one room and this one person - '
+            'it cannot be used to join anything else, or to record or end a '
+            'call. `LIVEKIT_API_SECRET` stays on the server; only tokens signed '
+            'with it are ever returned.\n\n'
+            'What the token lets you *publish* is decided here, not by the '
+            'client: microphone always, camera only on a `video` call, screen '
+            'share only if the group owner\'s plan has it.\n\n'
+            '### Who may\n'
+            'Active members only. Somebody outside the conversation gets `404` '
+            '- the same answer as a conversation that does not exist. In a '
+            '**broadcast** group only admins may start a call. In a one-to-one '
+            'conversation where either person blocked the other, `403`.\n\n'
+            '### One live call per conversation\n'
+            'A second start while one is ringing or active returns `409`, with '
+            '`data.call_id` naming the call to **join** instead.\n\n'
+            '### Realtime\n'
+            'Everyone else in the conversation is told over the existing '
+            'websocket (`/ws/chat/`) with a `call.incoming` frame. See the '
+            'collection description for every frame.\n\n'
+            '| Status | When |\n'
+            '| --- | --- |\n'
+            '| `201` | started |\n'
+            '| `403` | broadcast group and you are not an admin; blocked |\n'
+            '| `404` | not a member of that conversation |\n'
+            '| `409` | there is already a live call here |\n'
+            '| `429` | 60 starts an hour |\n'
+            '| `503` | LiveKit is not configured or not reachable |'
+        )),
+    req('List calls', 'GET', '/api/v1/calls/',
+        query=[{'key': 'conversation', 'value': '{{conversation_id}}'}],
+        desc=(
+            'Calls in conversations you are an active member of, newest first, '
+            'paginated.\n\n'
+            'Filters: `conversation=<id>` and `status=ringing|active|ended`. '
+            '`?conversation=<id>&status=active` is how a client finds out '
+            'whether there is a call to offer to join when it opens a thread.\n\n'
+            'Ended calls are the call history: who took part, when they joined '
+            'and left, and for how long.'
+        )),
+    req('Get a call', 'GET', '/api/v1/calls/{{call_id}}/',
+        desc=(
+            'One call. `participants` holds every stay, not only who is in '
+            'right now - a client shows the ones whose `left_at` is `null`, and '
+            '`participant_count` is that number. `duration` is in seconds.\n\n'
+            '`is_recording` is `true` while a recording is in progress, so a '
+            'client can show that everyone is being recorded.\n\n'
+            'No token is ever in here. Somebody who is not in the conversation '
+            'gets `404` and cannot tell whether the call exists.'
+        )),
+    req('Join a call', 'POST', '/api/v1/calls/{{call_id}}/join/',
+        desc=(
+            'Join a live call. Returns the call and a LiveKit token, exactly as '
+            '*Start a call* does.\n\n'
+            'Joining moves a ringing call to `active` and tells everyone '
+            '(`call.accepted`).\n\n'
+            '**Idempotent.** Joining while already in the call takes no second '
+            'place and hands back a fresh token - that is what a page refresh '
+            'needs, and it does not announce an arrival a second time.\n\n'
+            '### The participant limit\n'
+            'The plan\'s `max_call_participants` is enforced here, on the '
+            'server, counted under a lock so two people cannot both take the '
+            'last place. It is the **group owner\'s** plan (for a one-to-one '
+            'call, the person who started it), the same rule as members per '
+            'group. Nothing in the request can raise it. Somebody already in '
+            'the call is never turned away for it.\n\n'
+            '| Status | When |\n'
+            '| --- | --- |\n'
+            '| `200` | in, with a token |\n'
+            '| `403` | the call is full for this plan |\n'
+            '| `404` | not a member of the conversation |\n'
+            '| `409` | the call has ended |\n'
+            '| `429` | 300 joins an hour |'
+        )),
+    req('Decline a call', 'POST', '/api/v1/calls/{{call_id}}/reject/',
+        desc=(
+            'Turn down a call that is ringing. Tells everyone '
+            '(`call.rejected`).\n\n'
+            'In a **group**, this only says "not me" - the call carries on. In '
+            'a **one-to-one** conversation there is nobody else, so declining '
+            'ends the call (`end_reason: declined`).\n\n'
+            'You cannot decline your own call (`400`) or one you are already in '
+            '(`400`). Run this as somebody other than the caller to see it '
+            'succeed.'
+        )),
+    req('Start recording', 'POST', '/api/v1/calls/{{call_id}}/recording/start/',
+        tests=capture('recording_id', 'body.data && body.data.id'),
+        desc=(
+            'Start recording the call. LiveKit\'s egress service writes the '
+            'file straight to S3; Django keeps the metadata.\n\n'
+            '**Who:** whoever started the call, or a group admin. **Plan:** the '
+            'group owner\'s plan must include call recording '
+            '(`has_call_recording` on *List plans*) - Free does not.\n\n'
+            'Everyone on the call is told (`call.recording.started`) and '
+            '`call.is_recording` becomes `true`. Only one recording can be in '
+            'progress per call.\n\n'
+            '`data.status` is `recording`. The bucket and key are never in an '
+            'API response.\n\n'
+            '| Status | When |\n'
+            '| --- | --- |\n'
+            '| `201` | recording |\n'
+            '| `403` | not the starter or an admin, or the plan has no recording |\n'
+            '| `404` | not a member |\n'
+            '| `409` | the call ended, already being recorded, or nobody has '
+            'connected yet |\n'
+            '| `429` | 30 starts an hour |\n'
+            '| `503` | recording is not configured, or LiveKit is not reachable |'
+        )),
+    req('Stop recording', 'POST', '/api/v1/calls/{{call_id}}/recording/stop/',
+        desc=(
+            'Stop the recording in progress. Same standing as starting it.\n\n'
+            'Returns at once with `status: stopping`; the file is finalised and '
+            'uploaded in the background, and LiveKit reports back by webhook, '
+            'moving it to `completed` (with `size_bytes`, `duration_seconds` '
+            'and, if the plan has a retention period, `expires_at`).\n\n'
+            'Ending the call has the same effect - a recording is finished by '
+            'LiveKit when its room closes.\n\n'
+            '`400` when nothing is being recorded.'
+        )),
+    req('List a call\'s recordings', 'GET', '/api/v1/calls/{{call_id}}/recordings/',
+        desc=(
+            'Metadata for every recording of the call, newest first. No '
+            'download links here - fetch one recording for that.\n\n'
+            '**Who can see them:** an active member who started the call, '
+            'administers the group, or was on the call. A member who was never '
+            'there gets `404`: a recording holds every participant\'s voice.'
+        )),
+    req('Get a recording', 'GET', '/api/v1/recordings/{{recording_id}}/',
+        desc=(
+            'One recording\'s metadata, and - once `status` is `completed` - a '
+            '`download_url`.\n\n'
+            'The link is signed for this request and expires in minutes '
+            '(`LIVEKIT_RECORDING_URL_TTL_SECONDS`, default 300); ask again '
+            'rather than storing it. It is `null` until the file is ready and '
+            'after it is deleted.\n\n'
+            'Same visibility as *List a call\'s recordings*: `404` for anybody '
+            'who may not see it.'
+        )),
+    req('Delete a recording', 'DELETE', '/api/v1/recordings/{{recording_id}}/',
+        desc=(
+            'Delete the recording\'s file. Whoever started the call, or a group '
+            'admin.\n\n'
+            'Returns `204`. The **record stays** (`status: deleted`, with who '
+            'and when) so a call still says it was recorded; the pointer to the '
+            'file goes with the file. If S3 cannot delete it, nothing is marked '
+            'and the request answers `503` - try again.\n\n'
+            '`409` while the recording is still in progress: stop it first. '
+            'Recordings past their plan\'s retention period are deleted '
+            'automatically each day.'
+        )),
+    req('Leave a call', 'POST', '/api/v1/calls/{{call_id}}/leave/',
+        desc=(
+            'Take yourself out of the call. Records when you left and for how '
+            'long. **The last person out ends the call** '
+            '(`end_reason: empty`, or `unanswered` if nobody ever picked up).\n\n'
+            'Leaving a call you are not in is not an error.\n\n'
+            'A client that just closes the tab never calls this. LiveKit '
+            'reports the disconnect by webhook and the place is given back '
+            'then; a call nobody ended is closed by a sweep.'
+        )),
+    req('End a call', 'POST', '/api/v1/calls/{{call_id}}/end/',
+        desc=(
+            'End the call **for everyone** and close its LiveKit room, which '
+            'disconnects anybody still in it. Tells the conversation '
+            '(`call.ended`).\n\n'
+            '**Who:** whoever started the call, or a group admin (either '
+            'person, in a one-to-one). Anybody else gets `403`.\n\n'
+            'Ending a call that has already ended is not an error - in this '
+            'collection the previous request was the last person leaving, so '
+            'this returns the ended call as it is.'
+        )),
+    req('LiveKit webhook (provider callback)', 'POST',
+        '/api/v1/calls/webhooks/livekit/', auth=False,
+        body={'event': 'room_finished', 'room': {'name': 'call-example'}},
+        desc=(
+            'How LiveKit tells Django what happened in a room - a participant '
+            'arriving or dropping out, a room closing, a recording finishing. '
+            'Django cannot see a connection, so this is what frees the place of '
+            'somebody whose laptop closed, and what completes a recording.\n\n'
+            'Authenticated by a signature, not a token: the `Authorization` '
+            'header is a JWT LiveKit makes with the API key and secret, '
+            'carrying a hash of the body. Configure LiveKit\'s `webhook:` block '
+            'with this URL and the same key. Running this request as written '
+            'returns `400` - Postman cannot mint that signature.\n\n'
+            '| Status | When |\n'
+            '| --- | --- |\n'
+            '| `200` | verified and handled, including events we ignore |\n'
+            '| `400` | missing or bad signature, or the body was changed |\n'
+            '| `500` | a verified event failed to process - LiveKit retries |'
+        )),
+]
+
+
 CLEANUP = [
     req('Delete a group', 'DELETE', '/api/v1/chat/conversations/{{conversation_id}}/',
         desc=(
@@ -869,6 +1125,23 @@ COLLECTION = {
             '4. **Create group** - stores `conversation_id` and gives the group '
             'its own phone number.\n\n'
             '## What is new since v3\n'
+            '- **`11. Calls & recordings`** - voice and video calls in any '
+            'conversation you belong to, on LiveKit. Django authorises the call, '
+            'enforces the plan\'s participant limit and hands the browser a '
+            'short-lived token; LiveKit carries the media, so **audio and video '
+            'never pass through this API**. Recording (to S3), its retention '
+            'and its permissions are here too. *Plan* objects gained '
+            '`has_calls` (one flag for audio and video together), '
+            '`max_call_participants`, `has_screen_share`, `has_call_recording` '
+            'and `call_recording_retention_days`. Calling can be switched off '
+            'per plan - see `10. Enterprise` for pricing it on a custom plan.\n'
+            '- **Call events arrive on the existing websocket**, `/ws/chat/`, '
+            'to everyone in the conversation: `call.incoming`, `call.accepted`, '
+            '`call.rejected`, `call.ended`, `call.recording.started` and '
+            '`call.recording.stopped`. Each carries `call_id`, '
+            '`conversation_id`, `user_id` (who caused it) and the whole `call`. '
+            '`call.incoming` is not sent to the person who started the call. '
+            'There is no second socket, and no token ever travels on one.\n'
             '- **`9. Billing`** - the four platform plans (Free, Premium, '
             'Business, Enterprise), Pay-As-You-Go Communication Credit '
             'packages, a billing summary, Stripe Checkout for both a plan '
@@ -931,6 +1204,9 @@ COLLECTION = {
         {'key': 'otp_code', 'value': ''},
         {'key': 'phone_otp_code', 'value': ''},
         {'key': 'credit_package_id', 'value': ''},
+        # Calls: captured by *Start a call* and *Start recording*.
+        {'key': 'call_id', 'value': ''},
+        {'key': 'recording_id', 'value': ''},
         # A browser's own push address, from `subscription.endpoint`.
         {'key': 'push_endpoint', 'value': ''},
     ],
@@ -944,7 +1220,15 @@ COLLECTION = {
         {'name': '7. SMS webhook (provider)', 'item': WEBHOOK},
         {'name': '8. Billing', 'item': BILLING},
         {'name': '9. Web push', 'item': PUSH},
-        {'name': '10. Cleanup (destructive)', 'item': CLEANUP},
+        # There is no 10 here. `10. Enterprise` exists only in the generated
+        # JSON - it was added to the collection by hand in ecb908f and 675bc3d
+        # and never ported to this builder - so 10 is left free rather than
+        # renumbering a folder this file cannot reproduce. Running this file
+        # would write a collection WITHOUT it (and without the `draft_id` and
+        # `contract_id` variables): port that folder here before regenerating
+        # the JSON, or merge into the JSON instead, as `11.` was.
+        {'name': '11. Calls & recordings', 'item': CALLS},
+        {'name': '12. Cleanup (destructive)', 'item': CLEANUP},
     ],
 }
 

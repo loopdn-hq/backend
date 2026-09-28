@@ -1,0 +1,9 @@
+{% autoescape off %}Done - we will not email you about {% if group_name %}{{ group_name }}{% else %}your conversation with {{ sender_name }}{% endif %} again.
+
+This applies to {% if group_name %}this group{% else %}this conversation{% endif %} only. If somebody else invites this
+address to a group on {{ product_name }}, you will be asked separately, and you
+can say no to that too.
+
+-- 
+{{ product_name }}{% if app_url %}: {{ app_url }}{% endif %}
+{% endautoescape %}

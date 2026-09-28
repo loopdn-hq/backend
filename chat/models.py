@@ -159,8 +159,20 @@ class Conversation(models.Model):
     # also what lets the column carry no db_default; see migration 0003.
     image = models.ImageField(upload_to=group_image_upload_to, blank=True, null=True)
 
-    # Direct conversations only: '<lower user id>:<higher user id>'.
-    direct_key = models.CharField(max_length=64, unique=True, null=True, blank=True)
+    # One-to-one conversations only, in one of two forms:
+    #
+    #     '<lower user id>:<higher user id>'   both sides have accounts
+    #     '<user id>:email:<address>'          the other side is an address
+    #
+    # It was never "two user ids" by nature - it is a canonical unique name for
+    # the pair, and an address is as good a name as an id. Holding both forms in
+    # one column is what keeps ONE rule ("every one-to-one conversation has
+    # exactly one unique key") instead of two nullable columns that can disagree.
+    # The forms cannot collide: the second segment is either digits or 'email'.
+    #
+    # 320 rather than 64 because an address may be 254 characters. Widening a
+    # varchar in Postgres is metadata-only - no table rewrite, no index rebuild.
+    direct_key = models.CharField(max_length=320, unique=True, null=True, blank=True)
 
     ## GROUP SETTINGS ##
 
@@ -273,6 +285,29 @@ class Conversation(models.Model):
         low, high = sorted([int(user_a.pk), int(user_b.pk)])
         return f'{low}:{high}'
 
+    @staticmethod
+    def direct_key_for_email(user, email):
+        """The same idea for a pair where one side is only an address.
+
+        Not order-independent, unlike the pair form, and it does not need to be:
+        an address cannot start a conversation, so there is only ever one way
+        round. The ':email:' segment names the channel rather than being a bare
+        '<id>:<address>', so a future SMS bridge is '<id>:sms:+63...' in this
+        same column under this same uniqueness rule.
+        """
+        return f'{int(user.pk)}:email:{(email or "").strip().lower()}'
+
+    @property
+    def is_external_direct(self):
+        """One-to-one, with an address on the other side instead of an account.
+
+        Read off the key rather than by looking at the participants, so it stays
+        a fact about the conversation that costs no query - which is what lets
+        `chat.delivery.conversation_reason` keep answering from the conversation
+        alone.
+        """
+        return bool(self.direct_key) and ':email:' in self.direct_key
+
     @classmethod
     def start_direct(cls, user, other):
         """Return this pair's conversation, creating it only if needed."""
@@ -299,6 +334,43 @@ class Conversation(models.Model):
         # administer, and neither person outranks the other.
         conversation.add_participant(user, role=Participant.Role.MEMBER)
         conversation.add_participant(other, role=Participant.Role.MEMBER)
+        return conversation, True
+
+    @classmethod
+    def start_direct_external(cls, user, email, *, display_name=None):
+        """This person's conversation with an address, creating it if needed.
+
+        The twin of `start_direct`, and deliberately the same shape: reached by
+        `direct_key`, idempotent, and re-activating both rows when the thread
+        already exists. Without the key lookup, messaging the same address twice
+        would open a second thread - and each would send its own consent
+        request, which is how "one ask per address, ever" quietly stops being
+        true.
+
+        The conversation is a DIRECT one. It is one-to-one, it has no name and
+        nobody administers it, so every rule already written for DIRECT is the
+        rule this wants; only the key's shape differs.
+        """
+        address = (email or '').strip().lower()
+        if not address:
+            raise ValueError('An external conversation needs an address.')
+
+        key = cls.direct_key_for_email(user, address)
+        conversation = cls.objects.filter(direct_key=key).first()
+        if conversation:
+            conversation.add_participant(user, role=Participant.Role.MEMBER)
+            conversation.add_email_participant(
+                address, display_name=display_name, added_by=user
+            )
+            return conversation, False
+
+        conversation = cls.objects.create(
+            kind=cls.Kind.DIRECT, direct_key=key, created_by=user
+        )
+        conversation.add_participant(user, role=Participant.Role.MEMBER)
+        conversation.add_email_participant(
+            address, display_name=display_name, added_by=user
+        )
         return conversation, True
 
     @classmethod
@@ -489,6 +561,31 @@ class Conversation(models.Model):
         )
         return participant
 
+    def add_email_participant(self, email, display_name=None, added_by=None):
+        """Add somebody who has no account, reachable only at this address.
+
+        The sibling of `add_phone_participant`, and consent starts PENDING for
+        the same reason: email is the only way this member can receive anything,
+        and somebody else typing their address is not them agreeing to be
+        emailed. `chat.signals.seed_channel_consent` sets that PENDING itself,
+        off `user_id is None` - there is nothing to pass here.
+
+        The name falls back to the local part, which is what `display_label`
+        would show anyway; storing it keeps the row readable in the admin and
+        satisfies the name constraint.
+        """
+        address = (email or '').strip().lower()
+        participant, _ = Participant.objects.get_or_create(
+            conversation=self,
+            email=address,
+            defaults={
+                'display_name': display_name or local_part(address) or 'Unknown',
+                'added_by': added_by,
+                'role': Participant.Role.MEMBER,
+            },
+        )
+        return participant
+
     @classmethod
     def _unused_join_code(cls, attempts=12):
         """A join code no other conversation is holding.
@@ -535,10 +632,24 @@ class Conversation(models.Model):
         Broadcast is the only thing that says no today. Membership itself is
         checked long before here - by the queryset that found the conversation
         at all.
+
+        Asked of the PARTICIPANT rather than the user, because the sender may
+        have no account: somebody who joined by texting JOIN posts through
+        `sms/inbound.py` with a membership and nothing else. `can()` would find
+        no account for them and refuse, which would silently stop inbound SMS
+        reaching the group.
+
+        A None participant is not a membership at all - a system message, or a
+        sender with no row. Those were only ever allowed outside broadcast
+        mode, and still are.
         """
-        if self.mode != self.Mode.BROADCAST:
-            return True
-        return participant is not None and participant.role == Participant.Role.ADMIN
+        from rbac.resolver import can_participant
+
+        if participant is None:
+            return self.mode != self.Mode.BROADCAST
+        return can_participant(
+            participant, 'group.message.send', conversation=self
+        )
 
     def has_participant(self, user):
         return self.active_participants.filter(user=user).exists()
@@ -547,20 +658,27 @@ class Conversation(models.Model):
         return self.active_participants.filter(phone_number=phone_number).exists()
 
     def may_add_members(self, user):
-        """Whether this person may add or invite people."""
-        if self.add_member_permission == self.MemberAddPermission.MEMBERS:
-            return self.has_participant(user)
-        return self.is_admin(user)
+        """Whether this person may add or invite people.
+
+        The rule itself lives in `rbac/policy.py` now: the role grant is the
+        floor - a member is permitted in principle - and
+        `add_member_permission` is what decides. Both must pass.
+        """
+        from rbac.resolver import can
+
+        return can(user, 'group.member.add', self)
 
     def may_edit_group(self, user):
         """Whether this person may change the name, image or description.
 
-        Never covers the policy settings - see ADMIN_ONLY_SETTINGS. A member who
-        could grant themselves permissions would make this setting pointless.
+        Never covers the policy settings - see ADMIN_ONLY_SETTINGS, which is a
+        separate feature (`group.settings.policy`) with no second layer, so no
+        setting can ever open it. A member who could grant themselves
+        permissions would make this setting pointless.
         """
-        if self.edit_group_permission == self.EditGroupPermission.MEMBERS:
-            return self.has_participant(user)
-        return self.is_admin(user)
+        from rbac.resolver import can
+
+        return can(user, 'group.settings.edit', self)
 
     def is_admin(self, user):
         return self.active_participants.filter(
@@ -571,15 +689,21 @@ class Conversation(models.Model):
         """Whether this person may pin or unpin a message here.
 
         A pin is the one thing every member sees above the thread, so in a
-        group it is an admin's call - the same standing as renaming it. There
-        is no moderator role to give it to, and no setting has been asked for.
+        group it is an admin's call - the same standing as renaming it.
 
-        A one-to-one has no admins at all, so either person may pin: refusing
-        both would make the feature unreachable in half the app.
+        The DIRECT branch stays OUTSIDE the role check, and deliberately. Both
+        sides of a one-to-one are MEMBER - there are no admins to give it to -
+        so "may I pin in a DM?" is really "am I one of the two people?", which
+        is a MEMBERSHIP question, not a role one. `rbac/policy.py` may only
+        narrow a grant, never widen it, and seeding `group.message.pin` open
+        for `member` to cover this would make the permissions matrix claim
+        members can pin, which is false in every group.
         """
+        from rbac.resolver import can
+
         if self.kind == self.Kind.DIRECT:
             return self.has_participant(user)
-        return self.is_admin(user)
+        return can(user, 'group.message.pin', self)
 
 
 class Participant(models.Model):
@@ -750,6 +874,21 @@ class Participant(models.Model):
         on_delete=models.SET_NULL,
         related_name='+',
     )
+
+    # WHEN they cleared, beside the message id above - and it exists for the
+    # one case the id cannot express: a conversation with NO messages in it.
+    #
+    # Clearing works by pointing at the newest message, so an empty
+    # conversation gave the pointer nothing to hold and the clear silently did
+    # nothing - the row came back on the next refresh, which is exactly what
+    # somebody clearing a group they have never used reports as broken.
+    #
+    # The id still decides everything once there IS a message: only the empty
+    # case reads this, and it stops mattering the moment somebody posts,
+    # because that message is newer than this timestamp. Wall clock is sound
+    # enough for that question - it is "has anything at all happened since",
+    # not an ordering of messages against each other.
+    cleared_at = models.DateTimeField(null=True, blank=True)
 
     # Tidied out of this member's own list. Theirs alone - nobody else can
     # tell, and it neither leaves the group nor stops anything being
@@ -1249,6 +1388,33 @@ class ChannelConsent(models.Model):
         on_delete=models.CASCADE,
     )
     channel = models.CharField(max_length=8, choices=Channel.choices)
+
+    # When this member was ASKED about this channel, and in exactly what words.
+    #
+    # Per channel, beside the answer they gave, because the question differs by
+    # channel and so does the date. The same person can be invited to a group
+    # by text in January and emailed about it in March; one field on Participant
+    # could only hold whichever came last, and would silently overwrite the
+    # record of the first.
+    #
+    # That matters more than tidiness: "what exactly were they agreeing to" is
+    # the question a consent complaint turns on, and the template will have
+    # changed by the time anybody asks. A wording overwritten by a later,
+    # different channel is evidence destroyed.
+    asked_at = models.DateTimeField(null=True, blank=True)
+    consent_text = models.TextField(blank=True, default='', db_default='')
+
+    # When an admin last nudged them about an unanswered invitation.
+    #
+    # Separate from `asked_at`, which is the FIRST ask and never moves - the
+    # date somebody was first put on notice is the one a complaint turns on,
+    # and a reminder must not quietly reset it.
+    #
+    # This is what the rate limit reads. A nudge is a message to somebody who
+    # has not consented, which is the traffic carriers police hardest, so it is
+    # deliberately admin-initiated rather than automatic and cannot be repeated
+    # inside NUDGE_INTERVAL.
+    reminded_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(
         max_length=10,
         choices=Status.choices,

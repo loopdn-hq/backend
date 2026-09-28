@@ -47,6 +47,19 @@ _SEPARATORS = [
     # and lost the marker.
     re.compile(r'^\s*Reply to this email to respond to the group\.\s*$', re.MULTILINE),
     re.compile(r'^\s*You are getting this because you are in .{0,200}$', re.MULTILINE),
+    # The external-conversation footers, for the same reason and with the same
+    # caveat: `-- ` is the real defence, these catch a client that reflowed it.
+    # The consent request's footer matters most - it contains the word YES, so
+    # a reply that quotes it back and says nothing else must not be read as one.
+    re.compile(r'^\s*Reply to this email to respond\.\s*$', re.MULTILINE),
+    re.compile(
+        r'^\s*You are getting this because .{0,80}messaged this address on .{0,80}$',
+        re.MULTILINE,
+    ),
+    re.compile(
+        r'^\s*You are getting this because you agreed to receive messages\s*$',
+        re.MULTILINE,
+    ),
 ]
 
 # `-- ` on its own line, the one convention that IS standard (RFC 3676 §4.3).
@@ -65,8 +78,16 @@ _QUOTE_LINE = re.compile(
     r'|_{10,}\s*'
     r'|(?:From|Sent|To|Cc|Date|Subject):\s*.*'
     r'|Reply to this email to respond to the group\.\s*'
+    r'|Reply to this email to respond\.\s*'
     r'|You are getting this because you are in .*'
+    r'|You are getting this because .*messaged this address on .*'
+    r'|You are getting this because you agreed to receive messages.*'
     r'|To stop emails from this group,.*'
+    r'|To stop, reply:.*'
+    r'|To stop these emails at any time, reply:.*'
+    r'|Reply with just the word YES .*'
+    r'|Would you like to carry on this conversation by email\?\s*'
+    r'|Wait for our confirmation before writing anything else\.\s*'
     r'|Or use this link:.*'
     r'|Other groups are not affected\.\s*'
     r')$',

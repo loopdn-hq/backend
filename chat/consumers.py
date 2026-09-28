@@ -10,6 +10,10 @@ events that are about the user rather than a conversation.
     <- {"type": "typing", "conversation_id": 1, "user_id": 2}
     <- {"type": "conversation.read", "conversation_id": 1,
         "last_read_message_id": 42}   (this account, on another device)
+    <- {"type": "call.incoming" | "call.accepted" | "call.rejected" |
+        "call.ended" | "call.recording.started" | "call.recording.stopped",
+        "call_id": 7, "conversation_id": 1, "user_id": 2, "call": {...}}
+        (sent by calls/services.py; the media itself never comes this way)
 
     -> {"type": "message.send", "conversation_id": 1, "text": "hi"}
     -> {"type": "typing", "conversation_id": 1}
@@ -213,11 +217,25 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         changes nothing about a conversation other people are also in.
         """
         from chat.models import Conversation, Participant
-        from user.blocks import blocks_between
-
+        from user.blocks import blocks_between, blocks_email
 
         if conversation.kind != Conversation.Kind.DIRECT:
             return False
+
+        # An external thread has one account in it, so there is no pair to
+        # compare - only whether that account blocked the address. Asked here
+        # as well as in `create_message` for the reason the whole method
+        # exists: the socket must refuse what the REST path refuses, or it is
+        # the door left open beside the one that was locked.
+        if conversation.is_external_direct:
+            address = (
+                Participant.objects.filter(
+                    conversation=conversation, user__isnull=True
+                )
+                .values_list('email', flat=True)
+                .first()
+            )
+            return bool(address) and blocks_email(self.user, address)
 
         other = (
             Participant.objects.filter(
@@ -235,6 +253,20 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
     async def message_new(self, event):
         await self.send_json({'type': 'message.new', 'message': event['message']})
+
+    async def conversation_consent(self, event):
+        """The far side of an external thread answered YES or NO.
+
+        Sent to the conversation group, which the sender's socket is already
+        in, so their composer unlocks or locks without a refresh. Nobody else
+        is in that group - an external thread has one account in it.
+        """
+        await self.send_json({
+            'type': 'conversation.consent',
+            'conversation_id': event['conversation_id'],
+            'participant_id': event['participant_id'],
+            'status': event['status'],
+        })
 
     async def message_updated(self, event):
         """A message already in the thread changed - edit, delete, reaction.
@@ -324,6 +356,57 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
                 'last_read_message_id': event['last_read_message_id'],
             }
         )
+
+    # -- calls --------------------------------------------------------------
+    #
+    # Sent by calls/services.py to the conversation's group. One method per
+    # frame type, because Channels routes a group event by turning its `type`
+    # into a method name - a frame with no method is dropped without a trace.
+    # They all say the same thing (something happened to this call), so they
+    # share one sender.
+
+    async def send_call_frame(self, event):
+        await self.send_json(
+            {
+                'type': event['type'],
+                'call_id': event['call_id'],
+                'conversation_id': event['conversation_id'],
+                # Who caused it. None when the system did.
+                'user_id': event.get('user_id'),
+                'call': event['call'],
+                **(
+                    {'recording_id': event['recording_id']}
+                    if 'recording_id' in event
+                    else {}
+                ),
+            }
+        )
+
+    async def call_incoming(self, event):
+        """Somebody started a call here.
+
+        Not to the person who started it: they are already in it, and a client
+        that rang for the caller's own call - on every device they have open -
+        would be broken in a way that is hard to explain.
+        """
+        if event.get('user_id') == self.user.pk:
+            return
+        await self.send_call_frame(event)
+
+    async def call_accepted(self, event):
+        await self.send_call_frame(event)
+
+    async def call_rejected(self, event):
+        await self.send_call_frame(event)
+
+    async def call_ended(self, event):
+        await self.send_call_frame(event)
+
+    async def call_recording_started(self, event):
+        await self.send_call_frame(event)
+
+    async def call_recording_stopped(self, event):
+        await self.send_call_frame(event)
 
     async def presence(self, event):
         """Somebody in this conversation came online, or went offline.

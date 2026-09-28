@@ -411,8 +411,9 @@ def _opt_in(participant):
         return InboundResult(action='ignored_unknown_sender')
 
     participant.sms_enabled = True
-    participant.consent_at = timezone.now()
-    participant.save(update_fields=['sms_enabled', 'consent_at'])
+    participant.save(update_fields=['sms_enabled'])
+    # No consent_at write here: set_channel_consent below stamps `consented_at`
+    # on the SMS consent row, which is the per-channel record.
     membership.set_channel_consent(
         participant, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
     )

@@ -51,7 +51,7 @@ def invite_to_app(inviter, email):
     """Email an invitation to Loopd'n. Returns `SENT` or `ALREADY_HERE`."""
     address = (email or '').strip().lower()
 
-    if not _within_the_cap(inviter):
+    if not consume_invite_allowance(inviter):
         raise TooManyInvites
 
     # The inviter's own view of the world, blocks and discoverability included:
@@ -83,12 +83,18 @@ def invite_to_app(inviter, email):
     return SENT
 
 
-def _within_the_cap(inviter):
-    """Whether this inviter may send one more, counting every ATTEMPT.
+def consume_invite_allowance(inviter):
+    """Whether this person may reach one more stranger, counting every ATTEMPT.
 
     Attempts rather than sends, because a silently declined invitation costs
     the sender nothing to repeat: counting only what goes out would leave the
     probe that the silence exists to stop running at full speed.
+
+    SHARED WITH THE EXTERNAL CONVERSATION PATH, and deliberately one bucket
+    rather than two. `chat/serializers.py:DirectConversationSerializer` opens a
+    thread with an address that has no account, which puts an email in front of
+    a stranger exactly as an invitation does - and two caps of twenty is a cap
+    of forty for anybody willing to use both doors.
     """
     key = f'user:invites:{inviter.pk}'
     if (cache.get(key) or 0) >= INVITES_PER_HOUR:

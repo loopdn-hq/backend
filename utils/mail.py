@@ -37,6 +37,7 @@ storage and SMS are: with `RESEND_API_KEY` unset, `send_email` renders the
 message and logs it instead of sending, so a laptop and the test suite need no
 account, no credentials and no network.
 """
+import html
 import json
 import logging
 import urllib.error
@@ -121,12 +122,21 @@ VERIFICATION_CODE = EmailTemplate(
     context_keys=('code', 'expires_in_minutes'),
 )
 
-# Somebody with no account was added to a group by their address. The link is
-# a convenience, not a credential: membership is granted by VERIFYING the
-# address, so a forwarded invitation gives the reader nothing.
+# Somebody with no account was added to a group by their address. Two ways in:
+# reply YES and take part by email, or sign up and take part in the app. The
+# link is a convenience, not a credential: membership in the app is granted by
+# VERIFYING the address, so a forwarded invitation gives the reader nothing.
+#
+# It is also the question a YES answers, so it carries a way out like every
+# other email that asks one - declared here, so an invitation without one is
+# unsendable. `can_reply` is False where inbound email is not set up, and the
+# template then offers the link alone rather than a YES that lands nowhere.
 GROUP_INVITATION = EmailTemplate(
     slug='group_invitation',
-    context_keys=('group_name', 'inviter_name', 'join_url'),
+    context_keys=(
+        'group_name', 'inviter_name', 'join_url', 'can_reply',
+        'stop_keyword', 'unsubscribe_url',
+    ),
 )
 
 # Somebody tried to start a conversation with an address that has no account.
@@ -164,6 +174,72 @@ UNSUBSCRIBED = EmailTemplate(
     context_keys=('group_name', 'app_url'),
 )
 
+# The link that lets somebody back into an account they cannot sign in to.
+# `expires_in_minutes` is declared rather than hardcoded in the template
+# because PASSWORD_RESET_TIMEOUT is the thing that decides it, and a template
+# saying thirty while the setting says ten is worse than no number at all.
+PASSWORD_RESET = EmailTemplate(
+    slug='password_reset',
+    context_keys=('reset_url', 'expires_in_minutes'),
+)
+
+# Sent AFTER the fact, on both routes a password moves by - the reset link and
+# the signed-in change. It is the only way somebody finds out about a reset
+# they did not ask for, since by then there is nothing left to refuse.
+PASSWORD_CHANGED = EmailTemplate(slug='password_changed')
+
+# --- the external one-to-one ("bridge") ------------------------------------
+#
+# One person on Loopd'n, one address that has no account. Five templates rather
+# than one because the far side has to be asked before anything else is sent,
+# and then told what happened. `body` appears on exactly TWO of them - the
+# first contact and an ordinary message - so the sender's words reach the
+# recipient there and nowhere else. The other three have no `body` variable to
+# render even if a caller passed one, which is the catalogue enforcing the rule
+# structurally rather than by review.
+
+# First contact: the sender's message AND the question, in one email (Yul's
+# call, 2026-09-19). A stranger who can see what they are being asked about is
+# far likelier to answer than one who cannot - at the cost of putting
+# user-authored text in front of somebody who has not consented, which is what
+# the per-sender cap and the one-ask-per-address rule exist to bound.
+BRIDGE_CONSENT = EmailTemplate(
+    slug='bridge_consent',
+    context_keys=('sender_name', 'body', 'stop_keyword', 'unsubscribe_url'),
+)
+
+# They replied, but not with YES or NO. Sent ONCE per address, ever - the cap
+# is a query against the delivery log, so an auto-responder terminates. No
+# `body`: it is a reminder of the instruction, not a second copy of the message.
+BRIDGE_CONSENT_NUDGE = EmailTemplate(
+    slug='bridge_consent_nudge',
+    context_keys=('sender_name', 'stop_keyword', 'unsubscribe_url'),
+)
+
+# They said YES. Tells them the rules of the thread they have just joined -
+# that replying is how they take part, and that STOP EMAILS still ends it.
+BRIDGE_ACCEPTED = EmailTemplate(
+    slug='bridge_accepted',
+    context_keys=('sender_name', 'stop_keyword', 'unsubscribe_url'),
+)
+
+# They said NO. Confirmed in the channel the request arrived on, for the reason
+# mail/optout.py gives: somebody who replies and hears nothing does not know it
+# worked, and the next thing they press is Report spam. The one template with
+# no way out in it, because they have already taken it.
+BRIDGE_DECLINED = EmailTemplate(
+    slug='bridge_declined',
+    context_keys=('sender_name', 'app_url'),
+)
+
+# Every message after consent.
+BRIDGE_MESSAGE = EmailTemplate(
+    slug='bridge_message',
+    context_keys=(
+        'sender_name', 'body', 'can_reply', 'stop_keyword', 'unsubscribe_url',
+    ),
+)
+
 # Sent after Stripe confirms a plan checkout or credit top-up checkout.
 BILLING_CHECKOUT_SUCCESS = EmailTemplate(
     slug='billing_checkout_success',
@@ -187,6 +263,13 @@ CATALOGUE = {
         APP_INVITATION,
         GROUP_MESSAGE,
         UNSUBSCRIBED,
+        PASSWORD_RESET,
+        PASSWORD_CHANGED,
+        BRIDGE_CONSENT,
+        BRIDGE_CONSENT_NUDGE,
+        BRIDGE_ACCEPTED,
+        BRIDGE_DECLINED,
+        BRIDGE_MESSAGE,
         BILLING_CHECKOUT_SUCCESS,
     )
 }
@@ -226,7 +309,15 @@ def send_templated_email(template, to, context=None, **kwargs):
 
     # Collapsed to a single line: a newline that reaches a Subject header is
     # header injection, and a trailing one from the template file is certain.
-    subject = ' '.join(render_to_string(template.subject_template, context).split())
+    #
+    # Unescaped first. The subject renders through the same autoescaping engine
+    # as the HTML part, but a header is not HTML: without this, a group called
+    # "Yul's Family" arrived as "Yul&#x27;s Family". Only the engine's own
+    # escaping is undone - a name containing a literal "&#10;" was escaped to
+    # "&amp;#10;" on the way in, so it comes back as text, never a newline.
+    subject = ' '.join(
+        html.unescape(render_to_string(template.subject_template, context)).split()
+    )
 
     return send_email(
         to=to,

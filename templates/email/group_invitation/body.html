@@ -1,28 +1,75 @@
 {% extends "email/base.html" %}
 
+{% comment %}
+Four parts, in the order somebody reads them:
+
+  1. who added you, to what          so the rest makes sense
+  2. the question, with its answers  one decision, two one-word replies
+  3. the other way in                the app, for people who prefer it
+  4. why you got this, and the exit  in the footer, where people look for it
+
+The question only appears where a reply can reach us (`can_reply`). Without
+it the email is the app invitation alone - it must not print a YES that
+lands nowhere.
+{% endcomment %}
+
 {% block title %}{{ inviter_name }} added you to {{ group_name }}{% endblock %}
 
+{% block preheader %}{% if can_reply %}Reply YES to follow along by email, or join {{ product_name }} to use the app.{% else %}Join {{ product_name }} with this email address to see the group.{% endif %}{% endblock %}
+
 {% block content %}
-<p style="margin:0 0 16px;">
-  <strong>{{ inviter_name }}</strong> added you to
-  <strong>{{ group_name }}</strong> on {{ product_name }}.
+<p style="margin:0 0 8px; font-size:20px; line-height:28px; font-weight:600;">
+  {{ inviter_name }} added you to {{ group_name }}
 </p>
-<p style="margin:0 0 24px;">
-  {{ product_name }} is where the group talks. To see it, create an account
-  with this email address.
+<p style="margin:0 0 24px; color:#52525b;">
+  {{ group_name }} is a group on {{ product_name }}.{% if can_reply %} You can
+  take part by email &mdash; no account needed.{% endif %}
+</p>
+
+{% if can_reply %}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 24px; border:1px solid #e4e4e7; border-radius:8px;">
+  <tr>
+    <td style="padding:16px 20px;">
+      <p style="margin:0 0 12px; font-weight:600;">
+        Get {{ group_name }}&rsquo;s messages by email?
+      </p>
+      <p style="margin:0 0 8px;">
+        Reply <strong>YES</strong> &mdash; messages from the group arrive here,
+        and replying to any of them posts to the group.
+      </p>
+      <p style="margin:0 0 12px;">
+        Reply <strong>NO</strong> &mdash; we won&rsquo;t email you about
+        {{ group_name }} again.
+      </p>
+      <p style="margin:0; font-size:14px; color:#52525b;">
+        Just the one word. Until you answer, nothing else is sent to you.
+      </p>
+    </td>
+  </tr>
+</table>
+
+<p style="margin:0 0 12px; font-weight:600;">Prefer the app?</p>
+{% endif %}
+<p style="margin:0 0 16px;">
+  Sign up with this email address and you&rsquo;ll be in {{ group_name }}
+  straight away.
 </p>
 <p style="margin:0 0 24px;">
   <a href="{{ join_url }}"
      style="display:inline-block; background-color:#0284c7; color:#ffffff; text-decoration:none; font-weight:600; padding:12px 24px; border-radius:8px;">
-    Join {{ group_name }}
+    Join {{ group_name }} on {{ product_name }}
   </a>
 </p>
-<p style="margin:0 0 16px; font-size:14px; color:#52525b;">
-  You will be in the group as soon as you confirm this address &mdash; it is
-  that confirmation, not this email, that lets you in. Nothing here is a
-  password or a key, so forwarding it gives nobody access.
-</p>
 <p style="margin:0; font-size:14px; color:#52525b;">
-  If you were not expecting this, you can ignore it.
+  Nothing in this email is a password or a key, so forwarding it gives nobody
+  access.
 </p>
+{% endblock %}
+
+{% block footer %}
+You&rsquo;re getting this because {{ inviter_name }} added this address to
+{{ group_name }} on {{ product_name }}. Not expecting it?
+{% if can_reply %}Reply <strong>NO</strong>{% if unsubscribe_url %} or
+<a href="{{ unsubscribe_url }}">stop these emails</a>{% endif %}.{% elif unsubscribe_url %}<a href="{{ unsubscribe_url }}">Stop these emails</a>, or just ignore this one.{% else %}Just ignore it &mdash; you are not in anything you can see until you sign up.{% endif %}
+Questions? Reach us at {{ support_address }}.
 {% endblock %}

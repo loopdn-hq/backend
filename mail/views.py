@@ -97,7 +97,18 @@ class UnsubscribeView(APIView):
 
     def _page(self, request, *, template, participant, token):
         """One response shape for every outcome. See the module docstring."""
-        group_name = participant.conversation.name if participant else ''
+        # An external thread has no name of its own, so the page would say
+        # "stop emails from ''" - the same blank the From line used to have.
+        # It is named after the person on the other side instead.
+        group_name = ''
+        if participant is not None:
+            conversation = participant.conversation
+            if conversation.is_external_direct:
+                from mail.outbound import _conversation_label
+
+                group_name = _conversation_label(conversation)
+            else:
+                group_name = conversation.name
         response = Response(
             {
                 'ok': True,

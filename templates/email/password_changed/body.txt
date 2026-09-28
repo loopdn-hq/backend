@@ -1,0 +1,13 @@
+{{ product_name }}
+
+The password on your {{ product_name }} account was just changed.
+
+If that was you, there is nothing to do.
+
+If it was not, somebody else may have access to this address or to your
+account. Reset the password straight away from the sign-in page, and if you
+cannot get in, reply to this email so we can help.
+
+Resetting a password also signs out every device that was already signed in.
+
+Questions? Reach us at {{ support_address }}.

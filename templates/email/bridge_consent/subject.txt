@@ -1,0 +1,4 @@
+{% comment %}
+Stable per bridge, never the message text: clients thread on the subject, and
+putting the body here would scatter one conversation across the inbox.
+{% endcomment %}{{ sender_name }} messaged you on {{ product_name }}

@@ -15,6 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
+from calls.livekit import CallServiceError
 from chat.membership import JoinRefused, NotAMember
 from chat.models import BlockedFromConversation, PostingNotAllowed
 from otp.models import OtpError
@@ -42,7 +43,8 @@ def api_exception_handler(exc, context):
     # Telnyx or Resend timed out or refused. The message is already written for
     # a user, and 503 says "not your fault, try again" where a 400 would blame
     # the request and a 500 would hide the reason behind "Internal server error".
-    if isinstance(exc, (SmsError, EmailError)):
+    # CallServiceError is the same again for LiveKit and the recordings bucket.
+    if isinstance(exc, (SmsError, EmailError, CallServiceError)):
         return Response(
             {'detail': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE
         )

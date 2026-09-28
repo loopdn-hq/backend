@@ -1,6 +1,7 @@
 """Tests for conversations, membership, messages and the realtime layer."""
 import shutil
 import tempfile
+from datetime import timedelta
 from unittest import mock
 
 from channels.db import database_sync_to_async
@@ -21,6 +22,7 @@ from rest_framework.test import APITestCase, APITransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from chat import delivery, membership
+from user import blocks
 from sms import inbound
 from chat.mentions import set_mentions
 from chat.models import (
@@ -31,6 +33,7 @@ from chat.models import (
     Message,
     MessageReaction,
     Participant,
+    PostingNotAllowed,
     REACTION_EMOJI,
 )
 from chat.serializers import ConversationSerializer, MessageSerializer
@@ -3574,14 +3577,62 @@ class ClearHistoryTests(EnvelopeAssertions, APITestCase):
 
     # --- refusals -----------------------------------------------------------
 
-    def test_clearing_an_empty_conversation_is_harmless(self):
+    def test_clearing_an_empty_conversation_hides_it_too(self):
+        """The case the message pointer alone could not express.
+
+        A group nobody has posted in has no newest message to point at, so the
+        clear used to write nothing at all and the row came back on the next
+        refresh - which is what somebody clearing a group they never used
+        reports as broken. `Participant.cleared_at` is what answers it.
+        """
         empty = Conversation.start_group(self.alice, name='Quiet')
 
-        self.assertSuccess(
+        body = self.assertSuccess(
             self.client.post(
                 reverse('chat:conversation-clear', args=[empty.id]), {}
             )
         )
+        self.assertTrue(body['cleared'])
+
+        listed = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        row = [r for r in rows if r['id'] == empty.id][0]
+        self.assertTrue(row['cleared'])
+
+    def test_an_emptied_conversation_comes_back_when_somebody_posts(self):
+        empty = Conversation.start_group(self.alice, name='Quiet')
+        empty.add_participant(self.bob)
+        self.client.post(
+            reverse('chat:conversation-clear', args=[empty.id]), {}
+        )
+
+        create_message(empty, self.bob, text='anybody there?')
+
+        listed = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        row = [r for r in rows if r['id'] == empty.id][0]
+        self.assertFalse(row['cleared'])
+        # And it carries only what arrived after - there was nothing before.
+        self.assertEqual(row['last_message']['text'], 'anybody there?')
+
+    def test_clearing_an_empty_conversation_hides_nothing_from_anybody_else(self):
+        empty = Conversation.start_group(self.alice, name='Quiet')
+        empty.add_participant(self.bob)
+        self.client.post(
+            reverse('chat:conversation-clear', args=[empty.id]), {}
+        )
+
+        self.client.force_authenticate(self.bob)
+        listed = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        row = [r for r in rows if r['id'] == empty.id][0]
+        self.assertFalse(row['cleared'])
 
     def test_a_non_member_cannot_clear(self):
         self.client.force_authenticate(make_user('mallory'))
@@ -5982,3 +6033,716 @@ class MentionTests(TestCase):
         )
 
         self.assertEqual(message.text, '@Bob can you bring bread')
+
+
+class ExternalConversationTests(TestCase):
+    """A one-to-one thread whose far side is an address, not an account."""
+
+    def setUp(self):
+        self.yul = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.address = 'stewart@gmail.com'
+
+    def test_it_is_a_direct_conversation_keyed_on_the_address(self):
+        conversation, created = Conversation.start_direct_external(
+            self.yul, self.address
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(conversation.kind, Conversation.Kind.DIRECT)
+        self.assertTrue(conversation.is_external_direct)
+        self.assertEqual(
+            conversation.direct_key, f'{self.yul.pk}:email:{self.address}'
+        )
+
+    def test_opening_it_twice_returns_the_same_thread(self):
+        first, _ = Conversation.start_direct_external(self.yul, self.address)
+        second, created = Conversation.start_direct_external(self.yul, self.address)
+
+        self.assertEqual(first.pk, second.pk)
+        self.assertFalse(created)
+        self.assertEqual(
+            Participant.objects.filter(conversation=first, user__isnull=True).count(),
+            1,
+        )
+
+    def test_the_address_is_normalised_so_case_cannot_fork_the_thread(self):
+        first, _ = Conversation.start_direct_external(self.yul, self.address)
+        second, _ = Conversation.start_direct_external(self.yul, '  Stewart@Gmail.com ')
+
+        self.assertEqual(first.pk, second.pk)
+
+    def test_two_senders_reaching_one_address_get_two_threads(self):
+        other = User.objects.create_user('ada', 'ada@example.com', 'x')
+
+        mine, _ = Conversation.start_direct_external(self.yul, self.address)
+        theirs, _ = Conversation.start_direct_external(other, self.address)
+
+        self.assertNotEqual(mine.pk, theirs.pk)
+
+    def test_the_far_side_starts_pending_and_is_named_by_its_local_part(self):
+        conversation, _ = Conversation.start_direct_external(self.yul, self.address)
+
+        row = Participant.objects.get(conversation=conversation, user__isnull=True)
+        self.assertEqual(row.status, Participant.Status.ACTIVE)
+        self.assertEqual(row.display_label, 'stewart')
+        self.assertEqual(
+            ChannelConsent.objects.get(
+                participant=row, channel=ChannelConsent.Channel.EMAIL
+            ).status,
+            ChannelConsent.Status.PENDING,
+        )
+
+    def test_an_account_pair_key_and_an_address_key_cannot_collide(self):
+        ada = User.objects.create_user('ada2', 'ada2@example.com', 'x')
+        pair, _ = Conversation.start_direct(self.yul, ada)
+        external, _ = Conversation.start_direct_external(self.yul, self.address)
+
+        self.assertNotEqual(pair.direct_key, external.direct_key)
+        self.assertFalse(pair.is_external_direct)
+
+
+class ExternalDeliveryRuleTests(TestCase):
+    """What the delivery ladder says about each kind of conversation."""
+
+    def setUp(self):
+        self.yul = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.ada = User.objects.create_user('ada', 'ada@example.com', 'x')
+
+    def test_a_group_is_carried_by_every_channel(self):
+        group = Conversation.start_group(self.yul, name='Family')
+
+        self.assertIsNone(delivery.conversation_reason(group))
+        self.assertIsNone(delivery.conversation_reason(group, 'email'))
+        self.assertIsNone(delivery.conversation_reason(group, 'sms'))
+
+    def test_a_conversation_between_two_accounts_is_still_carried_by_none(self):
+        """The regression DirectMessagesAreNotEmailedTests guards."""
+        pair, _ = Conversation.start_direct(self.yul, self.ada)
+
+        self.assertIsNotNone(delivery.conversation_reason(pair))
+        self.assertIsNotNone(delivery.conversation_reason(pair, 'email'))
+        self.assertIsNotNone(delivery.conversation_reason(pair, 'sms'))
+
+    def test_an_external_thread_is_carried_by_email_and_not_by_sms(self):
+        external, _ = Conversation.start_direct_external(self.yul, 'x@gmail.com')
+
+        self.assertIsNone(delivery.conversation_reason(external, 'email'))
+        self.assertIsNotNone(delivery.conversation_reason(external, 'sms'))
+
+
+class ExternalBlockTests(TestCase):
+    """Blocking the address on the far side, in both directions."""
+
+    def setUp(self):
+        self.yul = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.address = 'stewart@gmail.com'
+        self.conversation, _ = Conversation.start_direct_external(
+            self.yul, self.address
+        )
+        self.row = Participant.objects.get(
+            conversation=self.conversation, user__isnull=True
+        )
+
+    def test_the_blocker_is_told_plainly(self):
+        blocks.block(self.yul, email=self.address)
+
+        with self.assertRaises(PostingNotAllowed) as caught:
+            create_message(self.conversation, self.yul, text='hello')
+
+        self.assertIn('You blocked', str(caught.exception))
+
+    def test_the_blocked_address_is_told_nothing(self):
+        blocks.block(self.yul, email=self.address)
+
+        with self.assertRaises(PostingNotAllowed) as caught:
+            create_message(
+                self.conversation, None, text='hello', participant=self.row
+            )
+
+        self.assertNotIn('blocked', str(caught.exception).lower())
+
+    def test_an_unblocked_address_may_still_post(self):
+        message = create_message(
+            self.conversation, None, text='hello', participant=self.row
+        )
+
+        self.assertEqual(message.text, 'hello')
+
+
+class ExternalRekeyTests(TestCase):
+    """What happens when the address finally gets an account."""
+
+    def setUp(self):
+        self.yul = User.objects.create_user('yul', 'yul@example.com', 'x')
+        self.address = 'stewart@gmail.com'
+        self.conversation, _ = Conversation.start_direct_external(
+            self.yul, self.address
+        )
+
+    def sign_up_stewart(self):
+        stewart = User.objects.create_user('stewart', self.address, 'x')
+        stewart.profile.email_verified = True
+        stewart.profile.save(update_fields=['email_verified'])
+        membership.claim_email_invitations(stewart)
+        return stewart
+
+    def test_the_thread_is_refiled_under_the_pair(self):
+        stewart = self.sign_up_stewart()
+
+        self.conversation.refresh_from_db()
+        self.assertFalse(self.conversation.is_external_direct)
+        self.assertEqual(
+            self.conversation.direct_key,
+            Conversation.direct_key_for(self.yul, stewart),
+        )
+
+    def test_start_direct_then_finds_the_thread_they_already_have(self):
+        """Without the re-key this opens a SECOND thread - the whole point."""
+        stewart = self.sign_up_stewart()
+
+        found, created = Conversation.start_direct(self.yul, stewart)
+
+        self.assertFalse(created)
+        self.assertEqual(found.pk, self.conversation.pk)
+
+    def test_a_thread_that_already_exists_absorbs_the_bridge(self):
+        stewart = User.objects.create_user('stewart', 'other@example.com', 'x')
+        pair, _ = Conversation.start_direct(self.yul, stewart)
+        create_message(self.conversation, self.yul, text='sent by email')
+
+        stewart.email = self.address
+        stewart.save(update_fields=['email'])
+        stewart.profile.email_verified = True
+        stewart.profile.save(update_fields=['email_verified'])
+        membership.claim_email_invitations(stewart)
+
+        self.assertFalse(
+            Conversation.objects.filter(pk=self.conversation.pk).exists()
+        )
+        self.assertEqual(pair.messages.filter(text='sent by email').count(), 1)
+
+
+class ConsentIsRecordedPerChannelTests(TestCase):
+    """The question, and the answer, belong to one channel each.
+
+    This is the whole point of moving the record off Participant. The same
+    person can be invited to a group by text in January and emailed about it in
+    March. Those are two different questions, asked on two different days, in
+    two different sets of words - and a single pair of fields on the member
+    could only ever hold whichever came last.
+
+    Silently overwriting the first is worse than never recording it, because
+    nothing afterwards shows that anything was lost.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.participant = self.group.add_phone_participant(
+            '+639170000002', display_name='Mom'
+        )
+
+    def test_two_channels_keep_two_separate_questions(self):
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.SMS, 'Reply YES to get texts.'
+        )
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.EMAIL, 'Reply YES to get emails.'
+        )
+
+        sms = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+        email = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.EMAIL
+        )
+
+        self.assertEqual(sms.consent_text, 'Reply YES to get texts.')
+        self.assertEqual(email.consent_text, 'Reply YES to get emails.')
+        self.assertIsNotNone(sms.asked_at)
+        self.assertIsNotNone(email.asked_at)
+
+    def test_asking_again_does_not_rewrite_the_first_question(self):
+        # A resend is the same question. The date that matters is when they
+        # were first put on notice, and the wording is what they first saw.
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.SMS, 'The original wording.'
+        )
+        first = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.SMS, 'A later, different wording.'
+        )
+
+        again = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+        self.assertEqual(again.consent_text, 'The original wording.')
+        self.assertEqual(again.asked_at, first.asked_at)
+
+    def test_answering_one_channel_leaves_the_other_alone(self):
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.SMS, 'Reply YES to get texts.'
+        )
+        membership.record_consent_asked(
+            self.participant, ChannelConsent.Channel.EMAIL, 'Reply YES to get emails.'
+        )
+
+        membership.set_channel_consent(
+            self.participant,
+            ChannelConsent.Channel.SMS,
+            ChannelConsent.Status.OPTED_IN,
+        )
+
+        sms = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+        email = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.EMAIL
+        )
+        self.assertEqual(sms.status, ChannelConsent.Status.OPTED_IN)
+        self.assertIsNotNone(sms.consented_at)
+        # Agreeing to texts is not agreeing to email.
+        self.assertEqual(email.status, ChannelConsent.Status.PENDING)
+        self.assertIsNone(email.consented_at)
+
+    def test_a_texted_yes_records_when_they_agreed(self):
+        # The gap that started this: YES set the status and nothing recorded
+        # the date, because the only writer was a member-wide field the SMS
+        # path never touched.
+        membership.set_channel_consent(
+            self.participant,
+            ChannelConsent.Channel.SMS,
+            ChannelConsent.Status.OPTED_IN,
+        )
+
+        sms = ChannelConsent.objects.get(
+            participant=self.participant, channel=ChannelConsent.Channel.SMS
+        )
+        self.assertIsNotNone(sms.consented_at)
+
+
+class NudgeAnUnansweredInvitationTests(EnvelopeAssertions, APITestCase):
+    """Asking again, once a day at most, and never after an answer.
+
+    A nudge is a message to somebody who has NOT consented, which is the
+    traffic carriers police hardest. So it is admin-triggered rather than
+    automatic, rate limited, and refused outright for anybody who has already
+    said no - a second ask after a NO is the behaviour that loses a campaign.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        membership.record_consent_asked(
+            self.row, ChannelConsent.Channel.SMS, 'You were added. Reply YES.'
+        )
+        self.client.force_authenticate(self.alice)
+        self.url = reverse('chat:conversation-nudge', args=[self.group.pk])
+
+    def send(self, channel=ChannelConsent.Channel.SMS, participant=None):
+        return self.client.post(
+            self.url,
+            {'participant': (participant or self.row).pk, 'channel': channel},
+            format='json',
+        )
+
+    def age_the_ask(self, hours):
+        consent = ChannelConsent.objects.get(
+            participant=self.row, channel=ChannelConsent.Channel.SMS
+        )
+        consent.asked_at = timezone.now() - timedelta(hours=hours)
+        consent.save(update_fields=['asked_at'])
+        return consent
+
+    # --- the rate limit ---------------------------------------------------
+
+    def test_a_fresh_invitation_cannot_be_nudged_yet(self):
+        self.assertFailure(self.send())
+
+    def test_a_day_later_it_can(self):
+        self.age_the_ask(25)
+
+        self.assertSuccess(self.send())
+
+        consent = ChannelConsent.objects.get(
+            participant=self.row, channel=ChannelConsent.Channel.SMS
+        )
+        self.assertIsNotNone(consent.reminded_at)
+
+    def test_nudging_twice_in_a_day_is_refused(self):
+        self.age_the_ask(25)
+        self.assertSuccess(self.send())
+
+        # The clock restarts from the nudge, not from the original ask.
+        self.assertFailure(self.send())
+
+    def test_the_first_ask_is_never_rewritten(self):
+        consent = self.age_the_ask(25)
+        first_asked, first_text = consent.asked_at, consent.consent_text
+
+        self.send()
+
+        consent.refresh_from_db()
+        self.assertEqual(consent.asked_at, first_asked)
+        self.assertEqual(consent.consent_text, first_text)
+
+    # --- never after an answer -------------------------------------------
+
+    def test_somebody_who_said_no_is_never_nudged(self):
+        self.age_the_ask(72)
+        membership.set_channel_consent(
+            self.row, ChannelConsent.Channel.SMS, ChannelConsent.Status.DECLINED
+        )
+
+        self.assertFailure(self.send())
+
+    def test_somebody_who_sent_stop_is_never_nudged(self):
+        self.age_the_ask(72)
+        membership.set_channel_consent(
+            self.row, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_OUT
+        )
+
+        self.assertFailure(self.send())
+
+    def test_somebody_who_already_agreed_is_not_nudged(self):
+        self.age_the_ask(72)
+        membership.set_channel_consent(
+            self.row, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
+        )
+
+        self.assertFailure(self.send())
+
+    # --- who may do it ----------------------------------------------------
+
+    def test_an_ordinary_member_cannot_nudge(self):
+        self.age_the_ask(25)
+        self.client.force_authenticate(self.bob)
+
+        self.assertFailure(self.send())
+
+    # --- per channel ------------------------------------------------------
+
+    def test_nudging_sms_does_not_touch_the_email_row(self):
+        membership.record_consent_asked(
+            self.row, ChannelConsent.Channel.EMAIL, 'Emailed invitation.'
+        )
+        self.age_the_ask(25)
+
+        self.send(ChannelConsent.Channel.SMS)
+
+        email = ChannelConsent.objects.get(
+            participant=self.row, channel=ChannelConsent.Channel.EMAIL
+        )
+        self.assertIsNone(email.reminded_at)
+
+    # --- only a text goes out -----------------------------------------------
+
+    def test_a_nudge_about_email_is_refused_and_texts_nobody(self):
+        # The row 0028 left behind: the text invitation's date on the email row,
+        # old enough to pass the floor. This used to go out as a TEXT, past the
+        # SMS row's own floor.
+        email = membership.record_consent_asked(
+            self.row, ChannelConsent.Channel.EMAIL, 'You were added. Reply YES.'
+        )
+        email.asked_at = timezone.now() - timedelta(hours=25)
+        email.save(update_fields=['asked_at'])
+
+        with mock.patch('sms.outbound.send_notice') as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.assertFailure(self.send(ChannelConsent.Channel.EMAIL))
+
+        sent.assert_not_called()
+        email.refresh_from_db()
+        self.assertIsNone(email.reminded_at)
+
+    def test_somebody_with_no_number_is_not_nudged(self):
+        # Otherwise the reminder is stamped and reported sent, and send_notice
+        # quietly finds nobody to text.
+        row = self.group.add_email_participant('mom@example.com')
+        sms = membership.record_consent_asked(
+            row, ChannelConsent.Channel.SMS, 'You were added. Reply YES.'
+        )
+        sms.asked_at = timezone.now() - timedelta(hours=25)
+        sms.save(update_fields=['asked_at'])
+
+        with mock.patch('sms.outbound.send_notice') as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.assertFailure(self.send(participant=row))
+
+        sent.assert_not_called()
+        sms.refresh_from_db()
+        self.assertIsNone(sms.reminded_at)
+
+
+class ChannelsOnTheMemberListTests(EnvelopeAssertions, APITestCase):
+    """What the member list says about each channel, and when to offer a nudge.
+
+    A member without an account is reachable at the one number or address they
+    were added with. Their row for any other channel is seeded PENDING, and the
+    0028 backfill copied the invitation date onto it - so somebody added by
+    phone read "Email pending" and was offered a nudge about email.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.client.force_authenticate(self.alice)
+        self.url = reverse('chat:conversation-participants', args=[self.group.pk])
+
+    def channels_of(self, participant):
+        data = self.assertSuccess(self.client.get(self.url))
+        row = next(r for r in data['results'] if r['id'] == participant.pk)
+        return row['channels']
+
+    def asked_a_day_ago(self, participant):
+        """Every row asked, and past the floor - what 0028 left behind."""
+        ChannelConsent.objects.filter(participant=participant).update(
+            asked_at=timezone.now() - timedelta(hours=25)
+        )
+
+    def test_somebody_added_by_phone_has_no_email_channel(self):
+        row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        self.asked_a_day_ago(row)
+
+        channels = self.channels_of(row)
+
+        self.assertIsNone(channels['email']['status'])
+        self.assertIsNone(channels['email']['asked_at'])
+        self.assertFalse(channels['email']['can_nudge'])
+        self.assertEqual(channels['sms']['status'], 'pending')
+
+    def test_somebody_added_by_email_has_no_text_channel(self):
+        row = self.group.add_email_participant('mom@example.com')
+        self.asked_a_day_ago(row)
+
+        channels = self.channels_of(row)
+
+        self.assertIsNone(channels['sms']['status'])
+        self.assertFalse(channels['sms']['can_nudge'])
+        self.assertEqual(channels['email']['status'], 'pending')
+
+    def test_an_unanswered_text_invitation_offers_a_nudge(self):
+        row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        self.asked_a_day_ago(row)
+
+        self.assertTrue(self.channels_of(row)['sms']['can_nudge'])
+
+    def test_the_daily_floor_is_left_to_the_endpoint(self):
+        # Offered straight after the invitation: pressing it is what says how
+        # long to wait, which an absent entry could not.
+        row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        membership.record_consent_asked(
+            row, ChannelConsent.Channel.SMS, 'You were added. Reply YES.'
+        )
+
+        self.assertTrue(self.channels_of(row)['sms']['can_nudge'])
+
+    def test_no_nudge_once_they_have_answered(self):
+        row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        self.asked_a_day_ago(row)
+        membership.set_channel_consent(
+            row, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
+        )
+
+        self.assertFalse(self.channels_of(row)['sms']['can_nudge'])
+
+    def test_an_email_invitation_offers_no_nudge(self):
+        # There is only a text reminder, and a nudge "about email" would send it.
+        row = self.group.add_email_participant('mom@example.com')
+        self.asked_a_day_ago(row)
+
+        self.assertFalse(self.channels_of(row)['email']['can_nudge'])
+
+
+class SearchMembersToAddTests(EnvelopeAssertions, APITestCase):
+    """Finding people to add, and saying what adding each one would do.
+
+    It must find nobody the rest of the product would not: username by prefix,
+    email only exact and verified, nobody hidden by Settings > Privacy, neither
+    side of a block. And a "ready" must not be contradicted by the add.
+    """
+
+    def setUp(self):
+        cache.clear()
+        from user.models import PrivacySettings
+
+        self.audience = PrivacySettings.Audience
+        self.alice = make_user('alice', '+639170000001')
+        self.carol = make_user('carol', '+639170000003')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.carol)
+        self.client.force_authenticate(self.alice)
+        self.url = reverse('chat:conversation-search-members', args=[self.group.pk])
+
+    def search(self, term):
+        return self.assertSuccess(self.client.get(self.url, {'q': term}))
+
+    def usernames(self, data):
+        return [row['user']['username'] for row in data['results']]
+
+    def verified(self, user):
+        user.profile.email_verified = True
+        user.profile.save(update_fields=['email_verified'])
+        return user
+
+    # --- by username ---------------------------------------------------------
+
+    def test_a_username_prefix_lists_matching_people_with_their_picture(self):
+        make_user('bobby')
+        make_user('bob')
+
+        data = self.search('bo')
+
+        self.assertEqual(self.usernames(data), ['bob', 'bobby'])
+        self.assertIn('avatar_url', data['results'][0]['user']['profile'])
+        self.assertEqual(data['results'][0]['status'], 'ready')
+
+    def test_at_most_five_are_shown_and_it_says_there_are_more(self):
+        for i in range(7):
+            make_user(f'sam{i}')
+
+        data = self.search('sam')
+
+        self.assertEqual(len(data['results']), 5)
+        self.assertTrue(data['has_more'])
+
+    def test_one_letter_finds_nobody(self):
+        make_user('bob')
+
+        self.assertEqual(self.search('b')['results'], [])
+
+    def test_the_searcher_is_not_offered_to_themselves(self):
+        self.assertEqual(self.usernames(self.search('ali')), [])
+
+    # --- by email ------------------------------------------------------------
+
+    def test_an_exact_verified_email_finds_the_account(self):
+        self.verified(make_user('bob'))
+
+        data = self.search('BOB@example.com')
+
+        self.assertEqual(self.usernames(data), ['bob'])
+        self.assertFalse(data['has_more'])
+
+    def test_part_of_an_email_finds_nobody(self):
+        # A prefix over addresses would walk the directory a letter at a time.
+        self.verified(make_user('bob'))
+
+        self.assertEqual(self.search('bob@exam')['results'], [])
+
+    def test_an_unverified_email_finds_nobody(self):
+        make_user('bob')
+
+        self.assertEqual(self.search('bob@example.com')['results'], [])
+
+    def test_an_email_hidden_in_privacy_finds_nobody(self):
+        bob = self.verified(make_user('bob'))
+        set_privacy(bob, discoverable_by_email=False)
+
+        self.assertEqual(self.search('bob@example.com')['results'], [])
+
+    # --- an address with no account ---------------------------------------------
+
+    def test_a_whole_address_nobody_has_is_offered_for_an_invitation(self):
+        data = self.search('Ana@Example.com')
+
+        self.assertEqual(data['results'], [])
+        self.assertEqual(
+            data['invite'],
+            {'email': 'ana@example.com', 'status': 'ready', 'detail': ''},
+        )
+
+    def test_part_of_an_address_is_not_offered(self):
+        self.assertIsNone(self.search('ana@exam')['invite'])
+
+    def test_an_address_already_invited_says_so(self):
+        self.group.add_email_participant('ana@example.com')
+
+        self.assertEqual(
+            self.search('ana@example.com')['invite']['status'], 'already_member'
+        )
+
+    def test_a_hidden_account_is_offered_like_any_other_address(self):
+        # Anything else would say an account is there. The invitation itself
+        # then adds and emails nobody.
+        bob = self.verified(make_user('bob'))
+        set_privacy(bob, discoverable_by_email=False)
+
+        self.assertEqual(self.search('bob@example.com')['invite']['status'], 'ready')
+
+    def test_your_own_address_is_you_not_an_invitation(self):
+        self.verified(self.alice)
+
+        data = self.search('alice@example.com')
+
+        self.assertEqual(self.usernames(data), ['alice'])
+        self.assertEqual(data['results'][0]['status'], 'already_member')
+        self.assertIsNone(data['invite'])
+
+    # --- what adding them would do ---------------------------------------------
+
+    def test_somebody_already_here_says_so(self):
+        data = self.search('car')
+
+        self.assertEqual(data['results'][0]['status'], 'already_member')
+
+    def test_somebody_who_refuses_group_adds_says_so(self):
+        bob = make_user('bob')
+        set_privacy(bob, group_adds_from=self.audience.NOBODY)
+
+        row = self.search('bob')['results'][0]
+
+        self.assertEqual(row['status'], 'refused')
+        self.assertIn('@bob', row['detail'])
+
+    def test_somebody_blocked_from_this_loop_says_so(self):
+        bob = make_user('bob')
+        row = self.group.add_participant(bob)
+        row.status = Participant.Status.BLOCKED
+        row.save(update_fields=['status'])
+
+        self.assertEqual(self.search('bob')['results'][0]['status'], 'refused')
+
+    def test_either_side_of_a_block_is_not_found(self):
+        bob = make_user('bob')
+        blocks.block(bob, user=self.alice)
+
+        self.assertEqual(self.search('bob')['results'], [])
+
+    def test_a_ready_result_can_be_added(self):
+        make_user('bob')
+        self.assertEqual(self.search('bob')['results'][0]['status'], 'ready')
+
+        added = self.client.post(
+            reverse('chat:conversation-members', args=[self.group.pk]),
+            {'members': ['bob']},
+            format='json',
+        )
+
+        self.assertSuccess(added)
+
+    # --- who may ask -----------------------------------------------------------
+
+    def test_it_adds_nobody(self):
+        make_user('bob')
+        before = self.group.active_participants.count()
+
+        self.search('bob')
+
+        self.assertEqual(self.group.active_participants.count(), before)
+
+    def test_an_ordinary_member_cannot_search_for_people_to_add(self):
+        self.client.force_authenticate(self.carol)
+
+        self.assertFailure(
+            self.client.get(self.url, {'q': 'bob'}), status.HTTP_403_FORBIDDEN
+        )
