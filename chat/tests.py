@@ -6442,3 +6442,122 @@ class NudgeAnUnansweredInvitationTests(EnvelopeAssertions, APITestCase):
             participant=self.row, channel=ChannelConsent.Channel.EMAIL
         )
         self.assertIsNone(email.reminded_at)
+
+    # --- only a text goes out -----------------------------------------------
+
+    def test_a_nudge_about_email_is_refused_and_texts_nobody(self):
+        # The row 0028 left behind: the text invitation's date on the email row,
+        # old enough to pass the floor. This used to go out as a TEXT, past the
+        # SMS row's own floor.
+        email = membership.record_consent_asked(
+            self.row, ChannelConsent.Channel.EMAIL, 'You were added. Reply YES.'
+        )
+        email.asked_at = timezone.now() - timedelta(hours=25)
+        email.save(update_fields=['asked_at'])
+
+        with mock.patch('sms.outbound.send_notice') as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.assertFailure(self.send(ChannelConsent.Channel.EMAIL))
+
+        sent.assert_not_called()
+        email.refresh_from_db()
+        self.assertIsNone(email.reminded_at)
+
+    def test_somebody_with_no_number_is_not_nudged(self):
+        # Otherwise the reminder is stamped and reported sent, and send_notice
+        # quietly finds nobody to text.
+        row = self.group.add_email_participant('mom@example.com')
+        sms = membership.record_consent_asked(
+            row, ChannelConsent.Channel.SMS, 'You were added. Reply YES.'
+        )
+        sms.asked_at = timezone.now() - timedelta(hours=25)
+        sms.save(update_fields=['asked_at'])
+
+        with mock.patch('sms.outbound.send_notice') as sent:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.assertFailure(self.send(participant=row))
+
+        sent.assert_not_called()
+        sms.refresh_from_db()
+        self.assertIsNone(sms.reminded_at)
+
+
+class ChannelsOnTheMemberListTests(EnvelopeAssertions, APITestCase):
+    """What the member list says about each channel, and when to offer a nudge.
+
+    A member without an account is reachable at the one number or address they
+    were added with. Their row for any other channel is seeded PENDING, and the
+    0028 backfill copied the invitation date onto it - so somebody added by
+    phone read "Email pending" and was offered a nudge about email.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.client.force_authenticate(self.alice)
+        self.url = reverse('chat:conversation-participants', args=[self.group.pk])
+
+    def channels_of(self, participant):
+        data = self.assertSuccess(self.client.get(self.url))
+        row = next(r for r in data['results'] if r['id'] == participant.pk)
+        return row['channels']
+
+    def asked_a_day_ago(self, participant):
+        """Every row asked, and past the floor - what 0028 left behind."""
+        ChannelConsent.objects.filter(participant=participant).update(
+            asked_at=timezone.now() - timedelta(hours=25)
+        )
+
+    def test_somebody_added_by_phone_has_no_email_channel(self):
+        row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        self.asked_a_day_ago(row)
+
+        channels = self.channels_of(row)
+
+        self.assertIsNone(channels['email']['status'])
+        self.assertIsNone(channels['email']['asked_at'])
+        self.assertFalse(channels['email']['can_nudge'])
+        self.assertEqual(channels['sms']['status'], 'pending')
+
+    def test_somebody_added_by_email_has_no_text_channel(self):
+        row = self.group.add_email_participant('mom@example.com')
+        self.asked_a_day_ago(row)
+
+        channels = self.channels_of(row)
+
+        self.assertIsNone(channels['sms']['status'])
+        self.assertFalse(channels['sms']['can_nudge'])
+        self.assertEqual(channels['email']['status'], 'pending')
+
+    def test_an_unanswered_text_invitation_offers_a_nudge(self):
+        row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        self.asked_a_day_ago(row)
+
+        self.assertTrue(self.channels_of(row)['sms']['can_nudge'])
+
+    def test_the_daily_floor_is_left_to_the_endpoint(self):
+        # Offered straight after the invitation: pressing it is what says how
+        # long to wait, which an absent entry could not.
+        row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        membership.record_consent_asked(
+            row, ChannelConsent.Channel.SMS, 'You were added. Reply YES.'
+        )
+
+        self.assertTrue(self.channels_of(row)['sms']['can_nudge'])
+
+    def test_no_nudge_once_they_have_answered(self):
+        row = self.group.add_phone_participant('+639170000003', display_name='Mom')
+        self.asked_a_day_ago(row)
+        membership.set_channel_consent(
+            row, ChannelConsent.Channel.SMS, ChannelConsent.Status.OPTED_IN
+        )
+
+        self.assertFalse(self.channels_of(row)['sms']['can_nudge'])
+
+    def test_an_email_invitation_offers_no_nudge(self):
+        # There is only a text reminder, and a nudge "about email" would send it.
+        row = self.group.add_email_participant('mom@example.com')
+        self.asked_a_day_ago(row)
+
+        self.assertFalse(self.channels_of(row)['email']['can_nudge'])

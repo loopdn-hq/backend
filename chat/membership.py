@@ -586,14 +586,46 @@ def nudge_refusal(participant, channel, *, now=None):
     again is the behaviour that gets a campaign shut down, so both are refused
     here rather than left to the caller to remember.
     """
-    now = now or timezone.now()
-
-    if participant.status != Participant.Status.ACTIVE:
-        return 'They are not an active member.'
-
     consent = ChannelConsent.objects.filter(
         participant=participant, channel=channel
     ).first()
+    refusal = standing_nudge_refusal(participant, channel, consent)
+    if refusal is not None:
+        return refusal
+
+    # PENDING and asked, from here. `asked_at` is the first ask and never
+    # moves, so the clock runs from whichever contact was most recent.
+    now = now or timezone.now()
+    waited = now - max(filter(None, (consent.asked_at, consent.reminded_at)))
+    if waited < NUDGE_INTERVAL:
+        remaining = NUDGE_INTERVAL - waited
+        hours = int(remaining.total_seconds() // 3600) + 1
+        return f'Asked recently. You can nudge again in about {hours}h.'
+
+    return None
+
+
+def standing_nudge_refusal(participant, channel, consent):
+    """Why `nudge_refusal` would refuse however long they waited, or None.
+
+    Everything but the once-a-day floor, which is the one refusal that passes
+    by itself. Split out so the member list can say whether to offer a nudge at
+    all without walking these rules again - a client that re-derived them from
+    `status` is how a member added by phone came to be offered a nudge about
+    email.
+
+    `consent` is this member's row for `channel`, or None. Passed in rather
+    than fetched, so a page of members reads the prefetch.
+    """
+    if participant.status != Participant.Status.ACTIVE:
+        return 'They are not an active member.'
+
+    # The reminder is a text: `nudge` sends it through send_notice, in SMS
+    # wording. Nudging "about email" would text them instead, and past the SMS
+    # row's floor, since the floor is kept per channel.
+    if channel != ChannelConsent.Channel.SMS:
+        return 'Only a text invitation can be sent again for now.'
+
     if consent is None:
         return 'They have never been asked about this channel.'
 
@@ -604,17 +636,15 @@ def nudge_refusal(participant, channel, *, now=None):
     if consent.status == ChannelConsent.Status.OPTED_OUT:
         return 'They opted out. Only they can undo that.'
 
-    # PENDING from here. `asked_at` is the first ask and never moves, so the
-    # clock runs from whichever contact was most recent.
-    last = max(filter(None, (consent.asked_at, consent.reminded_at)), default=None)
-    if last is None:
+    if consent.asked_at is None and consent.reminded_at is None:
         return 'Nothing has been sent to them yet.'
 
-    waited = now - last
-    if waited < NUDGE_INTERVAL:
-        remaining = NUDGE_INTERVAL - waited
-        hours = int(remaining.total_seconds() // 3600) + 1
-        return f'Asked recently. You can nudge again in about {hours}h.'
+    # Without a number, send_notice finds nobody to text and returns quietly -
+    # after `nudge` has stamped the reminder and told the admin it went out.
+    from sms.outbound import number_for
+
+    if not number_for(participant):
+        return 'They have no number to text.'
 
     return None
 

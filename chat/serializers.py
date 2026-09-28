@@ -479,6 +479,20 @@ class MessageReactionSerializer(serializers.Serializer):
     emoji = serializers.ChoiceField(choices=[(e, e) for e in REACTION_EMOJI])
 
 
+def _reachable(participant, channel):
+    """Whether this member has anywhere to receive `channel` at all.
+
+    Only a member without an account is ruled out: they were added at one
+    number or one address, and that is all there is. An account holder is left
+    to their own answer, which they gave in settings.
+    """
+    if participant.is_phone_only:
+        return channel != ChannelConsent.Channel.EMAIL
+    if participant.is_email_only:
+        return channel == ChannelConsent.Channel.EMAIL
+    return True
+
+
 class ParticipantSerializer(serializers.ModelSerializer):
     # Null for a member who has no account. `display_label` is the field a
     # client should render: it works for both kinds and needs no branching.
@@ -544,6 +558,12 @@ class ParticipantSerializer(serializers.ModelSerializer):
         needs to distinguish from "they said no", and a missing key reads as
         neither.
 
+        So does a channel a member without an account cannot be reached on,
+        whatever its row says. Every such member is seeded a PENDING row per
+        channel, and the 0028 backfill copied their invitation date onto all of
+        them - which had somebody added by phone reading "Email pending" for an
+        address that does not exist.
+
         Reads the prefetch - see the queryset in ConversationViewSet.participants,
         without which this is one query per channel per member.
         """
@@ -551,7 +571,9 @@ class ParticipantSerializer(serializers.ModelSerializer):
 
         record = {}
         for channel, _label in ChannelConsent.Channel.choices:
-            consent = consent_for(obj, channel)
+            consent = (
+                consent_for(obj, channel) if _reachable(obj, channel) else None
+            )
             record[channel] = {
                 'status': consent.status if consent else None,
                 # The decision the fan-out actually makes, so a client does not
@@ -560,6 +582,12 @@ class ParticipantSerializer(serializers.ModelSerializer):
                 'asked_at': consent.asked_at if consent else None,
                 'consented_at': consent.consented_at if consent else None,
                 'opted_out_at': consent.opted_out_at if consent else None,
+                # Whether to offer a nudge here at all, for the same reason.
+                # The once-a-day floor is left to the endpoint: its refusal
+                # says how long to wait, which a missing entry could not.
+                'can_nudge': membership.standing_nudge_refusal(
+                    obj, channel, consent
+                ) is None,
             }
         return record
 
