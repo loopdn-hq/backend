@@ -6,7 +6,7 @@ class CampaignEligibility(models.Model):
     """Whether one campaign may appear in one group - and if not, why not.
 
     Written by selection (plan 1b), so "why did my campaign not run there" has
-    an answer for Loopd'n staff. Never shown to an advertiser: which groups a
+    an answer for Loopd'n staff. Never shown to a company: which groups a
     campaign could reach is exactly the membership disclosure §13 forbids, so
     there is deliberately no viewset for this table.
 
@@ -15,7 +15,7 @@ class CampaignEligibility(models.Model):
     """
 
     campaign = models.ForeignKey(
-        'ads.Campaign', on_delete=models.CASCADE, related_name='eligibility'
+        'commercial.Campaign', on_delete=models.CASCADE, related_name='eligibility'
     )
     # related_name='+': chat/ has no business walking from a group to the
     # campaigns that may target it.
@@ -33,7 +33,7 @@ class CampaignEligibility(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=['campaign', 'conversation'],
-                name='ads_campaigneligibility_unique_campaign_conversation',
+                name='commercial_campaigneligibility_unique_campaign_conversation',
             ),
         ]
 

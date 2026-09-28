@@ -29,10 +29,10 @@ is not what stops them". Read the two together, which is what `can()` does.
 
 WHAT IS DELIBERATELY ABSENT
 ---------------------------
-No advertising or advertiser-org features. The `ads` app does not exist, so a
-row for `ads.campaign.publish` would be a promise with no check behind it -
-exactly what the catalogue-in-code rule exists to prevent. They arrive with
-that app (step 9 and `docs/advertising_integration_plan.md`).
+No advertising or company-scope features. The `commercial` app has its models
+but no API yet, so a row for `ads.campaign.publish` would be a promise with no
+check behind it - exactly what the catalogue-in-code rule exists to prevent.
+They arrive with that API (step 9 and `docs/advertising_integration_plan.md`).
 
 `ads.access` is the one exception, and only because it gates a menu item this
 plan itself adds in step 6. When the campaign features do arrive, `commercial`

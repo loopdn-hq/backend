@@ -21,17 +21,17 @@ class AdConversion(models.Model):
         GROUP_JOIN = 'group_join', 'Group join'
 
     campaign = models.ForeignKey(
-        'ads.Campaign', on_delete=models.PROTECT, related_name='conversions'
+        'commercial.Campaign', on_delete=models.PROTECT, related_name='conversions'
     )
     impression = models.ForeignKey(
-        'ads.AdImpression',
+        'commercial.AdImpression',
         on_delete=models.SET_NULL,
         related_name='conversions',
         null=True,
         blank=True,
     )
     kind = models.CharField(max_length=16, choices=Kind.choices)
-    # What the advertiser says the result was worth, when they say.
+    # What the company says the result was worth, when they say.
     value_cents = models.PositiveIntegerField(null=True, blank=True)
     # When it happened, which can be earlier than when a webhook told us.
     occurred_at = models.DateTimeField(default=timezone.now)
@@ -39,7 +39,7 @@ class AdConversion(models.Model):
     class Meta:
         ordering = ['-occurred_at']
         indexes = [
-            models.Index(fields=['campaign', 'kind'], name='ads_conversion_campaign_idx'),
+            models.Index(fields=['campaign', 'kind'], name='commercial_conversion_idx'),
         ]
 
     def __str__(self):

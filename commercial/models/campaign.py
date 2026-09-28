@@ -3,7 +3,7 @@ from django.db.models import F, Q
 
 
 class Campaign(models.Model):
-    """One ad campaign: what the advertiser wants, what it may spend, and when.
+    """One ad campaign: what the company wants, what it may spend, and when.
 
     An *ad* campaign. Comments in chat/ use "campaign" for a carrier's A2P/10DLC
     registration, which is a different thing entirely: qualify the word in
@@ -11,7 +11,7 @@ class Campaign(models.Model):
 
     Selection (plan 1b) reads `status`, the dates and the budget; it never runs
     a campaign whose status is not `running`, so every way of stopping one -
-    the advertiser, a reviewer, an empty balance - is a status change.
+    the company, a reviewer, an empty balance - is a status change.
     """
 
     class Objective(models.TextChoices):
@@ -30,7 +30,7 @@ class Campaign(models.Model):
         # Passed review, waiting for `starts_at`.
         APPROVED = 'approved', 'Approved'
         RUNNING = 'running', 'Running'
-        # Stopped by the advertiser, by Loopd'n, or by running out of money.
+        # Stopped by the company, by Loopd'n, or by running out of money.
         PAUSED = 'paused', 'Paused'
         ENDED = 'ended', 'Ended'
 
@@ -40,8 +40,8 @@ class Campaign(models.Model):
         # Spend as fast as the frequency caps allow.
         ACCELERATED = 'accelerated', 'As fast as possible'
 
-    advertiser = models.ForeignKey(
-        'ads.Advertiser', on_delete=models.CASCADE, related_name='campaigns'
+    company = models.ForeignKey(
+        'commercial.Company', on_delete=models.CASCADE, related_name='campaigns'
     )
     name = models.CharField(max_length=120)
     objective = models.CharField(max_length=16, choices=Objective.choices)
@@ -74,14 +74,14 @@ class Campaign(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=Q(total_budget_cents__gt=0),
-                name='ads_campaign_has_a_budget',
+                name='commercial_campaign_has_a_budget',
             ),
             models.CheckConstraint(
                 condition=(
                     Q(daily_budget_cents__isnull=True)
                     | Q(daily_budget_cents__lte=F('total_budget_cents'))
                 ),
-                name='ads_campaign_daily_within_total',
+                name='commercial_campaign_daily_within_total',
             ),
             models.CheckConstraint(
                 condition=(
@@ -89,12 +89,12 @@ class Campaign(models.Model):
                     | Q(ends_at__isnull=True)
                     | Q(ends_at__gt=F('starts_at'))
                 ),
-                name='ads_campaign_ends_after_it_starts',
+                name='commercial_campaign_ends_after_it_starts',
             ),
         ]
         indexes = [
             # Selection's question: what is running and not yet over.
-            models.Index(fields=['status', 'ends_at'], name='ads_campaign_status_idx'),
+            models.Index(fields=['status', 'ends_at'], name='commercial_campaign_status_idx'),
         ]
 
     def __str__(self):

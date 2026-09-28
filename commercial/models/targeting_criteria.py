@@ -13,7 +13,7 @@ class TargetingCriteria(models.Model):
     """
 
     campaign = models.OneToOneField(
-        'ads.Campaign', on_delete=models.CASCADE, related_name='targeting'
+        'commercial.Campaign', on_delete=models.CASCADE, related_name='targeting'
     )
     categories = models.ManyToManyField(
         'chat.GroupCategory', blank=True, related_name='+'
@@ -35,7 +35,7 @@ class TargetingCriteria(models.Model):
                     | Q(max_group_size__isnull=True)
                     | Q(max_group_size__gte=F('min_group_size'))
                 ),
-                name='ads_targetingcriteria_min_within_max',
+                name='commercial_targetingcriteria_min_within_max',
             ),
         ]
 

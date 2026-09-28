@@ -3,12 +3,14 @@ from django.db import models
 from django.db.models import Q
 
 
-class Advertiser(models.Model):
+class Company(models.Model):
     """A business that buys ads - not the person who signed in to buy them.
 
-    One person can run several (two shops, an agency with clients), and later
-    several people will manage one (docs/rbac_plan.md, step 9), so campaigns
-    belong here and never to a User. Suspending an advertiser stops its ads and
+    The product plan (§11-§13) calls this "the advertiser"; here it is a
+    company, the word the commercial dashboard shows. One person can run
+    several (two shops, an agency with clients), and later several people will
+    manage one (docs/rbac_plan.md, step 9), so campaigns belong here and never
+    to a User. Suspending a company stops its ads and
     touches nothing else its owner does: `user.is_active` would lock them out of
     their family group as well.
 
@@ -33,7 +35,7 @@ class Advertiser(models.Model):
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
-        related_name='advertisers',
+        related_name='companies',
     )
     # What a sponsored message is labelled with: "Sponsored · Joe's Pizza".
     name = models.CharField(max_length=120)
@@ -62,17 +64,17 @@ class Advertiser(models.Model):
         ordering = ['name']
         constraints = [
             # The ledger says how the balance got here; this is the backstop
-            # that stops a bug ever spending money the advertiser does not have.
+            # that stops a bug ever spending money the company does not have.
             models.CheckConstraint(
                 condition=Q(balance_cents__gte=0),
-                name='ads_advertiser_balance_non_negative',
+                name='commercial_company_balance_non_negative',
             ),
-            # Two advertisers on one Stripe customer would pay for each other's
+            # Two companies on one Stripe customer would pay for each other's
             # campaigns. Blank means "no customer yet" and may repeat.
             models.UniqueConstraint(
                 fields=['stripe_customer_id'],
                 condition=~Q(stripe_customer_id=''),
-                name='ads_advertiser_unique_stripe_customer',
+                name='commercial_company_unique_stripe_customer',
             ),
         ]
 

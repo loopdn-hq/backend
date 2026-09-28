@@ -204,9 +204,10 @@ INSTALLED_APPS = [
     # Voice and video calls. Django authorises and records; LiveKit carries the
     # media - see calls/livekit.py.
     'calls',
-    # Sponsored messages and the businesses that buy them. Models only so far -
-    # nothing reads these tables yet; see docs/advertising_integration_plan.md.
-    'ads',
+    # What a commercial user does: companies, campaigns, their money and results.
+    # Models only so far - nothing reads these tables yet; see
+    # docs/advertising_integration_plan.md and docs/commercial_rename_plan.md.
+    'commercial',
 ]
 
 MIDDLEWARE = [

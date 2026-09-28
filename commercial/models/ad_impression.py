@@ -9,7 +9,7 @@ class AdImpression(models.Model):
     because SMS has no render event. It is the unit reach and delivered are
     counted in (plan 2a), and the unit a per-impression price is charged on.
 
-    `participant` must never reach an advertiser-facing serializer. It is the
+    `participant` must never reach a company-facing serializer. It is the
     join from commercial data to a person; reports only aggregate over it.
 
     The links into chat are SET_NULL - not CASCADE, and not PROTECT. A group is
@@ -27,7 +27,7 @@ class AdImpression(models.Model):
         ADS_SMS = 'ads_sms', 'Sponsored SMS'
 
     creative = models.ForeignKey(
-        'ads.Creative', on_delete=models.PROTECT, related_name='impressions'
+        'commercial.Creative', on_delete=models.PROTECT, related_name='impressions'
     )
     conversation = models.ForeignKey(
         'chat.Conversation',
@@ -70,11 +70,11 @@ class AdImpression(models.Model):
             # collide, so this cannot fail on history.
             models.UniqueConstraint(
                 fields=['message', 'participant', 'channel'],
-                name='ads_adimpression_once_per_member_per_channel',
+                name='commercial_adimpression_once_per_member_per_channel',
             ),
         ]
         indexes = [
-            models.Index(fields=['creative', 'created_at'], name='ads_impression_creative_idx'),
+            models.Index(fields=['creative', 'created_at'], name='commercial_impression_idx'),
         ]
 
     def __str__(self):

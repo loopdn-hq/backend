@@ -8,7 +8,7 @@ from django.db import migrations
 
 
 def seed(apps, schema_editor):
-    AdSettings = apps.get_model('ads', 'AdSettings')
+    AdSettings = apps.get_model('commercial', 'AdSettings')
     AdSettings.objects.get_or_create(
         singleton=True,
         defaults={'serving_enabled': False, 'note': 'Off until ads are deliberately switched on.'},
@@ -22,7 +22,7 @@ def unseed(apps, schema_editor):
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('ads', '0001_initial'),
+        ('commercial', '0001_initial'),
     ]
 
     operations = [

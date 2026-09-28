@@ -26,7 +26,7 @@ def roles_for_axis(axis):
         return set(UserRole.Role.values)
     if axis == Feature.Axis.CONVERSATION:
         return set(Participant.Role.values)
-    # The advertiser org's roles, defined in the matrix before the app exists
+    # A company's roles, defined in the matrix before its API exists
     # so the scope does not need revisiting when it arrives. See step 9.
     return {'owner', 'manager', 'analyst'}
 

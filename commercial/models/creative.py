@@ -11,18 +11,18 @@ def creative_image_upload_to(instance, filename):
     Same reasoning as `user.models.avatar_upload_to`: the uploaded filename is
     attacker-controlled and collides constantly, so only the suffix survives.
 
-    `promote/`, not `ads/`: ad blockers match URLs containing `/ads/`, and this
-    path ends up in the image URL an advertiser previews their own ad through.
+    `commercial/`, not `ads/`: ad blockers match URLs containing `/ads/`, and
+    this path ends up in the image URL a company previews its own ad through.
     """
     suffix = Path(filename).suffix.lower() or '.jpg'
-    return f'promote/media/{uuid.uuid4().hex}{suffix}'
+    return f'commercial/media/{uuid.uuid4().hex}{suffix}'
 
 
 class Creative(models.Model):
     """What a sponsored message actually says and shows.
 
     Only `approved` creatives are ever selected, and that is a queryset filter
-    in ads/services.py rather than a check anybody can forget (plan, Stage 4).
+    in commercial/services.py rather than a check anybody can forget (plan, Stage 4).
 
     A call or text CTA carries no number of its own. It uses the campaign's
     tracking number (plan 2c), so no creative can route a response around the
@@ -44,7 +44,7 @@ class Creative(models.Model):
         REJECTED = 'rejected', 'Rejected'
 
     campaign = models.ForeignKey(
-        'ads.Campaign', on_delete=models.CASCADE, related_name='creatives'
+        'commercial.Campaign', on_delete=models.CASCADE, related_name='creatives'
     )
     headline = models.CharField(max_length=80)
     body = models.CharField(max_length=500)
@@ -77,11 +77,11 @@ class Creative(models.Model):
                     Q(cta_kind__in=['call', 'text'], cta_target='')
                     | (Q(cta_kind__in=['link', 'group_join']) & ~Q(cta_target=''))
                 ),
-                name='ads_creative_cta_target_matches_kind',
+                name='commercial_creative_cta_target_matches_kind',
             ),
         ]
         indexes = [
-            models.Index(fields=['campaign', 'status'], name='ads_creative_status_idx'),
+            models.Index(fields=['campaign', 'status'], name='commercial_creative_status_idx'),
         ]
 
     def __str__(self):

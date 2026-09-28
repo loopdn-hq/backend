@@ -2,7 +2,7 @@
 
 One resolver per axis, and the axis is chosen by the SUBJECT passed to `can()`:
 no subject means the account axis, a Conversation means the conversation axis.
-Adding the advertiser axis later is one function and one entry in `RESOLVERS` -
+Adding the company axis later is one function and one entry in `RESOLVERS` -
 which is the return on separating the axes at all.
 
 Every resolver returns a SET of role names, not one role. The account axis is

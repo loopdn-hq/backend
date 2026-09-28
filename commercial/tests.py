@@ -1,4 +1,4 @@
-"""The ads models, before anything uses them.
+"""The commercial app's models, before anything uses them.
 
 There is no service yet, so these hold the schema to what
 docs/advertising_integration_plan.md promises of it: the money cannot go wrong,
@@ -12,12 +12,12 @@ from django.db.models import ProtectedError
 from django.test import TestCase
 from django.utils import timezone
 
-from ads.models import (
+from commercial.models import (
     AdImpression,
     AdSettings,
     AdTransaction,
-    Advertiser,
     Campaign,
+    Company,
     Creative,
     TargetingCriteria,
 )
@@ -31,9 +31,9 @@ class AdsTestCase(TestCase):
     def setUp(self):
         cache.clear()
         self.owner = User.objects.create_user(username='joe', password='pw')
-        self.advertiser = Advertiser.objects.create(owner=self.owner, name="Joe's Pizza")
+        self.company = Company.objects.create(owner=self.owner, name="Joe's Pizza")
         self.campaign = Campaign.objects.create(
-            advertiser=self.advertiser,
+            company=self.company,
             name='Lunch deal',
             objective=Campaign.Objective.CALL,
             total_budget_cents=100_000,
@@ -94,26 +94,26 @@ class AdSettingsTests(TestCase):
 
 class MoneyTests(AdsTestCase):
     def test_a_balance_cannot_go_negative(self):
-        self.advertiser.balance_cents = -1
-        self.assertRefused(self.advertiser.save)
+        self.company.balance_cents = -1
+        self.assertRefused(self.company.save)
 
-    def test_two_advertisers_cannot_share_a_stripe_customer(self):
-        self.advertiser.stripe_customer_id = 'cus_123'
-        self.advertiser.save()
+    def test_two_companies_cannot_share_a_stripe_customer(self):
+        self.company.stripe_customer_id = 'cus_123'
+        self.company.save()
         self.assertRefused(
-            lambda: Advertiser.objects.create(
+            lambda: Company.objects.create(
                 owner=self.owner, name='Second shop', stripe_customer_id='cus_123'
             )
         )
 
-    def test_advertisers_with_no_stripe_customer_yet_do_not_collide(self):
-        Advertiser.objects.create(owner=self.owner, name='Second shop')
-        Advertiser.objects.create(owner=self.owner, name='Third shop')
+    def test_companies_with_no_stripe_customer_yet_do_not_collide(self):
+        Company.objects.create(owner=self.owner, name='Second shop')
+        Company.objects.create(owner=self.owner, name='Third shop')
 
     def test_a_purchase_must_add_money(self):
         self.assertRefused(
             lambda: AdTransaction.objects.create(
-                advertiser=self.advertiser,
+                company=self.company,
                 kind=AdTransaction.Kind.CREDIT_PURCHASE,
                 amount_cents=-500,
                 balance_after_cents=0,
@@ -123,7 +123,7 @@ class MoneyTests(AdsTestCase):
     def test_spending_must_say_which_campaign_spent_it(self):
         self.assertRefused(
             lambda: AdTransaction.objects.create(
-                advertiser=self.advertiser,
+                company=self.company,
                 kind=AdTransaction.Kind.USAGE_DEBIT,
                 amount_cents=-500,
                 balance_after_cents=0,
@@ -134,7 +134,7 @@ class MoneyTests(AdsTestCase):
         """A Stripe webhook retried after it was handled must not pay out twice."""
         def credit():
             AdTransaction.objects.create(
-                advertiser=self.advertiser,
+                company=self.company,
                 kind=AdTransaction.Kind.CREDIT_PURCHASE,
                 amount_cents=5_000,
                 balance_after_cents=5_000,
@@ -146,7 +146,7 @@ class MoneyTests(AdsTestCase):
 
     def test_a_campaign_that_has_spent_cannot_be_deleted(self):
         AdTransaction.objects.create(
-            advertiser=self.advertiser,
+            company=self.company,
             campaign=self.campaign,
             kind=AdTransaction.Kind.USAGE_DEBIT,
             amount_cents=-500,
@@ -203,7 +203,7 @@ class ImpressionTests(AdsTestCase):
         )
 
     def test_a_member_is_counted_once_per_message_per_channel(self):
-        """A retried serve must not bill the advertiser twice for one delivery."""
+        """A retried serve must not bill the company twice for one delivery."""
         self.impression()
         self.assertRefused(self.impression)
 

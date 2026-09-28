@@ -121,8 +121,9 @@ class Feature(models.Model):
         ACCOUNT = 'account', 'Account'
         # What they may do inside one conversation.
         CONVERSATION = 'conversation', 'Conversation'
-        # What they may do to one advertiser's campaigns.
-        ADVERTISER = 'advertiser', 'Advertiser'
+        # What they may do to one company's campaigns (a commercial.Company).
+        # Was `advertiser` until rbac/0009.
+        COMPANY = 'company', 'Company'
 
     key = models.CharField(max_length=64, unique=True)
     label = models.CharField(max_length=128)
@@ -168,7 +169,7 @@ class RoleFeature(models.Model):
 
     `role` is a plain CharField rather than a FK: roles live in three different
     places depending on the axis - `UserRole.Role` for account,
-    `chat.Participant.Role` for conversation, and the advertiser org's own
+    `chat.Participant.Role` for conversation, and a company's own
     roles later - and a FK could only point at one of them. `Feature.axis` says
     which vocabulary this row's `role` is drawn from.
     """

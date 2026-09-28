@@ -8,12 +8,12 @@ class AdClick(models.Model):
     not enough to identify anybody.
 
     A `suspected_scanner` hit is recorded rather than dropped. A scanner that
-    opens every URL in a text must not bill the advertiser for a click, but the
+    opens every URL in a text must not bill the company for a click, but the
     count of them is how anybody notices a carrier has started scanning.
     """
 
     impression = models.ForeignKey(
-        'ads.AdImpression', on_delete=models.CASCADE, related_name='clicks'
+        'commercial.AdImpression', on_delete=models.CASCADE, related_name='clicks'
     )
     clicked_at = models.DateTimeField(auto_now_add=True)
     ip_hash = models.CharField(max_length=64, blank=True, default='', db_default='')
@@ -24,7 +24,7 @@ class AdClick(models.Model):
         ordering = ['-clicked_at']
         indexes = [
             # The dedupe lookup: this impression, from this address, recently.
-            models.Index(fields=['impression', 'ip_hash'], name='ads_click_dedupe_idx'),
+            models.Index(fields=['impression', 'ip_hash'], name='commercial_click_dedupe_idx'),
         ]
 
     def __str__(self):
