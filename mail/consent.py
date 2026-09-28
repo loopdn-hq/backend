@@ -127,8 +127,10 @@ def _send(participant, template, what):
     recorded - so a provider outage must not turn a decision that has been
     made into an exception thrown back at an inbound webhook.
     """
-    from mail.outbound import _conversation_label, address_for, from_header
-    from mail.tokens import unsubscribe_url
+    from mail.outbound import (
+        _conversation_label, _headers_for, address_for, from_header,
+    )
+    from mail.tokens import reply_address, unsubscribe_url
     from mail import commands
 
     address = address_for(participant)
@@ -136,17 +138,29 @@ def _send(participant, template, what):
         return
 
     conversation = participant.conversation
+    stop_url = unsubscribe_url(participant)
     try:
         send_templated_email(
             template,
             to=address,
             context={
                 'sender_name': _conversation_label(conversation),
+                # Set for a group, so the three answers can talk about the
+                # group rather than "your conversation with" a group's name.
+                'group_name': (
+                    None if conversation.is_external_direct else conversation.name
+                ),
                 'stop_keyword': commands.KEYWORD,
-                'unsubscribe_url': unsubscribe_url(participant),
+                'unsubscribe_url': stop_url,
                 'app_url': settings.FRONTEND_URL,
             },
             from_email=from_header(conversation),
+            # The membership's own reply address. Without it a reply went to
+            # the From address, which takes no mail - so a YES sent in answer
+            # to the reminder that asks for one was lost, and after YES,
+            # "reply to these emails" pointed at nowhere.
+            reply_to=reply_address(participant),
+            headers=_headers_for(conversation, stop_url),
         )
     except EmailError:
         logger.warning(

@@ -1315,30 +1315,70 @@ def _email_invitation(conversation, participant, by):
     An invitation that cannot be sent must not undo a group that is already
     committed - and this runs in an on_commit callback, where an exception
     becomes a 500 on a request that already succeeded.
+
+    TWO WAYS IN, ONE EMAIL. Reply YES and the group's messages arrive by email,
+    where replying posts to the group - no account needed. Or sign up with this
+    address and they are in the app. The first only exists where replies can
+    reach us: with no reply domain there is nothing to reply TO, and the email
+    offers the link alone rather than a YES that lands nowhere.
+
+    It is a consent request, so it carries what the first contact of the
+    one-to-one bridge carries: a reply address that names this membership, the
+    unsubscribe link and its one-click header, and a record of exactly what
+    they were asked - stamped only once the send succeeded, since a question
+    that never arrived was not asked.
     """
+    from django.template.loader import render_to_string
+
+    from mail import commands
+    from mail.outbound import _headers_for, from_header
+    from mail.tokens import reply_address, unsubscribe_url
     from utils.mail import GROUP_INVITATION, EmailError, send_templated_email
 
-    inviter = getattr(getattr(by, 'profile', None), 'display_label', None)
     address = participant.email
     if not address:
         return
+
+    inviter = getattr(getattr(by, 'profile', None), 'display_label', None)
+    reply_to = reply_address(participant)
+    stop_url = unsubscribe_url(participant)
+    context = {
+        'group_name': conversation.name,
+        'inviter_name': inviter or 'Somebody',
+        # Deliberately not a token. Membership in the app is granted by
+        # verifying the address, so this only needs to carry them to the
+        # right form with the right address in it.
+        'join_url': f'{settings.FRONTEND_URL}/signup?email={quote(address)}',
+        'can_reply': bool(reply_to),
+        'stop_keyword': commands.KEYWORD,
+        'unsubscribe_url': stop_url,
+        'product_name': settings.EMAIL_PRODUCT_NAME,
+        'support_address': settings.EMAIL_SUPPORT_ADDRESS,
+    }
 
     try:
         send_templated_email(
             GROUP_INVITATION,
             to=address,
-            context={
-                'group_name': conversation.name,
-                'inviter_name': inviter or 'Somebody',
-                # Deliberately not a token. Membership is granted by verifying
-                # the address, so this only needs to carry them to the right
-                # form with the right address in it.
-                'join_url': f'{settings.FRONTEND_URL}/signup?email={quote(address)}',
-            },
+            context=context,
+            from_email=from_header(conversation),
+            reply_to=reply_to,
+            headers=_headers_for(conversation, stop_url),
         )
     except EmailError:
         logger.exception(
             'Could not email the invitation for conversation %s', conversation.pk
+        )
+        return
+
+    if reply_to:
+        # The plain-text part, word for word: "what exactly were they asked"
+        # is the question a complaint turns on, and the template will have
+        # changed by the time anybody asks it.
+        record_consent_asked(
+            participant,
+            ChannelConsent.Channel.EMAIL,
+            render_to_string(GROUP_INVITATION.text_template, context).strip(),
         )
 
 

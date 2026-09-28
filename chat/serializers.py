@@ -1473,9 +1473,28 @@ class GroupSettingsSerializer(serializers.ModelSerializer):
 
 
 class AddMembersSerializer(serializers.Serializer):
-    """Add people to a group by username or phone number."""
+    """Add people to a group by username or phone number, or invite by email.
 
-    members = serializers.ListField(child=serializers.CharField(), allow_empty=False)
+    `invite_email` is for addresses with no account behind them, and goes
+    through `membership.invite_by_email` exactly as it does when a group is
+    created: a row against the address, and an invitation that asks them to
+    reply YES or sign up. An address that turns out to be an account's is
+    added outright, and one whose owner hid it is silently skipped - see there.
+    """
+
+    members = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
+    # Capped, because every entry is an email to a stranger.
+    invite_email = serializers.ListField(
+        child=serializers.EmailField(), required=False, default=list,
+        max_length=20,
+    )
+
+    def validate(self, attrs):
+        if not attrs.get('members') and not attrs.get('invite_email'):
+            raise serializers.ValidationError('Name at least one person to add.')
+        return attrs
 
     def validate_members(self, values):
         # `exclude=None`, so `find_user` does NOT drop a blocked pair here.
@@ -1521,6 +1540,10 @@ class AddMembersSerializer(serializers.Serializer):
         """
         conversation = self.context['conversation']
         users = self.validated_data['members']
+        addresses = sorted({
+            address.strip().lower()
+            for address in self.validated_data['invite_email']
+        })
 
         # add_participant is idempotent, so re-adding an existing member is
         # a no-op rather than an error - but they should not be told they
@@ -1528,13 +1551,30 @@ class AddMembersSerializer(serializers.Serializer):
         added = [
             user for user in users if not conversation.has_participant(user)
         ]
+        # Re-inviting an address already in the group re-sends its invitation
+        # and adds nobody, so it does not count against the plan.
+        already_invited = set(
+            Participant.objects.filter(
+                conversation=conversation,
+                email__in=addresses,
+                status=Participant.Status.ACTIVE,
+            ).values_list('email', flat=True)
+        )
+        new_invites = [a for a in addresses if a not in already_invited]
 
-        if added:
+        if added or new_invites:
             from billing.limits import check_can_add_members
-            check_can_add_members(conversation, len(added))
+            check_can_add_members(conversation, len(added) + len(new_invites))
 
         for user in added:
             conversation.add_participant(user)
+
+        # Inside the same transaction, so a refused address undoes the whole
+        # add rather than leaving half of it done - the rule above. The emails
+        # themselves go out on commit, so a rollback sends none of them.
+        adder = getattr(self.context.get('request'), 'user', None)
+        for address in addresses:
+            membership.invite_by_email(conversation, address, adder)
 
         if added:
             announce_added_to_conversation(conversation, added)
@@ -1578,6 +1618,140 @@ def resolve_members(identifiers, exclude=None):
             f'No user found for: {", ".join(unknown)}.'
         )
     return users
+
+
+# How many people the add-members search shows at once. Enough to pick from
+# after a couple of letters; past that the answer is to keep typing, not to
+# scroll a directory inside a dialog.
+MEMBER_SEARCH_LIMIT = 5
+
+
+def member_candidates(conversation, term, adder, context=None):
+    """People `adder` could add to `conversation`, from what they typed.
+
+    Returns (results, has_more, invite). Each result is the person as anybody may see
+    them - name, handle, picture - with what adding them would do:
+
+        ready           the add would go through
+        already_member  in this Loop already, and re-adding is a no-op
+        refused         the add would be refused, and `detail` says why
+
+    Found the ways the rest of the product finds people, and no further:
+
+        a username      by prefix, as `search_users` does
+        an email        exact and verified only, as `find_user` does. A
+                        prefix over addresses would let anybody walk the
+                        directory a letter at a time, so a half-typed address
+                        finds nobody.
+        a number        exact and verified only, as `search_users` does
+
+    Both obey Settings > Privacy and leave out either side of a block, so
+    nobody can be found here who could not already be found by the search box,
+    or added by typing their username, address or number.
+
+    Every check the add endpoint makes is made here, in the same order, so a
+    "ready" is not contradicted a moment later by the add.
+
+    `invite` is set when a whole address found nobody: the address, offered for
+    an email invitation, with the same status and detail a person gets.
+    """
+    from user.lookups import search_users
+
+    term = (term or '').strip()
+    invite = None
+    if '@' in term:
+        user = find_user(term, exclude=adder)
+        if user is None and _is_own_address(adder, term):
+            # Their own address. Already here - not somebody to invite.
+            user = adder
+        users, has_more = ([user] if user else []), False
+        if user is None:
+            invite = _email_invite_offer(conversation, term)
+    else:
+        found = list(search_users(term, exclude=adder)[:MEMBER_SEARCH_LIMIT + 1])
+        users = found[:MEMBER_SEARCH_LIMIT]
+        has_more = len(found) > MEMBER_SEARCH_LIMIT
+
+    # One query for where every candidate stands in this Loop, rather than one
+    # each - the page is small, but it is re-asked on every pause in typing.
+    # From the table, not `conversation.participants`: the viewset prefetches
+    # that as ACTIVE rows only, and a filter on it inherits the prefetch, so a
+    # blocked row would never be seen.
+    standing = dict(
+        Participant.objects.filter(
+            conversation=conversation, user__in=users
+        ).values_list('user_id', 'status')
+    )
+
+    results = []
+    for user in users:
+        status, detail = _candidate_status(user, standing.get(user.pk), adder)
+        results.append({
+            'user': PublicUserSerializer(user, context=context or {}).data,
+            'status': status,
+            'detail': detail,
+        })
+    return results, has_more, invite
+
+
+def _is_own_address(adder, term):
+    address = (getattr(adder, 'email', '') or '').strip().lower()
+    return bool(address) and address == term.strip().lower()
+
+
+def _email_invite_offer(conversation, term):
+    """An address nobody could be found at, as something to invite, or None.
+
+    Offered for an address that belongs to a hidden account too, and that is
+    deliberate: saying otherwise would say an account is there. Inviting one
+    does nothing - `invite_by_email` adds nobody and emails nobody - which is
+    the same answer the rest of the product gives.
+    """
+    from django.core.exceptions import ValidationError as DjangoValidationError
+    from django.core.validators import validate_email
+
+    address = term.strip().lower()
+    try:
+        validate_email(address)
+    except DjangoValidationError:
+        return None
+
+    row = Participant.objects.filter(
+        conversation=conversation, email__iexact=address, user__isnull=True
+    ).first()
+    status, detail = 'ready', ''
+    if row is not None and row.status == Participant.Status.ACTIVE:
+        status, detail = 'already_member', 'Already invited to this Loop.'
+    elif row is not None and row.status == Participant.Status.BLOCKED:
+        status, detail = 'refused', 'Blocked from this Loop.'
+    return {'email': address, 'status': status, 'detail': detail}
+
+
+def _candidate_status(user, standing, adder):
+    """What adding `user` would do, as (status, detail).
+
+    `standing` is their Participant status in this Loop, or None.
+    """
+    if standing == Participant.Status.ACTIVE:
+        return 'already_member', 'Already in this Loop.'
+
+    # `add_participant` refuses this row whatever anybody else allows. The
+    # admin looking is the kind of person who put it there, so saying so
+    # reveals nothing to them.
+    if standing == Participant.Status.BLOCKED:
+        return 'refused', 'Blocked from this Loop.'
+
+    try:
+        membership._refuse_blocked_invite(adder, user)
+    except membership.JoinRefused as refusal:
+        # The add endpoint's own generic wording, so nothing here tells a
+        # block apart from any other refusal.
+        return 'refused', str(refusal)
+
+    if not privacy.allows_group_add(user, adder):
+        return 'refused', privacy.group_add_refusal([user])
+
+    return 'ready', ''
 
 
 class JoinGroupSerializer(serializers.Serializer):

@@ -37,6 +37,7 @@ storage and SMS are: with `RESEND_API_KEY` unset, `send_email` renders the
 message and logs it instead of sending, so a laptop and the test suite need no
 account, no credentials and no network.
 """
+import html
 import json
 import logging
 import urllib.error
@@ -121,12 +122,21 @@ VERIFICATION_CODE = EmailTemplate(
     context_keys=('code', 'expires_in_minutes'),
 )
 
-# Somebody with no account was added to a group by their address. The link is
-# a convenience, not a credential: membership is granted by VERIFYING the
-# address, so a forwarded invitation gives the reader nothing.
+# Somebody with no account was added to a group by their address. Two ways in:
+# reply YES and take part by email, or sign up and take part in the app. The
+# link is a convenience, not a credential: membership in the app is granted by
+# VERIFYING the address, so a forwarded invitation gives the reader nothing.
+#
+# It is also the question a YES answers, so it carries a way out like every
+# other email that asks one - declared here, so an invitation without one is
+# unsendable. `can_reply` is False where inbound email is not set up, and the
+# template then offers the link alone rather than a YES that lands nowhere.
 GROUP_INVITATION = EmailTemplate(
     slug='group_invitation',
-    context_keys=('group_name', 'inviter_name', 'join_url'),
+    context_keys=(
+        'group_name', 'inviter_name', 'join_url', 'can_reply',
+        'stop_keyword', 'unsubscribe_url',
+    ),
 )
 
 # Somebody tried to start a conversation with an address that has no account.
@@ -299,7 +309,15 @@ def send_templated_email(template, to, context=None, **kwargs):
 
     # Collapsed to a single line: a newline that reaches a Subject header is
     # header injection, and a trailing one from the template file is certain.
-    subject = ' '.join(render_to_string(template.subject_template, context).split())
+    #
+    # Unescaped first. The subject renders through the same autoescaping engine
+    # as the HTML part, but a header is not HTML: without this, a group called
+    # "Yul's Family" arrived as "Yul&#x27;s Family". Only the engine's own
+    # escaping is undone - a name containing a literal "&#10;" was escaped to
+    # "&amp;#10;" on the way in, so it comes back as text, never a newline.
+    subject = ' '.join(
+        html.unescape(render_to_string(template.subject_template, context)).split()
+    )
 
     return send_email(
         to=to,

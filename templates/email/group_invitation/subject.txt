@@ -1,1 +1,4 @@
-{{ inviter_name }} added you to {{ group_name }} on {{ product_name }}
+{% comment %}
+Who and what, never the question: the subject is what somebody decides to
+open on, and "Reply YES" reads as spam before it reads as an invitation.
+{% endcomment %}{{ inviter_name }} added you to {{ group_name }} on {{ product_name }}

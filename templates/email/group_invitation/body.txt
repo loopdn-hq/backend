@@ -1,15 +1,33 @@
-{{ inviter_name }} added you to "{{ group_name }}" on {{ product_name }}.
+{% comment %}
+Autoescape off for the whole file: this is the PLAIN-TEXT part, so there is no
+HTML for an entity to be decoded by. It is also what `_email_invitation`
+records as the words they were asked, so it has to read as the HTML does.
+{% endcomment %}{% autoescape off %}{{ inviter_name }} added you to {{ group_name }}
 
-{{ product_name }} is where the group talks. To see it, create an account with
-this email address:
+{{ group_name }} is a group on {{ product_name }}.{% if can_reply %} You can take part by email - no account needed.
+
+Get {{ group_name }}'s messages by email?
+
+  Reply YES - messages from the group arrive here, and replying to any of
+  them posts to the group.
+
+  Reply NO - we won't email you about {{ group_name }} again.
+
+Just the one word. Until you answer, nothing else is sent to you.
+
+Prefer the app?{% endif %}
+
+Sign up with this email address and you'll be in {{ group_name }} straight
+away:
 
 {{ join_url }}
 
-You will be in the group as soon as you confirm this address - it is that
-confirmation, not this email, that lets you in. Nothing here is a password or
-a key, so forwarding it gives nobody access.
+Nothing in this email is a password or a key, so forwarding it gives nobody
+access.
 
-If you were not expecting this, you can ignore it. You have not been added to
-anything you can see until you sign up.
-
+--
+You're getting this because {{ inviter_name }} added this address to
+{{ group_name }} on {{ product_name }}. Not expecting it?
+{% if can_reply %}Reply NO{% if unsubscribe_url %} or use this link: {{ unsubscribe_url }}{% endif %}{% elif unsubscribe_url %}Stop these emails: {{ unsubscribe_url }}{% else %}Just ignore it - you are not in anything you can see until you sign up.{% endif %}
 Questions? Reach us at {{ support_address }}.
+{% endautoescape %}

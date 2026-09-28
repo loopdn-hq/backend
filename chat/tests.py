@@ -6561,3 +6561,188 @@ class ChannelsOnTheMemberListTests(EnvelopeAssertions, APITestCase):
         self.asked_a_day_ago(row)
 
         self.assertFalse(self.channels_of(row)['email']['can_nudge'])
+
+
+class SearchMembersToAddTests(EnvelopeAssertions, APITestCase):
+    """Finding people to add, and saying what adding each one would do.
+
+    It must find nobody the rest of the product would not: username by prefix,
+    email only exact and verified, nobody hidden by Settings > Privacy, neither
+    side of a block. And a "ready" must not be contradicted by the add.
+    """
+
+    def setUp(self):
+        cache.clear()
+        from user.models import PrivacySettings
+
+        self.audience = PrivacySettings.Audience
+        self.alice = make_user('alice', '+639170000001')
+        self.carol = make_user('carol', '+639170000003')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.carol)
+        self.client.force_authenticate(self.alice)
+        self.url = reverse('chat:conversation-search-members', args=[self.group.pk])
+
+    def search(self, term):
+        return self.assertSuccess(self.client.get(self.url, {'q': term}))
+
+    def usernames(self, data):
+        return [row['user']['username'] for row in data['results']]
+
+    def verified(self, user):
+        user.profile.email_verified = True
+        user.profile.save(update_fields=['email_verified'])
+        return user
+
+    # --- by username ---------------------------------------------------------
+
+    def test_a_username_prefix_lists_matching_people_with_their_picture(self):
+        make_user('bobby')
+        make_user('bob')
+
+        data = self.search('bo')
+
+        self.assertEqual(self.usernames(data), ['bob', 'bobby'])
+        self.assertIn('avatar_url', data['results'][0]['user']['profile'])
+        self.assertEqual(data['results'][0]['status'], 'ready')
+
+    def test_at_most_five_are_shown_and_it_says_there_are_more(self):
+        for i in range(7):
+            make_user(f'sam{i}')
+
+        data = self.search('sam')
+
+        self.assertEqual(len(data['results']), 5)
+        self.assertTrue(data['has_more'])
+
+    def test_one_letter_finds_nobody(self):
+        make_user('bob')
+
+        self.assertEqual(self.search('b')['results'], [])
+
+    def test_the_searcher_is_not_offered_to_themselves(self):
+        self.assertEqual(self.usernames(self.search('ali')), [])
+
+    # --- by email ------------------------------------------------------------
+
+    def test_an_exact_verified_email_finds_the_account(self):
+        self.verified(make_user('bob'))
+
+        data = self.search('BOB@example.com')
+
+        self.assertEqual(self.usernames(data), ['bob'])
+        self.assertFalse(data['has_more'])
+
+    def test_part_of_an_email_finds_nobody(self):
+        # A prefix over addresses would walk the directory a letter at a time.
+        self.verified(make_user('bob'))
+
+        self.assertEqual(self.search('bob@exam')['results'], [])
+
+    def test_an_unverified_email_finds_nobody(self):
+        make_user('bob')
+
+        self.assertEqual(self.search('bob@example.com')['results'], [])
+
+    def test_an_email_hidden_in_privacy_finds_nobody(self):
+        bob = self.verified(make_user('bob'))
+        set_privacy(bob, discoverable_by_email=False)
+
+        self.assertEqual(self.search('bob@example.com')['results'], [])
+
+    # --- an address with no account ---------------------------------------------
+
+    def test_a_whole_address_nobody_has_is_offered_for_an_invitation(self):
+        data = self.search('Ana@Example.com')
+
+        self.assertEqual(data['results'], [])
+        self.assertEqual(
+            data['invite'],
+            {'email': 'ana@example.com', 'status': 'ready', 'detail': ''},
+        )
+
+    def test_part_of_an_address_is_not_offered(self):
+        self.assertIsNone(self.search('ana@exam')['invite'])
+
+    def test_an_address_already_invited_says_so(self):
+        self.group.add_email_participant('ana@example.com')
+
+        self.assertEqual(
+            self.search('ana@example.com')['invite']['status'], 'already_member'
+        )
+
+    def test_a_hidden_account_is_offered_like_any_other_address(self):
+        # Anything else would say an account is there. The invitation itself
+        # then adds and emails nobody.
+        bob = self.verified(make_user('bob'))
+        set_privacy(bob, discoverable_by_email=False)
+
+        self.assertEqual(self.search('bob@example.com')['invite']['status'], 'ready')
+
+    def test_your_own_address_is_you_not_an_invitation(self):
+        self.verified(self.alice)
+
+        data = self.search('alice@example.com')
+
+        self.assertEqual(self.usernames(data), ['alice'])
+        self.assertEqual(data['results'][0]['status'], 'already_member')
+        self.assertIsNone(data['invite'])
+
+    # --- what adding them would do ---------------------------------------------
+
+    def test_somebody_already_here_says_so(self):
+        data = self.search('car')
+
+        self.assertEqual(data['results'][0]['status'], 'already_member')
+
+    def test_somebody_who_refuses_group_adds_says_so(self):
+        bob = make_user('bob')
+        set_privacy(bob, group_adds_from=self.audience.NOBODY)
+
+        row = self.search('bob')['results'][0]
+
+        self.assertEqual(row['status'], 'refused')
+        self.assertIn('@bob', row['detail'])
+
+    def test_somebody_blocked_from_this_loop_says_so(self):
+        bob = make_user('bob')
+        row = self.group.add_participant(bob)
+        row.status = Participant.Status.BLOCKED
+        row.save(update_fields=['status'])
+
+        self.assertEqual(self.search('bob')['results'][0]['status'], 'refused')
+
+    def test_either_side_of_a_block_is_not_found(self):
+        bob = make_user('bob')
+        blocks.block(bob, user=self.alice)
+
+        self.assertEqual(self.search('bob')['results'], [])
+
+    def test_a_ready_result_can_be_added(self):
+        make_user('bob')
+        self.assertEqual(self.search('bob')['results'][0]['status'], 'ready')
+
+        added = self.client.post(
+            reverse('chat:conversation-members', args=[self.group.pk]),
+            {'members': ['bob']},
+            format='json',
+        )
+
+        self.assertSuccess(added)
+
+    # --- who may ask -----------------------------------------------------------
+
+    def test_it_adds_nobody(self):
+        make_user('bob')
+        before = self.group.active_participants.count()
+
+        self.search('bob')
+
+        self.assertEqual(self.group.active_participants.count(), before)
+
+    def test_an_ordinary_member_cannot_search_for_people_to_add(self):
+        self.client.force_authenticate(self.carol)
+
+        self.assertFailure(
+            self.client.get(self.url, {'q': 'bob'}), status.HTTP_403_FORBIDDEN
+        )

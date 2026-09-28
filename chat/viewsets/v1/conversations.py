@@ -88,6 +88,7 @@ from chat.serializers import (
     ParticipantSerializer,
     NudgeMemberSerializer,
     RemoveMemberSerializer,
+    member_candidates,
 )
 from chat.services import broadcast_conversation_updated, broadcast_message_updated
 
@@ -152,6 +153,7 @@ class ConversationViewSet(
         'requests:GET': 'Pending requests fetched.',
         'requests:POST': 'Request handled.',
         'remove': 'Member removed.',
+        'search_members': 'Search complete.',
         'nudge': 'Reminder sent.',
         'delivery': 'Delivery settings saved.',
         'read': 'Marked as read.',
@@ -556,6 +558,31 @@ class ConversationViewSet(
         )
         participant = decide(serializer.participant, request.user)
         return Response(ParticipantSerializer(participant).data)
+
+    @action(
+        detail=True, methods=['get'], url_path='members/search',
+        url_name='search-members',
+    )
+    def search_members(self, request, pk=None):
+        """Find people to add, and say what adding each one would do.
+
+        READ-ONLY, and for whoever may add people - the same standing the add
+        needs, since this is its first half. `member_candidates` has the rules:
+        username by prefix, email and number exact, at most a handful at once.
+        """
+        conversation = self.get_object()
+        if not conversation.may_add_members(request.user):
+            raise PermissionDenied('You cannot add people to this group.')
+
+        results, has_more, invite = member_candidates(
+            conversation,
+            request.query_params.get('q'),
+            request.user,
+            context=self.get_serializer_context(),
+        )
+        return Response(
+            {'results': results, 'has_more': has_more, 'invite': invite}
+        )
 
     @action(detail=True, methods=['post'])
     def nudge(self, request, pk=None):

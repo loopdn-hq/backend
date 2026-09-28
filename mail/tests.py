@@ -62,7 +62,7 @@ from mail.tokens import (
     unsubscribe_token_for,
     unsubscribe_url,
 )
-from utils.mail import EmailError
+from utils.mail import GROUP_INVITATION, EmailError, send_templated_email
 from user.models import MessagingSettings
 
 REPLY_DOMAIN = 'reply.loopdn.com'
@@ -2672,3 +2672,183 @@ class BridgeContainmentTests(TransactionTestCase):
         record = EmailDelivery.objects.get(participant=self.row)
         self.assertEqual(record.status, EmailDelivery.Status.SKIPPED)
         self.assertIn('consent', record.reason)
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, API_PUBLIC_URL=API_URL)
+class GroupInvitationByEmailTests(APITestCase):
+    """Adding an address with no account: the email, and the answers to it.
+
+    One email, two ways in - reply YES and take part by email, or sign up - and
+    it is a consent request, so it carries what every other one carries: a
+    reply address that names the membership, a way out, and a record of the
+    words they were asked.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.client.force_authenticate(self.alice)
+        self.url = reverse('chat:conversation-members', args=[self.group.pk])
+
+    def invite(self, *addresses, members=()):
+        with capture_sent() as sent, self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                self.url,
+                {'members': list(members), 'invite_email': list(addresses)},
+                format='json',
+            )
+        return response, sent
+
+    def row(self, address='ana@example.com'):
+        return Participant.objects.get(conversation=self.group, email=address)
+
+    def answer(self, body, row=None):
+        row = row or self.row()
+        with capture_sent() as sent:
+            result = inbound.handle_inbound(
+                reply_address(row), row.email, body, headers=authenticated(),
+            )
+        return result, sent
+
+    # --- the invitation ------------------------------------------------------
+
+    def test_an_address_with_no_account_is_invited(self):
+        response, sent = self.invite('Ana@Example.com')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        row = self.row()
+        self.assertIsNone(row.user)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]['to'], ['ana@example.com'])
+        self.assertIn('added you to Family', sent[0]['subject'])
+
+    def test_it_asks_yes_or_no_and_offers_the_app(self):
+        _, sent = self.invite('ana@example.com')
+
+        text = sent[0]['text']
+        self.assertIn('Reply YES', text)
+        self.assertIn('Reply NO', text)
+        self.assertIn('/signup?email=ana%40example.com', text)
+
+    def test_a_reply_to_it_reaches_this_membership(self):
+        _, sent = self.invite('ana@example.com')
+
+        self.assertEqual(participant_id_from(sent[0]['reply_to']), self.row().pk)
+        self.assertTrue(sent[0]['from'].startswith('Family via '))
+
+    def test_it_carries_a_way_out(self):
+        _, sent = self.invite('ana@example.com')
+
+        self.assertIn(unsubscribe_url(self.row()), sent[0]['text'])
+        self.assertIn('List-Unsubscribe', sent[0]['headers'])
+
+    def test_the_words_they_were_asked_are_recorded(self):
+        _, sent = self.invite('ana@example.com')
+
+        consent = ChannelConsent.objects.get(
+            participant=self.row(), channel=ChannelConsent.Channel.EMAIL
+        )
+        self.assertIsNotNone(consent.asked_at)
+        self.assertIn('Reply YES', consent.consent_text)
+        self.assertEqual(consent.status, ChannelConsent.Status.PENDING)
+
+    @override_settings(MAIL_REPLY_DOMAIN='')
+    def test_with_nowhere_to_reply_it_offers_only_the_app(self):
+        # A YES would land nowhere, so it is not asked for - and not recorded
+        # as asked.
+        _, sent = self.invite('ana@example.com')
+
+        self.assertNotIn('Reply YES', sent[0]['text'])
+        self.assertIn('/signup?email=', sent[0]['text'])
+        consent = ChannelConsent.objects.get(
+            participant=self.row(), channel=ChannelConsent.Channel.EMAIL
+        )
+        self.assertIsNone(consent.asked_at)
+
+    def test_nothing_named_is_refused(self):
+        response, sent = self.invite()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(sent, [])
+
+    def test_a_refused_address_adds_nobody_and_emails_nobody(self):
+        # All or nothing, as the add has always been.
+        bob = make_user('bob')
+        blocked = self.group.add_email_participant('ana@example.com')
+        blocked.status = Participant.Status.BLOCKED
+        blocked.save(update_fields=['status'])
+
+        response, sent = self.invite('ana@example.com', members=['bob'])
+
+        self.assertGreaterEqual(response.status_code, 400)
+        self.assertEqual(sent, [])
+        self.assertFalse(self.group.has_participant(bob))
+
+    # --- their answer ---------------------------------------------------------
+
+    def test_yes_lets_them_take_part_by_email(self):
+        self.invite('ana@example.com')
+
+        result, sent = self.answer('YES')
+
+        self.assertEqual(result.action, 'consent_accepted')
+        consent = ChannelConsent.objects.get(
+            participant=self.row(), channel=ChannelConsent.Channel.EMAIL
+        )
+        self.assertEqual(consent.status, ChannelConsent.Status.OPTED_IN)
+        self.assertIn("You're in Family", sent[0]['text'])
+        # "Reply to post" has to point somewhere that takes replies.
+        self.assertEqual(participant_id_from(sent[0]['reply_to']), self.row().pk)
+
+    def test_no_is_confirmed_in_the_groups_own_words(self):
+        self.invite('ana@example.com')
+
+        result, sent = self.answer('no')
+
+        self.assertEqual(result.action, 'consent_declined')
+        self.assertIn('will not email you about Family again', sent[0]['text'])
+
+    def test_the_reminder_can_itself_be_answered(self):
+        # It asks for a YES; before, the reply to it went to an address that
+        # takes no mail.
+        self.invite('ana@example.com')
+
+        _, sent = self.answer('who is this?')
+
+        self.assertIn("YES to get Family's messages by email", sent[0]['text'])
+        self.assertEqual(participant_id_from(sent[0]['reply_to']), self.row().pk)
+
+
+class EmailSubjectTests(TestCase):
+    """A subject is a header, not HTML."""
+
+    def test_an_apostrophe_in_a_name_arrives_as_an_apostrophe(self):
+        with capture_sent() as sent:
+            send_templated_email(
+                GROUP_INVITATION,
+                to='ana@example.com',
+                context={
+                    'group_name': "Yul's Family", 'inviter_name': "O'Brien",
+                    'join_url': 'https://loopdn.com/signup', 'can_reply': False,
+                    'stop_keyword': 'STOP EMAILS', 'unsubscribe_url': None,
+                },
+            )
+
+        self.assertIn("O'Brien added you to Yul's Family", sent[0]['subject'])
+
+    def test_escaped_text_in_a_name_never_becomes_a_new_line(self):
+        with capture_sent() as sent:
+            send_templated_email(
+                GROUP_INVITATION,
+                to='ana@example.com',
+                context={
+                    'group_name': 'Evil&#10;Bcc: x@example.com',
+                    'inviter_name': 'Mallory',
+                    'join_url': 'https://loopdn.com/signup', 'can_reply': False,
+                    'stop_keyword': 'STOP EMAILS', 'unsubscribe_url': None,
+                },
+            )
+
+        self.assertNotIn('\n', sent[0]['subject'])
+        self.assertIn('&#10;', sent[0]['subject'])
