@@ -181,6 +181,7 @@ ACCOUNT_FEATURES = [
 #   group.invite.phone        invite action              is_admin
 #   group.settings.edit       may_edit_group             chat/models.py
 #   group.settings.policy     ADMIN_ONLY_SETTINGS        chat/serializers.py
+#   group.number.provision    provision_number action    viewsets/v1/...
 #
 # Step 3's exit criteria is that `can()` reproduces those answers exactly, so
 # this table is checked against behaviour rather than trusted.
@@ -265,6 +266,15 @@ CONVERSATION_FEATURES = [
                     'edit_group_permission, sms_delivery_enabled, '
                     'sms_replies_enabled, voice_messages_enabled. A member who '
                     'could change these would make the others meaningless.',
+        grants={GROUP_ADMIN: True, GROUP_MEMBER: False},
+    ),
+    dict(
+        key='group.number.provision', label="Get the group's phone number",
+        area='Groups', sort_order=130, default_allowed=False,
+        description='For a group whose number was never bought. Spends money '
+                    'every month, which is why it is not folded into the '
+                    'policy settings: an operator may want admins changing '
+                    'those without buying numbers.',
         grants={GROUP_ADMIN: True, GROUP_MEMBER: False},
     ),
 ]
