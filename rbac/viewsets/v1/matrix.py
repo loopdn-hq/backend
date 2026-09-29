@@ -12,8 +12,8 @@ management command and a migration must obey them too, and a guard that only
 HTTP respects is not a guard.
 
 The GET returns the same structure the screen renders, so it is also the thing
-to paste into a support conversation when somebody asks what an advertiser can
-do.
+to paste into a support conversation when somebody asks what a commercial user
+can do.
 """
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -32,19 +32,19 @@ from rbac.serializers import SetGrantSerializer
 #:
 #: A role appearing in the data but not here is appended alphabetically rather
 #: than dropped - a matrix that silently omits a column is worse than an ugly
-#: one, and the advertiser-org roles land in exactly that position.
+#: one, and a company's roles land in exactly that position.
 ROLE_ORDER = {
     Feature.Axis.ACCOUNT: [
-        UserRole.Role.ADMIN, UserRole.Role.ADVERTISER, UserRole.Role.STANDARD,
+        UserRole.Role.ADMIN, UserRole.Role.COMMERCIAL, UserRole.Role.STANDARD,
     ],
     Feature.Axis.CONVERSATION: ['admin', 'member'],
-    Feature.Axis.ADVERTISER: ['owner', 'manager', 'analyst'],
+    Feature.Axis.COMPANY: ['owner', 'manager', 'analyst'],
 }
 
 AXIS_LABELS = {
     Feature.Axis.ACCOUNT: 'Account roles',
     Feature.Axis.CONVERSATION: 'Group roles',
-    Feature.Axis.ADVERTISER: 'Advertiser roles',
+    Feature.Axis.COMPANY: 'Company roles',
 }
 
 

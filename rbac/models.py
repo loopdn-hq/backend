@@ -13,7 +13,7 @@ configuration between the two, and it is the table the matrix screen renders.
 
 TWO AXES, NEVER ONE
 -------------------
-`UserRole.role` is an ACCOUNT role - standard, advertiser, admin - and says
+`UserRole.role` is an ACCOUNT role - standard, commercial, admin - and says
 which areas of the product a person may reach at all.
 
 It is not `chat.Participant.Role`, which is a GROUP role - admin or member,
@@ -46,9 +46,9 @@ class UserRole(models.Model):
     state it has to interpret.
 
     It also keeps one product question out of the schema. An ads-only
-    advertiser is simply an account with an `advertiser` row and no `standard`
-    row; whether such an account is ever created is a business decision, and
-    the model does not force it either way.
+    commercial user is simply an account with a `commercial` row and no
+    `standard` row; whether such an account is ever created is a business
+    decision, and the model does not force it either way.
 
     `granted_by` is nullable because the rows that arrive by migration or
     signal have no human behind them. Nulls here mean "the system did it",
@@ -59,8 +59,9 @@ class UserRole(models.Model):
     class Role(models.TextChoices):
         # Normal app use - chat, groups, calls. Granted at signup.
         STANDARD = 'standard', 'Standard'
-        # Plus the advertising area and campaigns.
-        ADVERTISER = 'advertiser', 'Advertiser'
+        # Plus the commercial area: companies that buy ads. Was `advertiser`
+        # until rbac/0008. Not the Business plan, which is a billing tier.
+        COMMERCIAL = 'commercial', 'Commercial'
         # Plus every feature in the product. Loopd'n's own team.
         #
         # NOT `is_staff`/`is_superuser`, which stay reserved for the Django
@@ -120,8 +121,9 @@ class Feature(models.Model):
         ACCOUNT = 'account', 'Account'
         # What they may do inside one conversation.
         CONVERSATION = 'conversation', 'Conversation'
-        # What they may do to one advertiser's campaigns.
-        ADVERTISER = 'advertiser', 'Advertiser'
+        # What they may do to one company's campaigns (a commercial.Company).
+        # Was `advertiser` until rbac/0009.
+        COMPANY = 'company', 'Company'
 
     key = models.CharField(max_length=64, unique=True)
     label = models.CharField(max_length=128)
@@ -167,7 +169,7 @@ class RoleFeature(models.Model):
 
     `role` is a plain CharField rather than a FK: roles live in three different
     places depending on the axis - `UserRole.Role` for account,
-    `chat.Participant.Role` for conversation, and the advertiser org's own
+    `chat.Participant.Role` for conversation, and a company's own
     roles later - and a FK could only point at one of them. `Feature.axis` says
     which vocabulary this row's `role` is drawn from.
     """

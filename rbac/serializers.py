@@ -45,7 +45,7 @@ class SetGrantSerializer(serializers.Serializer):
 
     `role` is a free string rather than a ChoiceField: roles come from three
     vocabularies depending on the feature's axis - account, conversation and
-    later the advertiser org - so the model cannot name one list. The service
+    later a company - so the model cannot name one list. The service
     validates it against the feature it is being set on.
     """
 

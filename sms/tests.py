@@ -2920,3 +2920,179 @@ class SmsFailureAlertTests(TestCase):
         self.failed(reason='carrier rejected the message', attempts=1)
 
         self.assertEqual(self.announce(), 0)
+
+
+@override_settings(SMS_FORCE_COUNTRY='US', SMS_FALLBACK_COUNTRIES=[])
+class ProvisionANumberOnRequestTests(APITestCase):
+    """An admin getting a group the number it was created without.
+
+    One group, one number: pressing twice buys once, two admins at once buy
+    once, and a number bought for a group that got one meanwhile is released
+    rather than billed with nothing pointing at it. And when nothing can be
+    bought, the admin is told why instead of SMS being switched off.
+    """
+
+    BOUGHT = {'number': '+14155550123', 'provider': 'telnyx',
+              'provider_number_id': 'num-1'}
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(username='yul', password='x')
+        self.member = User.objects.create_user(username='sam', password='x')
+        self.group = Conversation.start_group(self.admin, name='Family')
+        self.group.add_participant(self.member)
+        self.client.force_authenticate(self.admin)
+        self.url = reverse('chat:conversation-number', args=[self.group.pk])
+
+        configured = mock.patch(
+            'sms.provisioning.messaging_is_configured', return_value=True
+        )
+        configured.start()
+        self.addCleanup(configured.stop)
+
+    def press(self, bought=BOUGHT):
+        with mock.patch('sms.provisioning.order_number',
+                        return_value=bought) as order:
+            response = self.client.post(self.url)
+        return response, order
+
+    # --- it works ----------------------------------------------------------
+
+    def test_an_admin_gets_the_group_a_number(self):
+        response, order = self.press()
+
+        data = self.assertSuccessful(response)
+        self.assertEqual(data['sms_number']['number'], '+14155550123')
+        order.assert_called_once_with('US')
+        self.assertEqual(GroupNumber.objects.get(conversation=self.group).number,
+                         '+14155550123')
+
+    def test_a_group_that_has_a_number_keeps_it_and_nothing_is_bought(self):
+        GroupNumber.objects.create(
+            conversation=self.group, number='+14155550999',
+            status=GroupNumber.Status.ACTIVE, country='US',
+        )
+
+        response, order = self.press()
+
+        self.assertEqual(
+            self.assertSuccessful(response)['sms_number']['number'], '+14155550999'
+        )
+        order.assert_not_called()
+        self.assertEqual(GroupNumber.objects.filter(conversation=self.group).count(), 1)
+
+    def test_it_is_an_admin_feature(self):
+        self.assertIn('group.number.provision', self.features_of(self.admin))
+        self.assertNotIn('group.number.provision', self.features_of(self.member))
+
+    def test_a_member_cannot_buy_one(self):
+        self.client.force_authenticate(self.member)
+
+        response, order = self.press()
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        order.assert_not_called()
+
+    # --- one group, one number -----------------------------------------------
+
+    def test_a_second_press_while_one_is_buying_buys_nothing(self):
+        cache.add(f'sms:provision:{self.group.pk}', True, 300)
+
+        response, order = self.press()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('already being set up', self.message_of(response))
+        order.assert_not_called()
+
+    def test_the_lock_is_let_go_after_a_failure(self):
+        self.press(bought=None)
+
+        response, _ = self.press()
+
+        self.assertSuccessful(response)
+
+    def test_a_number_bought_after_the_group_got_one_is_released(self):
+        # Another request committed a number while this one was at the
+        # provider. The column refuses a second; the one just bought must be
+        # handed back, not left billing with nothing pointing at it.
+        def meanwhile(country):
+            GroupNumber.objects.create(
+                conversation=self.group, number='+14155550999',
+                status=GroupNumber.Status.ACTIVE, country='US',
+            )
+            return self.BOUGHT
+
+        with mock.patch('sms.provisioning.order_number', side_effect=meanwhile), \
+                mock.patch('sms.provisioning.release_number',
+                           return_value=True) as released:
+            number = provisioning.provision_requested(self.group)
+
+        self.assertEqual(number.number, '+14155550999')
+        self.assertEqual(released.call_args.args[0].number, '+14155550123')
+        self.assertFalse(GroupNumber.objects.filter(number='+14155550123').exists())
+
+    # --- when none can be had, say why -------------------------------------
+
+    def test_no_provider_says_so(self):
+        with mock.patch('sms.provisioning.messaging_is_configured',
+                        return_value=False):
+            response, order = self.press()
+
+        self.assertIn("isn't set up", self.message_of(response))
+        order.assert_not_called()
+
+    @override_settings(SMS_FORCE_COUNTRY='')
+    def test_a_creator_with_no_country_says_so_and_switches_nothing_off(self):
+        response, order = self.press()
+
+        self.assertIn('verified phone number', self.message_of(response))
+        order.assert_not_called()
+        self.group.refresh_from_db()
+        self.assertTrue(self.group.sms_delivery_enabled)
+
+    def test_the_country_is_the_creators_not_the_presser(self):
+        # Rule 1. Another admin pressing it must not move the number abroad.
+        self.group.participants.filter(user=self.member).update(role='admin')
+        self.client.force_authenticate(self.member)
+
+        with override_settings(SMS_FORCE_COUNTRY=''):
+            self.admin.profile.phone_number = '+639171111111'
+            self.admin.profile.phone_no_verified = True
+            self.admin.profile.save()
+            _, order = self.press()
+
+        order.assert_called_once_with('PH')
+
+    def test_a_loop_with_sms_off_is_told_to_turn_it_on(self):
+        self.group.sms_delivery_enabled = False
+        self.group.sms_replies_enabled = False
+        self.group.save(update_fields=['sms_delivery_enabled', 'sms_replies_enabled'])
+
+        response, order = self.press()
+
+        self.assertIn('Turn on SMS Delivery', self.message_of(response))
+        order.assert_not_called()
+
+    def test_none_to_be_had_says_try_again(self):
+        response, _ = self.press(bought=None)
+
+        self.assertIn('Try again', self.message_of(response))
+        self.assertFalse(GroupNumber.objects.filter(conversation=self.group).exists())
+
+    # --- helpers ---------------------------------------------------------------
+
+    def assertSuccessful(self, response):
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        return response.json()['data']
+
+    def message_of(self, response):
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        return response.json()['message']
+
+    def features_of(self, user):
+        self.client.force_authenticate(user)
+        response = self.client.get(
+            reverse('chat:conversation-detail', args=[self.group.pk])
+        )
+        self.client.force_authenticate(self.admin)
+        return response.json()['data']['features']

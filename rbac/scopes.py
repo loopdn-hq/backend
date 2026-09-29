@@ -2,11 +2,11 @@
 
 One resolver per axis, and the axis is chosen by the SUBJECT passed to `can()`:
 no subject means the account axis, a Conversation means the conversation axis.
-Adding the advertiser axis later is one function and one entry in `RESOLVERS` -
+Adding the company axis later is one function and one entry in `RESOLVERS` -
 which is the return on separating the axes at all.
 
 Every resolver returns a SET of role names, not one role. The account axis is
-additive (a user holds `standard` and `advertiser` at once), and returning a set
+additive (a user holds `standard` and `commercial` at once), and returning a set
 from all of them keeps the resolver from caring which axis is which.
 """
 from rbac.models import UserRole

@@ -33,6 +33,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from otp.models import OtpError
 from otp.services import start_email_verification, verify_email
+from rbac.services import start_as_commercial
 from user.lookups import active_users
 from user.models import (
     AppearanceSettings,
@@ -53,6 +54,11 @@ from utils.mail import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Which site an account is made on. `commercial` is the ads-only user type from
+#: commercial.loopdn.com (rbac.services.start_as_commercial); everything else is
+#: `standard`. Read at creation only - signing in never changes anybody's role.
+ACCOUNT_TYPES = ('standard', 'commercial')
 
 
 class ProfileSerializer(serializers.ModelSerializer):
@@ -287,6 +293,9 @@ class RegisterSerializer(serializers.ModelSerializer):
     # usable in a conversation list.
     display_name = serializers.CharField(max_length=80, required=False, allow_blank=True)
     phone_number = serializers.CharField(max_length=16, required=False, allow_blank=True)
+    account_type = serializers.ChoiceField(
+        choices=ACCOUNT_TYPES, default='standard', write_only=True
+    )
 
     class Meta:
         model = User
@@ -299,6 +308,7 @@ class RegisterSerializer(serializers.ModelSerializer):
             'last_name',
             'display_name',
             'phone_number',
+            'account_type',
         ]
 
     def validate_username(self, value):
@@ -337,6 +347,7 @@ class RegisterSerializer(serializers.ModelSerializer):
             'phone_number': validated_data.pop('phone_number', '') or None,
         }
         password = validated_data.pop('password')
+        account_type = validated_data.pop('account_type')
 
         # create_user hashes the password; User(**data) would store it raw.
         #
@@ -366,6 +377,9 @@ class RegisterSerializer(serializers.ModelSerializer):
             ]
         )
 
+        if account_type == 'commercial':
+            start_as_commercial(user)
+
         return user
 
 
@@ -373,6 +387,11 @@ class GoogleCredentialSerializer(serializers.Serializer):
     """Validates the ID token issued by Google Identity Services."""
 
     credential = serializers.CharField(trim_whitespace=True)
+    # Applies only when this sign-in creates the account - see
+    # UserViewSet._get_or_create_google_user.
+    account_type = serializers.ChoiceField(
+        choices=ACCOUNT_TYPES, default='standard', write_only=True
+    )
 
     def validate_credential(self, value):
         if not settings.GOOGLE_CLIENT_IDS:

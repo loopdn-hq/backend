@@ -107,6 +107,34 @@ def generate_join_code(length=6):
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
+class GroupCategory(models.Model):
+    """What kind of group this is, as its admin describes it: a school, a family.
+
+    Declared, never inferred. It is one of the two things advertising may target
+    on (docs/advertising_integration_plan.md, 0b), and §13 of the product plan
+    forbids working it out from what people write - so the only source is an
+    admin saying so.
+
+    A table rather than `CharField(choices=...)`: choices live in code, and
+    adding a category should be a row, not a deploy. The starting list is §2's,
+    seeded by migration 0031. `active=False` retires one without breaking the
+    groups and campaigns that already point at it.
+    """
+
+    slug = models.SlugField(max_length=40, unique=True)
+    label = models.CharField(max_length=80)
+    active = models.BooleanField(default=True, db_default=True)
+    # The order a picker shows them in, which is §2's order, not the alphabet.
+    sort_order = models.PositiveSmallIntegerField(default=0, db_default=0)
+
+    class Meta:
+        ordering = ['sort_order', 'label']
+        verbose_name_plural = 'group categories'
+
+    def __str__(self):
+        return self.label
+
+
 class Conversation(models.Model):
     class Kind(models.TextChoices):
         DIRECT = 'direct', 'Direct'

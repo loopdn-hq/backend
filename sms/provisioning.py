@@ -45,9 +45,11 @@ stand in for one, because a well-formed number that belongs to nobody is
 indistinguishable from a real one everywhere it is later read: the API hands
 it to a client, the client prints it, and somebody texts a dead line.
 
-One group, one number, bought when the group is created. Nothing is bought in
+One group, one number, bought when the group is created - or, when that
+failed, when an admin asks for it (`provision_requested`). Nothing is bought in
 advance and nothing is reused between groups - `GroupNumber.number` is unique,
-and a released number is never handed to a second group.
+a released number is never handed to a second group, and
+`GroupNumber.conversation` is one-to-one, so a group cannot hold two.
 
 Two things about the provider are not optional: a search must precede every
 order (it is refused otherwise), and an accepted order is not an owned number
@@ -57,7 +59,8 @@ import logging
 import time
 
 from django.conf import settings
-from django.db import transaction
+from django.core.cache import cache
+from django.db import IntegrityError, transaction
 
 from sms.client import (
     SmsError,
@@ -169,19 +172,115 @@ def provision_for(conversation, creator):
         _disable_sms(conversation)
         return None
 
+    return _assign(conversation, country)
+
+
+class NumberRefused(Exception):
+    """An admin asked for a number and none can be had. The message says why,
+    in words they can act on."""
+
+
+# How long one request may hold a group's purchase. Longer than the slowest
+# order - a search, several candidates and the completion polls - so the lock
+# never lapses while a purchase it guards is still under way.
+PROVISION_LOCK_SECONDS = 300
+
+
+def provision_requested(conversation):
+    """Buy the number this group should already have, because an admin asked.
+
+    For a group whose number was never bought - the provider failed, had none,
+    or was not configured when the group was created. Returns the GroupNumber;
+    raises NumberRefused with the reason when there is none to be had.
+
+    ONE GROUP, ONE NUMBER. A group that has a number gets it back and nothing
+    is bought, so pressing the button twice is harmless. Two admins pressing it
+    at once are serialised by a lock taken BEFORE the provider is called: the
+    one-to-one column would refuse the second row, but only after the second
+    number had been paid for - a lease nothing points at. `_assign` releases
+    one if it ever gets that far anyway.
+
+    UNLIKE `provision_for`, NOTHING IS SWITCHED OFF. Creation turns SMS off for
+    a group whose creator has no country, silently, because nobody is there to
+    tell. Here somebody is, so each rule that stops the purchase is a sentence
+    for them instead, in the order that fixes it: the provider, the country,
+    then the group's own settings.
+
+    The country is still the CREATOR's (rule 1), not whoever pressed it. An
+    admin in another country must not move the group's number abroad, and
+    every member would pay for it.
+    """
+    existing = GroupNumber.objects.filter(conversation=conversation).first()
+    if existing is not None:
+        return existing
+
+    lock = f'sms:provision:{conversation.pk}'
+    if not cache.add(lock, True, PROVISION_LOCK_SECONDS):
+        raise NumberRefused(
+            'A number is already being set up for this Loop. Give it a minute.'
+        )
+    try:
+        # Again inside the lock: the request that held it may have just
+        # finished buying.
+        existing = GroupNumber.objects.filter(conversation=conversation).first()
+        if existing is not None:
+            return existing
+
+        if not messaging_is_configured():
+            raise NumberRefused(
+                "Texting isn't set up on this server yet, so no number can be "
+                'bought.'
+            )
+
+        country = country_for(conversation.created_by)
+        if country is None:
+            raise NumberRefused(
+                "A Loop's number is in its creator's country, and they have no "
+                'verified phone number yet. Once they verify one, try again.'
+            )
+
+        if not uses_sms(conversation):
+            raise NumberRefused(
+                'Turn on SMS Delivery first - a number is only bought for a '
+                'Loop that uses text.'
+            )
+
+        number = _assign(conversation, country)
+        if number is None:
+            raise NumberRefused(
+                'No number could be bought right now. Try again in a few minutes.'
+            )
+        return number
+    finally:
+        cache.delete(lock)
+
+
+def _assign(conversation, country):
+    """A number of `country` for this group: a spare if one is leased, else
+    one bought now. None if there is none to be had.
+
+    The group's row is written in a savepoint, because the one-to-one column is
+    the last word on "one number per group". If another request got there
+    first, theirs stands: a spare we claimed is left spare, and a number we
+    just bought is released at once rather than billed with nothing pointing
+    at it.
+    """
     # A spare of the right country, if one is already leased. Locked, because
     # two groups created at the same instant must not claim the same number.
-    with transaction.atomic():
-        spare = (
-            GroupNumber.objects.select_for_update(skip_locked=True)
-            .filter(status=GroupNumber.Status.AVAILABLE, country=country)
-            .first()
-        )
-        if spare is not None:
-            spare.conversation = conversation
-            spare.status = GroupNumber.Status.ACTIVE
-            spare.save(update_fields=['conversation', 'status', 'updated_at'])
-            return spare
+    try:
+        with transaction.atomic():
+            spare = (
+                GroupNumber.objects.select_for_update(skip_locked=True)
+                .filter(status=GroupNumber.Status.AVAILABLE, country=country)
+                .first()
+            )
+            if spare is not None:
+                spare.conversation = conversation
+                spare.status = GroupNumber.Status.ACTIVE
+                spare.save(update_fields=['conversation', 'status', 'updated_at'])
+                return spare
+    except IntegrityError:
+        return GroupNumber.objects.filter(conversation=conversation).first()
 
     ordered, bought_in = _order_with_fallback(country)
     if ordered is None:
@@ -191,7 +290,7 @@ def provision_for(conversation, creator):
         )
         return None
 
-    return GroupNumber.objects.create(
+    bought = GroupNumber(
         conversation=conversation,
         status=GroupNumber.Status.ACTIVE,
         number=ordered['number'],
@@ -199,6 +298,17 @@ def provision_for(conversation, creator):
         provider_number_id=ordered.get('provider_number_id', ''),
         country=bought_in,
     )
+    try:
+        with transaction.atomic():
+            bought.save(force_insert=True)
+    except IntegrityError:
+        logger.error(
+            'Conversation %s already had a number when %s was bought for it; '
+            'releasing the new one', conversation.pk, bought.number,
+        )
+        release_number(bought)
+        return GroupNumber.objects.filter(conversation=conversation).first()
+    return bought
 
 
 def _disable_sms(conversation):

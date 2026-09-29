@@ -122,7 +122,13 @@ CSRF_TRUSTED_ORIGINS = [
 # socket is refused - silently, because a rejected handshake looks to a browser
 # exactly like a server that is not there. Set it wherever ALLOWED_HOSTS is
 # set, with the scheme included: matching is on scheme, host and port.
-_default_cors_origins = 'http://localhost:3000,http://127.0.0.1:3000' if DEBUG else ''
+#
+# commercial.localhost is the commercial site in development: the same frontend,
+# told apart by hostname (frontend-web/src/lib/config/site.ts).
+_default_cors_origins = (
+    'http://localhost:3000,http://127.0.0.1:3000,http://commercial.localhost:3000'
+    if DEBUG else ''
+)
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.environ.get('CORS_ALLOWED_ORIGINS', _default_cors_origins).split(',')
@@ -198,6 +204,10 @@ INSTALLED_APPS = [
     # Voice and video calls. Django authorises and records; LiveKit carries the
     # media - see calls/livekit.py.
     'calls',
+    # What a commercial user does: companies, campaigns, their money and results.
+    # Models only so far - nothing reads these tables yet; see
+    # docs/advertising_integration_plan.md and docs/commercial_rename_plan.md.
+    'commercial',
 ]
 
 MIDDLEWARE = [

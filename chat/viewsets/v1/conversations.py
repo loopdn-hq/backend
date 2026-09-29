@@ -165,6 +165,7 @@ class ConversationViewSet(
         'destroy': 'Group deleted.',
         'join_code:GET': 'Join code fetched.',
         'join_code:POST': 'New join code issued.',
+        'provision_number': 'Number ready.',
     }
 
     def get_serializer_class(self):
@@ -749,6 +750,41 @@ class ConversationViewSet(
             serializer.participant, serializer.validated_data['role'], request.user
         )
         return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['post'], url_path='number', url_name='number')
+    def provision_number(self, request, pk=None):
+        """Buy this group the phone number it should already have. Admins only.
+
+        For a group created without one - the provider failed, had none, or was
+        not configured at the time. A group that has a number gets it back and
+        nothing is bought: one group, one number, and the number never changes.
+        Anything that stops the purchase comes back as a 400 saying what would
+        fix it, rather than as a group quietly left without.
+
+        Synchronous, like the purchase at creation: a search, an order and its
+        confirmation, usually a couple of seconds. The answer is the whole
+        conversation, so the client re-renders the number from the same shape
+        it already reads.
+        """
+        from rbac.resolver import can
+        from sms.provisioning import NumberRefused, provision_requested
+
+        conversation = self.get_object()
+
+        if conversation.kind != Conversation.Kind.GROUP:
+            raise ValidationError('Only groups have a phone number.')
+
+        if not can(request.user, 'group.number.provision', conversation):
+            raise PermissionDenied('Only a group admin can get this Loop a number.')
+
+        try:
+            provision_requested(conversation)
+        except NumberRefused as refusal:
+            raise ValidationError(str(refusal))
+
+        # get_object() prefetched the conversation before the number existed.
+        conversation = self.get_queryset().get(pk=conversation.pk)
+        return Response(self._as_conversation(conversation))
 
     @action(detail=True, methods=['get', 'post'], url_path='join-code',
             url_name='join-code')
