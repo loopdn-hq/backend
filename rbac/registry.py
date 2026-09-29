@@ -29,14 +29,16 @@ is not what stops them". Read the two together, which is what `can()` does.
 
 WHAT IS DELIBERATELY ABSENT
 ---------------------------
-No advertising or company-scope features. The `commercial` app has its models
-but no API yet, so a row for `ads.campaign.publish` would be a promise with no
-check behind it - exactly what the catalogue-in-code rule exists to prevent.
-They arrive with that API (step 9 and `docs/advertising_integration_plan.md`).
+No campaign or company-scope features yet. The `commercial` app's API so far
+is companies (slice 0 of `docs/campaigns_final_plan.md`), and a row for
+`ads.campaign.publish` before campaigns exist would be a promise with no check
+behind it - exactly what the catalogue-in-code rule exists to prevent. They
+arrive with the campaign API (step 9 and `docs/campaigns_final_plan.md`).
 
-`ads.access` is the one exception, and only because it gates a menu item this
-plan itself adds in step 6. When the campaign features do arrive, `commercial`
-is the role that gets them - confirmed, not assumed.
+`ads.access` is the one exception. It gates the whole commercial API
+(`commercial.permissions.CanUseCommercial`) and the menu item step 6 adds.
+When the campaign features do arrive, `commercial` is the role that gets them -
+confirmed, not assumed.
 """
 
 #: `Feature.axis` values, repeated here so the registry reads without the model.

@@ -5,8 +5,9 @@ docs/advertising_integration_plan.md is the design: read its Naming section
 before adding a model, because several obvious names here already mean
 something else in this codebase ("campaign", "account", "channel", "placement").
 
-Nothing reads or writes these tables yet. They are Stage 1a of the plan, and
-the running app behaves identically with them present and empty.
+docs/campaigns_final_plan.md is the build order. Slice 0 (companies, and which
+one is active) is the only part with an API; everything else is schema that
+nothing reads or writes yet.
 """
 from .ad_click import AdClick
 from .ad_conversion import AdConversion
@@ -15,8 +16,10 @@ from .ad_settings import AdSettings
 from .ad_transaction import AdTransaction
 from .campaign import Campaign
 from .campaign_eligibility import CampaignEligibility
-from .company import Company
+from .commercial_preference import CommercialPreference
+from .company import Company, company_logo_upload_to
 from .creative import Creative, creative_image_upload_to
+from .industry import Industry
 from .targeting_criteria import TargetingCriteria
 
 __all__ = [
@@ -27,8 +30,11 @@ __all__ = [
     'AdTransaction',
     'Campaign',
     'CampaignEligibility',
+    'CommercialPreference',
     'Company',
     'Creative',
+    'Industry',
     'TargetingCriteria',
+    'company_logo_upload_to',
     'creative_image_upload_to',
 ]

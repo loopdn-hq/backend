@@ -1,6 +1,39 @@
+import uuid
+from pathlib import Path
+
 from django.conf import settings
 from django.db import models
 from django.db.models import Q
+
+from commercial.markets import Country, Currency
+from user.models import phone_number_validator
+
+
+def company_logo_upload_to(instance, filename):
+    """Store a logo under an unguessable name, like a creative's image.
+
+    The same private storage and the same folder: `commercial/`, never `ads/`,
+    because ad blockers match URLs containing `/ads/`.
+    """
+    suffix = Path(filename).suffix.lower() or '.png'
+    return f'commercial/media/{uuid.uuid4().hex}{suffix}'
+
+
+class CompanyQuerySet(models.QuerySet):
+    def manageable_by(self, user):
+        """The companies this person may see and change. Every lookup starts here.
+
+        Somebody else's company is then simply not found - a 404, never a 403
+        that confirms it exists. Today that means the ones they own; people
+        managing a company they do not own (docs/rbac_plan.md, step 9) widen
+        this one query and nothing else.
+
+        Suspended companies are included: their owner still needs to see them,
+        and what a suspended company may not do is the services' business.
+        """
+        if not getattr(user, 'is_authenticated', False):
+            return self.none()
+        return self.filter(owner=user)
 
 
 class Company(models.Model):
@@ -26,8 +59,8 @@ class Company(models.Model):
     """
 
     class Status(models.TextChoices):
-        # Signed up. Nothing it creates runs until somebody at Loopd'n looks.
-        PENDING = 'pending', 'Pending review'
+        # From the moment it is created (plan decision 18): Loopd'n reviews
+        # campaigns, not companies, so there is nothing to wait for.
         ACTIVE = 'active', 'Active'
         # Every campaign stops. The owner keeps using the rest of the product.
         SUSPENDED = 'suspended', 'Suspended'
@@ -39,13 +72,38 @@ class Company(models.Model):
     )
     # What a sponsored message is labelled with: "Sponsored · Joe's Pizza".
     name = models.CharField(max_length=120)
+    # PROTECT: retiring an industry is `active=False`, never a delete.
+    industry = models.ForeignKey(
+        'commercial.Industry', on_delete=models.PROTECT, related_name='companies'
+    )
+    # The market it advertises in. See commercial/markets.py.
+    country = models.CharField(max_length=2, choices=Country.choices)
+    # Every amount for this company - balance, budgets, spend - is in this.
+    # Fixed once any money has moved: services/companies.update_company.
+    currency = models.CharField(max_length=3, choices=Currency.choices)
     website = models.URLField(blank=True, default='', db_default='')
     contact_email = models.EmailField(blank=True, default='', db_default='')
+    # Optional, and not asked for on setup (plan decision 20): filled in later,
+    # on the company's details. International format, like a profile's number.
+    contact_phone = models.CharField(
+        max_length=16,
+        blank=True,
+        default='',
+        db_default='',
+        validators=[phone_number_validator],
+    )
+    address = models.CharField(max_length=255, blank=True, default='', db_default='')
+    # The company in its own words. Read by campaign review; never shown to
+    # members as it stands.
+    description = models.CharField(
+        max_length=500, blank=True, default='', db_default=''
+    )
+    logo = models.ImageField(upload_to=company_logo_upload_to, blank=True)
     status = models.CharField(
         max_length=16,
         choices=Status.choices,
-        default=Status.PENDING,
-        db_default=Status.PENDING,
+        default=Status.ACTIVE,
+        db_default=Status.ACTIVE,
     )
 
     # Cents, like billing.Wallet, so pricing is integer arithmetic.
@@ -59,6 +117,8 @@ class Company(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = CompanyQuerySet.as_manager()
 
     class Meta:
         ordering = ['name']
@@ -80,3 +140,8 @@ class Company(models.Model):
 
     def __str__(self):
         return self.name
+
+    @property
+    def money_has_moved(self):
+        """Whether any ledger row exists - after which the currency is fixed."""
+        return self.transactions.exists()
