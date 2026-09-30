@@ -21,6 +21,8 @@ from chat.models import BlockedFromConversation, PostingNotAllowed
 from otp.models import OtpError
 from sms.client import SmsError
 from utils.mail import EmailError
+from whatsapp.errors import ConnectionRefused as WhatsAppRefused
+from whatsapp.graph import WhatsAppError
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +46,16 @@ def api_exception_handler(exc, context):
     # a user, and 503 says "not your fault, try again" where a 400 would blame
     # the request and a 500 would hide the reason behind "Internal server error".
     # CallServiceError is the same again for LiveKit and the recordings bucket.
-    if isinstance(exc, (SmsError, EmailError, CallServiceError)):
+    if isinstance(exc, (SmsError, EmailError, CallServiceError, WhatsAppError)):
         return Response(
             {'detail': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+
+    # A WhatsApp request that cannot be done as asked. `reason` is for the web
+    # app to branch on - `whatsapp_not_connected` opens Embedded Signup.
+    if isinstance(exc, WhatsAppRefused):
+        return Response(
+            {'detail': str(exc), 'reason': exc.code}, status=status.HTTP_400_BAD_REQUEST
         )
 
     # Blocked is a 403 and not a 404: the caller already knows the conversation

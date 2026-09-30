@@ -1032,6 +1032,10 @@ class Message(models.Model):
         # identically to everyone, but where it came in matters when working
         # out why a delivery behaved the way it did.
         EMAIL = 'email', 'Email'
+        # Somebody wrote to the WhatsApp Business number a group is attached
+        # to - see whatsapp/inbound.py. Exactly eight characters, the width of
+        # this column.
+        WHATSAPP = 'whatsapp', 'WhatsApp'
         SYSTEM = 'system', 'System'
 
     conversation = models.ForeignKey(
@@ -1398,6 +1402,10 @@ class ChannelConsent(models.Model):
         SMS = 'sms', 'SMS'
         EMAIL = 'email', 'Email'
         VOICE = 'voice', 'Voice'
+        # Carried over the group owner's own WhatsApp Business number. Meta's
+        # policy requires an opt-in per business before anything is sent, which
+        # is exactly what a row here records - see whatsapp/inbound.py.
+        WHATSAPP = 'whatsapp', 'WhatsApp'
 
     class Status(models.TextChoices):
         # Asked and not yet answered. Nothing is delivered in this state: the
