@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Loopd'n API v4",
-    "description": "# Loopd'n API v4\n\nEvery reply is wrapped in the same envelope:\n\n```json\n{ \"code\": 1, \"message\": \"...\", \"data\": { } }\n```\n\n`code` is `1` for success and `-1` for failure; the HTTP status stays meaningful. `data` is the payload, or the field errors on a failure.\n\n## Start here\n1. **Register**, then **Verify email** (the code is in the server log when `DEBUG` is on).\n2. **Login** - stores your tokens automatically.\n3. **Request phone code** then **Verify phone** - without a verified number your account can never receive a group text.\n4. **Create group** - stores `conversation_id` and gives the group its own phone number.\n\n## What is new since v3\n- **`11. Calls & recordings`** - voice and video calls in any conversation you belong to, on LiveKit. Django authorises the call, enforces the plan's participant limit and hands the browser a short-lived token; LiveKit carries the media, so **audio and video never pass through this API**. Recording (to S3), its retention and its permissions are here too. *Plan* objects gained `max_call_participants`, `has_screen_share`, `has_call_recording` and `call_recording_retention_days`.\n- **Call events arrive on the existing websocket**, `/ws/chat/`, to everyone in the conversation: `call.incoming`, `call.accepted`, `call.rejected`, `call.ended`, `call.recording.started` and `call.recording.stopped`. Each carries `call_id`, `conversation_id`, `user_id` (who caused it) and the whole `call`. `call.incoming` is not sent to the person who started the call. There is no second socket, and no token ever travels on one.\n- **`10. Enterprise`** - the Plan Builder's own catalog-driven flow: a public pricing catalog, drafts (anonymous-allowed, attachable to an account on login), checkout into a frozen `EnterpriseContract` with a line-itemized Stripe invoice, billing status, and the message-credit ledger. Shares the Billing folder's Stripe webhook endpoint rather than adding a second one.\n- **`9. Web push`** - the VAPID public key, registering/forgetting a browser subscription so it can be notified while the app is closed.\n- **`8. Billing`** - the four platform plans (Free, Premium, Business, Enterprise), Pay-As-You-Go Communication Credit packages, a billing summary, Stripe Checkout for both a plan subscription and a credit top-up, the Stripe billing portal, and the Stripe webhook that keeps `Subscription` and the wallet in sync.\n- **Plan limits are enforced.** *Create group* and *Add members* now return `403` once a Free/Premium/Business plan's `max_groups` or `max_members_per_group` would be exceeded - see *List plans*.\n\n## What was new in v3\n- **Every URL now ends in a slash.** v1 and v2 stripped it, and Django answers a slash-less POST with a 301 that drops the body - so every write request in them silently did nothing.\n- **Payloads fixed**: `Register` and `Reset password` were missing `confirm_password`; `Google sign-in` sent `id_token` where the serializer wants `credential`; `Update my profile` sent an `sms_enabled` that no serializer declares.\n- **Runs top to bottom.** Verify email now precedes Login, the join code is fetched before it is used, and *Delete a group* moved to its own final folder instead of destroying the group halfway through.\n- **Forgot / reset / change password** were missing entirely.\n- **`GET .../participants/`** - the member list, paginated ten at a time. Conversation payloads no longer embed it.\n\n## What was new in v2\n- **Every group has its own phone number.** Bought on creation in the creator's country, never changes, deleted with the group.\n- **Membership has states** - active, pending, left, removed, blocked - and four join modes.\n- **Roles**: promote and demote admins.\n- **Broadcast groups** where only admins post.\n- **Members without accounts**, reachable only by SMS.\n- **Delivery settings** per group, and account-wide.\n- **The inbound SMS webhook.**\n\n## Two things that surprise people\n**404 means \"not yours\".** Access control is the database query, not a check bolted on top - so a conversation you are not in is indistinguishable from one that does not exist. That is deliberate.\n\n**Two SMS switches.** `MessagingSettings.sms_enabled` (account-wide) and `Participant.sms_enabled` (this group). Both must be on, plus a verified number, plus consent for members with no account.",
+    "description": "# Loopd'n API v4\n\nEvery reply is wrapped in the same envelope:\n\n```json\n{ \"code\": 1, \"message\": \"...\", \"data\": { } }\n```\n\n`code` is `1` for success and `-1` for failure; the HTTP status stays meaningful. `data` is the payload, or the field errors on a failure.\n\n## Start here\n1. **Register**, then **Verify email** (the code is in the server log when `DEBUG` is on).\n2. **Login** - stores your tokens automatically.\n3. **Request phone code** then **Verify phone** - without a verified number your account can never receive a group text.\n4. **Create group** - stores `conversation_id` and gives the group its own phone number.\n\n## What is new since v3\n- **`12. WhatsApp`** - optional: a group owner connects their own WhatsApp Business number through Meta's Embedded Signup (from profile settings, or when inviting by WhatsApp), attaches it to their groups, and invites members, who opt in with START. Messages then flow both ways over that number. `Cleanup` is now folder 13.\n- **`11. Calls & recordings`** - voice and video calls in any conversation you belong to, on LiveKit. Django authorises the call, enforces the plan's participant limit and hands the browser a short-lived token; LiveKit carries the media, so **audio and video never pass through this API**. Recording (to S3), its retention and its permissions are here too. *Plan* objects gained `max_call_participants`, `has_screen_share`, `has_call_recording` and `call_recording_retention_days`.\n- **Call events arrive on the existing websocket**, `/ws/chat/`, to everyone in the conversation: `call.incoming`, `call.accepted`, `call.rejected`, `call.ended`, `call.recording.started` and `call.recording.stopped`. Each carries `call_id`, `conversation_id`, `user_id` (who caused it) and the whole `call`. `call.incoming` is not sent to the person who started the call. There is no second socket, and no token ever travels on one.\n- **`10. Enterprise`** - the Plan Builder's own catalog-driven flow: a public pricing catalog, drafts (anonymous-allowed, attachable to an account on login), checkout into a frozen `EnterpriseContract` with a line-itemized Stripe invoice, billing status, and the message-credit ledger. Shares the Billing folder's Stripe webhook endpoint rather than adding a second one.\n- **`9. Web push`** - the VAPID public key, registering/forgetting a browser subscription so it can be notified while the app is closed.\n- **`8. Billing`** - the four platform plans (Free, Premium, Business, Enterprise), Pay-As-You-Go Communication Credit packages, a billing summary, Stripe Checkout for both a plan subscription and a credit top-up, the Stripe billing portal, and the Stripe webhook that keeps `Subscription` and the wallet in sync.\n- **Plan limits are enforced.** *Create group* and *Add members* now return `403` once a Free/Premium/Business plan's `max_groups` or `max_members_per_group` would be exceeded - see *List plans*.\n\n## What was new in v3\n- **Every URL now ends in a slash.** v1 and v2 stripped it, and Django answers a slash-less POST with a 301 that drops the body - so every write request in them silently did nothing.\n- **Payloads fixed**: `Register` and `Reset password` were missing `confirm_password`; `Google sign-in` sent `id_token` where the serializer wants `credential`; `Update my profile` sent an `sms_enabled` that no serializer declares.\n- **Runs top to bottom.** Verify email now precedes Login, the join code is fetched before it is used, and *Delete a group* moved to its own final folder instead of destroying the group halfway through.\n- **Forgot / reset / change password** were missing entirely.\n- **`GET .../participants/`** - the member list, paginated ten at a time. Conversation payloads no longer embed it.\n\n## What was new in v2\n- **Every group has its own phone number.** Bought on creation in the creator's country, never changes, deleted with the group.\n- **Membership has states** - active, pending, left, removed, blocked - and four join modes.\n- **Roles**: promote and demote admins.\n- **Broadcast groups** where only admins post.\n- **Members without accounts**, reachable only by SMS.\n- **Delivery settings** per group, and account-wide.\n- **The inbound SMS webhook.**\n\n## Two things that surprise people\n**404 means \"not yours\".** Access control is the database query, not a check bolted on top - so a conversation you are not in is indistinguishable from one that does not exist. That is deliberate.\n\n**Two SMS switches.** `MessagingSettings.sms_enabled` (account-wide) and `Participant.sms_enabled` (this group). Both must be on, plus a verified number, plus consent for members with no account.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -82,6 +82,26 @@
     {
       "key": "contract_id",
       "value": ""
+    },
+    {
+      "key": "whatsapp_connection_id",
+      "value": ""
+    },
+    {
+      "key": "whatsapp_signup_code",
+      "value": "PASTE_CODE_FROM_FB_LOGIN"
+    },
+    {
+      "key": "whatsapp_waba_id",
+      "value": "102345678901234"
+    },
+    {
+      "key": "whatsapp_phone_number_id",
+      "value": "109876543210987"
+    },
+    {
+      "key": "whatsapp_verify_token",
+      "value": "PASTE_WHATSAPP_WEBHOOK_VERIFY_TOKEN"
     }
   ],
   "item": [
@@ -2747,7 +2767,734 @@
       ]
     },
     {
-      "name": "12. Cleanup (destructive)",
+      "name": "12. WhatsApp",
+      "description": "WhatsApp over each group owner's **own** WhatsApp Business number, connected through Meta's Embedded Signup. The group stays a Loopd'n group - WhatsApp is one more channel into it, like SMS and email, and never a native WhatsApp group.\n\n**Optional.** Nothing happens at signup or login. The two entrances are *profile settings* (Connect WhatsApp Business) and a group's *Invite by WhatsApp*.\n\nRun top to bottom: connect, set templates, attach to `conversation_id`, invite, opt in. The two webhook requests are what Meta sends; the last two requests undo the setup.",
+      "item": [
+        {
+          "name": "WhatsApp config",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/config/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "config",
+                ""
+              ]
+            },
+            "description": "What the browser needs to start Meta's **Embedded Signup**: `app_id`, `config_id` and `graph_version` for `FB.init` / `FB.login`. All public by design. `enabled` is false when the server has no Meta app configured - hide the connect button then.\n\n**Connecting WhatsApp is optional and never part of signup or login.** The web app offers it from *profile settings* and from a group's *Invite by WhatsApp*."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List my WhatsApp connections",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/connections/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "connections",
+                ""
+              ]
+            },
+            "description": "The WhatsApp Business numbers **you** connected. Paginated. An empty `results` is the cue to show *Connect WhatsApp Business* in profile settings.\n\nEach carries its status (`active`, `error`, `suspended`), the display number and verified name Meta reports, quality rating, template names, and the groups it carries with their `#keyword`. **The business token is never returned** - it is stored encrypted and only ever sent to Meta.\n\nStores the first connection's id in `whatsapp_connection_id`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.results[0].id;",
+                  "if (value !== undefined && value !== null) {",
+                  "    pm.collectionVariables.set('whatsapp_connection_id', value);",
+                  "    console.log('Stored whatsapp_connection_id =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Connect WhatsApp Business (Embedded Signup)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/connections/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "connections",
+                ""
+              ]
+            },
+            "description": "Finish Embedded Signup. In the browser, `FB.login` with `config_id` returns a `code`, and the session-info `message` event carries `waba_id` and `phone_number_id`. Send all three here.\n\nThe server then:\n1. exchanges `code` for the business's token (needs our app secret, so never done in the browser);\n2. asks Meta which WABAs that token covers and **refuses a `waba_id` it does not cover** - the ids from the browser are claims, the token is proof;\n3. checks `phone_number_id` belongs to that WABA;\n4. subscribes our app to the WABA's webhooks, registers the number for Cloud API, reads its name;\n5. stores it with the token encrypted.\n\nReconnecting a number you already own updates it in place. Stores `whatsapp_connection_id`.\n\n| Status | When |\n| --- | --- |\n| `201` | connected |\n| `400` | `data.reason` is `waba_not_granted`, `number_not_in_waba`, `number_in_use` (another account owns it) or `suspended` |\n| `429` | 20 an hour |\n| `503` | Meta refused or is unreachable, or WhatsApp is not configured on this server |",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{whatsapp_signup_code}}\",\n  \"waba_id\": \"{{whatsapp_waba_id}}\",\n  \"phone_number_id\": \"{{whatsapp_phone_number_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});",
+                  "",
+                  "const value = body.data && body.data.id;",
+                  "if (value !== undefined && value !== null) {",
+                  "    pm.collectionVariables.set('whatsapp_connection_id', value);",
+                  "    console.log('Stored whatsapp_connection_id =', value);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get a WhatsApp connection",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/connections/{{whatsapp_connection_id}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "connections",
+                "{{whatsapp_connection_id}}",
+                ""
+              ]
+            },
+            "description": "One of your connections. Anybody else's is `404`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Set WhatsApp templates",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/connections/{{whatsapp_connection_id}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "connections",
+                "{{whatsapp_connection_id}}",
+                ""
+              ]
+            },
+            "description": "The approved templates this number uses. Only these three fields are writable.\n\nWhatsApp allows free-form text only within **24 hours** of the recipient's last message to the business. Outside that window only an approved template may be sent, so each connection needs, approved **on its own WABA**:\n\n- `notification_template_name` - a group message. Body parameters `{{1}}` group, `{{2}}` sender, `{{3}}` text. Category UTILITY.\n- `invitation_template_name` - the opt-in request. `{{1}}` inviter, `{{2}}` group, and a quick-reply button whose payload is `START`.\n\nBlank falls back to the server's `WHATSAPP_DEFAULT_TEMPLATE_NAME` / `WHATSAPP_INVITE_TEMPLATE_NAME`. Without a template, recipients outside the window are skipped with a logged reason, never dropped silently.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"notification_template_name\": \"loopdn_group_message\",\n  \"notification_template_language\": \"en\",\n  \"invitation_template_name\": \"loopdn_group_invite\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refresh WhatsApp connection",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/connections/{{whatsapp_connection_id}}/refresh/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "connections",
+                "{{whatsapp_connection_id}}",
+                "refresh",
+                ""
+              ]
+            },
+            "description": "Re-read the display number, verified name, quality rating and messaging limit from Meta. A revoked token or deregistered number moves the connection to `error`, and the owner must reconnect."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Group WhatsApp settings",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/groups/{{conversation_id}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "groups",
+                "{{conversation_id}}",
+                ""
+              ]
+            },
+            "description": "WhatsApp as seen from inside one group, by the caller:\n\n- `connected`, and `channel` - the business number, `keyword`, `delivery_enabled`, `replies_enabled`, and `join_link` (a `wa.me` link pre-filled with `START`: one tap to opt in);\n- `is_admin`;\n- `my_consent` - `null` (never asked), `pending`, `opted_in`, `declined` or `opted_out`;\n- `my_number_verified` - opting in needs a verified phone; offer verification first when false.\n\nActive members only; anyone else gets `404`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Attach WhatsApp to group",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/groups/{{conversation_id}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "groups",
+                "{{conversation_id}}",
+                ""
+              ]
+            },
+            "description": "Carry this group over one of **your** connected numbers. Group admins only, and only with a number you own. One number can carry many groups; each gets a `#keyword`, unique on that number, which members in several of its groups use to say which one they mean. Omit `keyword` to derive one from the group name.\n\nAlso the way to change the keyword or the two switches: `delivery_enabled` (group messages go out on WhatsApp) and `replies_enabled` (WhatsApp messages are posted into the group). Pointing a group at a different number of yours moves it.\n\n### `data.reason`\nA refusal that the web app should act on carries a stable code in `data.reason`:\n\n| reason | meaning |\n| --- | --- |\n| `whatsapp_not_connected` | the caller has no connected number - **run Embedded Signup**, then retry |\n| `choose_connection` | the caller has several numbers - pass `connection` |\n| `not_admin` / `not_owner` | only a group admin, with their own number |\n| `no_verified_number` | the person has no verified phone to reach |\n| `keyword_taken` | another group on that number uses the keyword |\n| `not_attached` | this group is not on WhatsApp |",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"connection\": \"{{whatsapp_connection_id}}\",\n  \"keyword\": \"family\",\n  \"delivery_enabled\": true,\n  \"replies_enabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invite by WhatsApp (new number)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/groups/{{conversation_id}}/invite/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "groups",
+                "{{conversation_id}}",
+                "invite",
+                ""
+              ]
+            },
+            "description": "The **Invite by WhatsApp** entrance. Adds the person to the group by phone number (the same permission and block checks as inviting by SMS, but no SMS is sent) and sends the connection's **invitation template**.\n\nIf the group is not on WhatsApp yet and you have exactly one connected number, it is attached first. With none, the answer is `400` with `data.reason = \"whatsapp_not_connected\"` - open Embedded Signup, then retry. With several, pass `connection`.\n\nTheir consent starts `pending`: **nothing from the group reaches them until they tap the button or reply START.** An admin typing a number is not that person agreeing, and Meta's policy says the same.\n\n`data.outcome`: `invited`, `not_sent` (see `data.reason`, e.g. no invitation template), `already_opted_in`, or `declined` - somebody who opted out is **not asked again**; only they can undo it, by sending START.\n\n### `data.reason`\nA refusal that the web app should act on carries a stable code in `data.reason`:\n\n| reason | meaning |\n| --- | --- |\n| `whatsapp_not_connected` | the caller has no connected number - **run Embedded Signup**, then retry |\n| `choose_connection` | the caller has several numbers - pass `connection` |\n| `not_admin` / `not_owner` | only a group admin, with their own number |\n| `no_verified_number` | the person has no verified phone to reach |\n| `keyword_taken` | another group on that number uses the keyword |\n| `not_attached` | this group is not on WhatsApp |\n\n| Status | When |\n| --- | --- |\n| `201` | handled - read `data.outcome` |\n| `400` | see `data.reason` above; or a phone number without a `display_name` |\n| `429` | 60 invitations an hour |",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone_number\": \"+639170000009\",\n  \"display_name\": \"Dan\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invite existing member by WhatsApp",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/groups/{{conversation_id}}/invite/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "groups",
+                "{{conversation_id}}",
+                "invite",
+                ""
+              ]
+            },
+            "description": "Ask somebody **already in the group** to receive it on WhatsApp too. Admins only. Pass `participant` (their membership id) instead of a phone number. They are reached at their **verified** phone number and nowhere else; with none, `400 no_verified_number`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"participant\": \"{{member_participant_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "My WhatsApp opt-in for a group",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/groups/{{conversation_id}}/consent/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "groups",
+                "{{conversation_id}}",
+                "consent",
+                ""
+              ]
+            },
+            "description": "The caller's own answer, from inside the app: `enabled: true` opts in (a recorded, explicit opt-in - it may also undo a STOP, because the member is the one choosing), `false` declines this group. Nobody can opt anybody else in.\n\n`400 not_attached` when the group is not on WhatsApp; `400 no_verified_number` until the caller verifies a phone.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"enabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "WhatsApp webhook: verification (Meta callback)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/webhooks/meta/?hub.mode=subscribe&hub.verify_token={{whatsapp_verify_token}}&hub.challenge=1158201444",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "webhooks",
+                "meta",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "hub.mode",
+                  "value": "subscribe"
+                },
+                {
+                  "key": "hub.verify_token",
+                  "value": "{{whatsapp_verify_token}}"
+                },
+                {
+                  "key": "hub.challenge",
+                  "value": "1158201444"
+                }
+              ]
+            },
+            "description": "**Called by Meta, not the app.** The handshake Meta performs when the callback URL is saved in the app dashboard: it answers with `hub.challenge` as plain text when `hub.verify_token` equals `WHATSAPP_WEBHOOK_VERIFY_TOKEN`, and `403` otherwise.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('answers 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "WhatsApp webhook: inbound message (Meta callback)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/webhooks/meta/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "webhooks",
+                "meta",
+                ""
+              ]
+            },
+            "description": "**Called by Meta, not the app.** One webhook for every connected number; `metadata.phone_number_id` says which connection. Signed with `X-Hub-Signature-256` (HMAC-SHA256 of the body with the app secret) - unsigned requests are `401` whenever `WHATSAPP_APP_SECRET` is set, so this example only works against a server without one.\n\nWhat a message does:\n- `STOP` / `START` opt out of / back into **every group on that business number**. `HELP` and `GROUPS` list the group tags.\n- Anything else is routed to one group: `#keyword text` names it; a swipe-reply goes to the quoted message's group; one group on the number means that one; otherwise the group they last talked in or heard from. Still ambiguous: they are asked, and nothing is posted.\n- It is posted only for an **opted-in** active member, with `source: \"whatsapp\"`, and then reaches the app, SMS, email and other WhatsApp members as any message does.\n- Strangers get silence. Media is not posted yet; members are told so.\n\nItems are de-duplicated one by one, so Meta's retries never post twice. `500` means \"retry\", and only for an item that failed unexpectedly.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"object\": \"whatsapp_business_account\",\n  \"entry\": [\n    {\n      \"id\": \"{{whatsapp_waba_id}}\",\n      \"changes\": [\n        {\n          \"field\": \"messages\",\n          \"value\": {\n            \"messaging_product\": \"whatsapp\",\n            \"metadata\": {\n              \"display_phone_number\": \"15550001111\",\n              \"phone_number_id\": \"{{whatsapp_phone_number_id}}\"\n            },\n            \"contacts\": [\n              {\n                \"wa_id\": \"639170000002\",\n                \"profile\": {\n                  \"name\": \"Bob\"\n                }\n              }\n            ],\n            \"messages\": [\n              {\n                \"from\": \"639170000002\",\n                \"id\": \"wamid.postman-inbound-1\",\n                \"timestamp\": \"1758700000\",\n                \"type\": \"text\",\n                \"text\": {\n                  \"body\": \"#family On my way\"\n                }\n              }\n            ]\n          }\n        }\n      ]\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('answers 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "WhatsApp webhook: delivery status (Meta callback)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/webhooks/meta/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "webhooks",
+                "meta",
+                ""
+              ]
+            },
+            "description": "**Called by Meta, not the app.** A message we sent moved on: `sent`, `delivered`, `read` or `failed`. Updates the delivery log, and never backwards - a late `sent` after `read` leaves it `read`. `pricing.category` is kept so an owner can see what Meta billed them for.\n\nThe other fields handled: `account_update` with `PARTNER_REMOVED` (the owner removed our app in Business Manager) disconnects the number and detaches its groups; `phone_number_quality_update` refreshes the messaging limit.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"object\": \"whatsapp_business_account\",\n  \"entry\": [\n    {\n      \"id\": \"{{whatsapp_waba_id}}\",\n      \"changes\": [\n        {\n          \"field\": \"messages\",\n          \"value\": {\n            \"messaging_product\": \"whatsapp\",\n            \"metadata\": {\n              \"phone_number_id\": \"{{whatsapp_phone_number_id}}\"\n            },\n            \"statuses\": [\n              {\n                \"id\": \"wamid.postman-outbound-1\",\n                \"status\": \"delivered\",\n                \"timestamp\": \"1758700100\",\n                \"recipient_id\": \"639170000002\",\n                \"pricing\": {\n                  \"billable\": true,\n                  \"category\": \"utility\"\n                }\n              }\n            ]\n          }\n        }\n      ]\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('answers 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Detach WhatsApp from group",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/groups/{{conversation_id}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "groups",
+                "{{conversation_id}}",
+                ""
+              ]
+            },
+            "description": "Stop carrying this group over WhatsApp. A group admin, or the owner of the number, may do it. The number stays connected and keeps serving its other groups."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Disconnect WhatsApp Business",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/whatsapp/connections/{{whatsapp_connection_id}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "whatsapp",
+                "connections",
+                "{{whatsapp_connection_id}}",
+                ""
+              ]
+            },
+            "description": "Disconnect the number: our app is unsubscribed from the WABA, the stored token is erased, and **every group it carried is detached at once**. Nothing more is sent from it or accepted on it. Connect again through Embedded Signup to undo."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "13. Cleanup (destructive)",
       "item": [
         {
           "name": "Delete a group",

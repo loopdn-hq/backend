@@ -208,6 +208,10 @@ INSTALLED_APPS = [
     # Models only so far - nothing reads these tables yet; see
     # docs/advertising_integration_plan.md and docs/commercial_rename_plan.md.
     'commercial',
+    # WhatsApp over each group owner's OWN WhatsApp Business number, connected
+    # through Meta's Embedded Signup - see whatsapp/models.py.
+    'whatsapp',
+
 ]
 
 MIDDLEWARE = [
@@ -862,6 +866,10 @@ REST_FRAMEWORK = {
         'call_start': '60/hour',
         'call_join': '300/hour',
         'call_recording': '30/hour',
+        # WhatsApp. Connecting is several Graph API calls on the customer's
+        # account; an invitation is a paid template to somebody's phone.
+        'whatsapp_connect': '20/hour',
+        'whatsapp_invite': '60/hour',
         # Per-IP ceilings on the password reset endpoints - user/throttles.py
         # explains why these exist alongside the per-email limits below, which
         # bound a single address rather than a walk through many.
@@ -1159,4 +1167,44 @@ LIVEKIT_RECORDING_SECRET = os.environ.get('LIVEKIT_RECORDING_SECRET', '')
 # just passed the permission check.
 LIVEKIT_RECORDING_URL_TTL_SECONDS = int(
     os.environ.get('LIVEKIT_RECORDING_URL_TTL_SECONDS', '300')
+)
+
+# WhatsApp (Meta Cloud API - one Meta app serving every tenant)
+#
+# Each group owner connects their OWN WhatsApp Business Account through
+# Embedded Signup, and messages go out on their number, billed to them by Meta.
+# These settings are only OUR app's: its id and secret (to exchange the signup
+# code and verify webhooks) and the Embedded Signup configuration.
+#
+# Unset in development: sending logs instead of calling Meta, and the webhook
+# accepts unsigned requests - whatsapp/checks.py refuses that once an app id is
+# present.
+WHATSAPP_APP_ID = os.environ.get('WHATSAPP_APP_ID', '')
+WHATSAPP_APP_SECRET = os.environ.get('WHATSAPP_APP_SECRET', '')
+WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID = os.environ.get('WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID', '')
+WHATSAPP_WEBHOOK_VERIFY_TOKEN = os.environ.get('WHATSAPP_WEBHOOK_VERIFY_TOKEN', '')
+WHATSAPP_GRAPH_VERSION = os.environ.get('WHATSAPP_GRAPH_VERSION', 'v23.0')
+WHATSAPP_REQUEST_TIMEOUT = int(os.environ.get('WHATSAPP_REQUEST_TIMEOUT', '10'))
+
+# Fernet keys for the stored business tokens, newest first; comma-separated so
+# a rotation can accept two. See whatsapp/crypto.py.
+WHATSAPP_TOKEN_KEYS = [
+    key.strip()
+    for key in os.environ.get('WHATSAPP_TOKEN_KEYS', '').split(',')
+    if key.strip()
+]
+WHATSAPP_SENDING_ENABLED = os.environ.get('WHATSAPP_SENDING_ENABLED', 'True').lower() in (
+    '1', 'true', 'yes',
+)
+
+# Fallback template names for connections that have not set their own. A
+# template belongs to a WABA, so each tenant must have one approved under this
+# name on their own account for the fallback to work.
+#   notification (UTILITY): {{1}} group, {{2}} sender, {{3}} text
+#   invitation   (UTILITY): {{1}} inviter, {{2}} group, quick-reply START
+WHATSAPP_DEFAULT_TEMPLATE_NAME = os.environ.get('WHATSAPP_DEFAULT_TEMPLATE_NAME', '')
+WHATSAPP_INVITE_TEMPLATE_NAME = os.environ.get('WHATSAPP_INVITE_TEMPLATE_NAME', '')
+WHATSAPP_DEFAULT_TEMPLATE_LANGUAGE = os.environ.get('WHATSAPP_DEFAULT_TEMPLATE_LANGUAGE', 'en')
+WHATSAPP_MAX_RECIPIENTS_PER_MESSAGE = int(
+    os.environ.get('WHATSAPP_MAX_RECIPIENTS_PER_MESSAGE', '250')
 )

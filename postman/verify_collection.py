@@ -194,6 +194,39 @@ def livekit_stack():
     return stack
 
 
+def whatsapp_stack():
+    """Meta's Graph API, stood in for.
+
+    Embedded Signup cannot be completed without a real business on the other
+    side, so the onboarding calls answer as Meta would for the collection's own
+    `whatsapp_waba_id` and `whatsapp_phone_number_id`. Sending needs no stub:
+    with no WHATSAPP_APP_ID it logs instead of calling Meta, which is exactly
+    the local-development behaviour worth proving. The webhook stays unsigned
+    for the same reason - no app secret is set here.
+    """
+    stack = ExitStack()
+    stack.enter_context(override_settings(WHATSAPP_WEBHOOK_VERIFY_TOKEN='verify-token'))
+
+    def granted(token):
+        return {'102345678901234'}
+
+    fakes = {
+        'exchange_code': lambda code: {'access_token': 'verify-business-token'},
+        'granted_waba_ids': granted,
+        'phone_numbers_of': lambda waba_id, token: {'109876543210987'},
+        'subscribe_app': lambda waba_id, token: None,
+        'unsubscribe_app': lambda waba_id, token: None,
+        'register_number': lambda phone_number_id, token, pin=None: '000000',
+        'phone_number_details': lambda phone_number_id, token: {
+            'display_phone_number': '+1 555 000 1111', 'verified_name': 'Verify Co',
+            'quality_rating': 'GREEN',
+        },
+    }
+    for name, fake in fakes.items():
+        stack.enter_context(mock.patch(f'whatsapp.graph.{name}', side_effect=fake))
+    return stack
+
+
 def seed_before(name, variables):
     """Create the other people the collection's examples talk about.
 
@@ -291,8 +324,12 @@ def run():
     old_config = runner.setup_databases()
     calls_stack = livekit_stack()
     calls_stack.__enter__()
+    whatsapp_fakes = whatsapp_stack()
+    whatsapp_fakes.__enter__()
 
     variables = {v['key']: v['value'] for v in collection.get('variable', [])}
+    # The collection ships a placeholder; whatsapp_stack() sets the real one.
+    variables['whatsapp_verify_token'] = 'verify-token'
     client = APIClient()
     results = []
 
@@ -355,6 +392,7 @@ def run():
                 results.append((name, mark, f'{code} {detail}'))
                 print(f'   {mark}  {code}  {name}  {detail}')
     finally:
+        whatsapp_fakes.__exit__(None, None, None)
         calls_stack.__exit__(None, None, None)
         runner.teardown_databases(old_config)
         teardown_test_environment()
