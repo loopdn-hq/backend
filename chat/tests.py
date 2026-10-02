@@ -1417,6 +1417,20 @@ class MembershipStateTests(EnvelopeAssertions, APITestCase):
         )
         self.assertEqual(requests[0]['user']['username'], 'bob')
 
+    def test_an_approval_groups_code_queues_a_request_and_says_so(self):
+        # A success with only the status, not the group: the asker is not a
+        # member yet. The web app reads exactly this as "request sent" - it
+        # used to read it as a failure and show the word "pending" as an error.
+        self.set_mode(Conversation.JoinMode.APPROVAL)
+
+        data = self.assertSuccess(self.join_as(self.bob))
+
+        self.assertEqual(data, {'status': Participant.Status.PENDING})
+        self.assertEqual(
+            self.group.participants.get(user=self.bob).status,
+            Participant.Status.PENDING,
+        )
+
     def test_a_wrong_code_is_refused(self):
         self.set_mode(Conversation.JoinMode.OPEN)
         self.assertFailure(self.join_as(self.bob, code='WRONGX'))
