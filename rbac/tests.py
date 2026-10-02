@@ -296,15 +296,15 @@ class SeedTests(TestCase):
             )
 
     def test_commercial_is_additive_and_carries_no_messaging(self):
-        """`commercial` grants the ads area and nothing else.
+        """`commercial` grants the commercial dashboard and nothing else.
 
         A company that also uses Loopd'n normally holds `standard` too and
-        gets chat through that. An ads-only account holds `commercial` alone
-        and reaches only the ads area - which is what makes that a per-account
-        grant rather than a schema decision.
+        gets chat through that. A commercial-only account holds `commercial`
+        alone and reaches only the dashboard - which is what makes that a
+        per-account grant rather than a schema decision.
         """
         self.assertTrue(
-            RoleFeature.objects.get(feature__key='ads.access', role='commercial').allowed
+            RoleFeature.objects.get(feature__key='commercial.access', role='commercial').allowed
         )
         for key in ['chat.access', 'chat.group.create', 'chat.direct.start']:
             self.assertFalse(
@@ -314,9 +314,9 @@ class SeedTests(TestCase):
                 RoleFeature.objects.get(feature__key=key, role='standard').allowed
             )
 
-    def test_standard_cannot_reach_the_ads_area(self):
+    def test_standard_cannot_reach_the_commercial_dashboard(self):
         self.assertFalse(
-            RoleFeature.objects.get(feature__key='ads.access', role='standard').allowed
+            RoleFeature.objects.get(feature__key='commercial.access', role='standard').allowed
         )
 
 
@@ -370,12 +370,12 @@ class AccountAxisTests(TestCase):
     def test_standard_reaches_chat_but_not_ads(self):
         self.assertTrue(can(self.user, 'chat.access'))
         self.assertTrue(can(self.user, 'chat.group.create'))
-        self.assertFalse(can(self.user, 'ads.access'))
+        self.assertFalse(can(self.user, 'commercial.access'))
 
     def test_commercial_reaches_ads_and_keeps_chat_through_standard(self):
         UserRole.objects.create(user=self.user, role=UserRole.Role.COMMERCIAL)
 
-        self.assertTrue(can(self.user, 'ads.access'))
+        self.assertTrue(can(self.user, 'commercial.access'))
         # Chat comes from the `standard` row, not from `commercial`.
         self.assertTrue(can(self.user, 'chat.access'))
 
@@ -384,7 +384,7 @@ class AccountAxisTests(TestCase):
         self.user.account_roles.filter(role=UserRole.Role.STANDARD).delete()
         UserRole.objects.create(user=self.user, role=UserRole.Role.COMMERCIAL)
 
-        self.assertTrue(can(self.user, 'ads.access'))
+        self.assertTrue(can(self.user, 'commercial.access'))
         self.assertFalse(can(self.user, 'chat.access'))
         self.assertFalse(can(self.user, 'chat.group.create'))
 
@@ -430,7 +430,7 @@ class AccountAxisTests(TestCase):
         """Areas are `standard`'s, not `commercial`'s.
 
         A commercial user who also uses Loopd'n normally holds `standard` too and
-        reaches them through that; an ads-only account does not.
+        reaches them through that; a commercial-only account does not.
         """
         for key in ['broadcast.access', 'activity.access',
                     'find_groups.access', 'analytics.access']:
@@ -636,9 +636,9 @@ class RequireTests(TestCase):
 
     def test_require_raises_with_the_features_own_label(self):
         with self.assertRaises(PermissionDenied) as caught:
-            require(self.user, 'ads.access')
+            require(self.user, 'commercial.access')
 
-        self.assertIn('open the advertising area', str(caught.exception).lower())
+        self.assertIn('use the commercial dashboard', str(caught.exception).lower())
 
     def test_an_unknown_key_still_refuses(self):
         with self.assertRaises(PermissionDenied):
@@ -757,11 +757,11 @@ class CatalogueSurvivesTruncationTests(TransactionTestCase):
         cell.allowed = False
         cell.save(update_fields=['allowed'])
 
-        Feature.objects.filter(key='ads.access').delete()
+        Feature.objects.filter(key='commercial.access').delete()
         ensure_catalogue()
 
         # Recreated...
-        self.assertTrue(Feature.objects.filter(key='ads.access').exists())
+        self.assertTrue(Feature.objects.filter(key='commercial.access').exists())
         # ...and the hand-made correction left alone. The database is
         # authoritative once seeded; a redeploy must not revert an operator.
         cell.refresh_from_db()
@@ -933,7 +933,7 @@ class RoleApiTests(EnvelopeAssertions, TestCase):
             {'user': self.plain.pk, 'role': 'commercial'}, format='json',
         ))
 
-        self.assertTrue(can(self.plain, 'ads.access'))
+        self.assertTrue(can(self.plain, 'commercial.access'))
 
     def test_a_standard_user_cannot_grant_themselves_anything(self):
         self.assertFailure(
@@ -1049,7 +1049,7 @@ class FeaturesEndpointTests(EnvelopeAssertions, TestCase):
 
         self.assertIn('chat.access', data['account'])
         self.assertIn('broadcast.access', data['account'])
-        self.assertNotIn('ads.access', data['account'])
+        self.assertNotIn('commercial.access', data['account'])
         self.assertNotIn('platform.role.grant', data['account'])
 
     def test_granting_commercial_adds_the_ads_area(self):
@@ -1057,7 +1057,7 @@ class FeaturesEndpointTests(EnvelopeAssertions, TestCase):
 
         data = self.assertSuccess(self.client.get('/api/v1/users/me/features/'))
 
-        self.assertIn('ads.access', data['account'])
+        self.assertIn('commercial.access', data['account'])
 
     def test_it_is_sorted_so_a_client_can_diff_it(self):
         data = self.assertSuccess(self.client.get('/api/v1/users/me/features/'))
@@ -1162,6 +1162,29 @@ class MatrixEndpointTests(EnvelopeAssertions, TestCase):
             self.client.get('/api/v1/rbac/matrix/'), status.HTTP_403_FORBIDDEN
         )
 
+    def test_the_admin_sites_door_is_for_account_admins_alone(self):
+        from rbac.resolver import can
+
+        self.assertTrue(can(self.admin, 'platform.access'))
+        self.assertFalse(can(self.plain, 'platform.access'))
+
+    def test_viewing_the_matrix_also_needs_the_admin_sites_door(self):
+        """A role given `platform.permissions.view` alone still cannot read it:
+        every admin endpoint checks `platform.access` too.
+        """
+        from django.core.cache import cache
+
+        services.set_grant('platform.permissions.view', 'standard', True, by=self.admin)
+        cache.clear()
+        self.client.force_authenticate(user=self.plain)
+        self.assertFailure(
+            self.client.get('/api/v1/rbac/matrix/'), status.HTTP_403_FORBIDDEN
+        )
+
+        services.set_grant('platform.access', 'standard', True, by=self.admin)
+        cache.clear()
+        self._fetch(self.plain)
+
     def test_it_covers_every_feature_exactly_once(self):
         data = self._fetch(self.admin)
 
@@ -1194,7 +1217,7 @@ class MatrixEndpointTests(EnvelopeAssertions, TestCase):
         account = next(a for a in data['axes'] if a['axis'] == 'account')
         ads = next(
             f for area in account['areas'] for f in area['features']
-            if f['key'] == 'ads.access'
+            if f['key'] == 'commercial.access'
         )
 
         self.assertTrue(ads['grants']['commercial'])
@@ -1242,16 +1265,17 @@ class MatrixEndpointTests(EnvelopeAssertions, TestCase):
     def test_it_costs_a_bounded_number_of_queries(self):
         """One page load for the whole product's permissions.
 
-        Cold: the caller's roles and their grants (the `require` gate), then
-        the features and their cells. Warm it is three - the grants lookup is
-        cached - so the cache is cleared to make the number mean something.
+        Cold: the caller's roles and their grants (the `platform.access`
+        gate), the roles again (the `platform.permissions.view` gate - the
+        grants are cached by then, the roles are not), then the features and
+        their cells. The cache is cleared to make the number mean something.
         """
         from django.core.cache import cache
 
         self.client.force_authenticate(user=self.admin)
         cache.clear()
 
-        with self.assertNumQueries(4):
+        with self.assertNumQueries(5):
             self.client.get('/api/v1/rbac/matrix/')
 
 
@@ -1263,21 +1287,21 @@ class SetGrantTests(TestCase):
         services.grant(self.actor, UserRole.Role.ADMIN)
 
     def test_an_ordinary_grant_flips_and_is_audited(self):
-        services.set_grant('ads.access', 'standard', True, by=self.actor)
+        services.set_grant('commercial.access', 'standard', True, by=self.actor)
 
         self.assertTrue(
             RoleFeature.objects.get(
-                feature__key='ads.access', role='standard'
+                feature__key='commercial.access', role='standard'
             ).allowed
         )
         entry = RoleAuditLog.objects.filter(action='feature.allow').get()
-        self.assertEqual(entry.feature_key, 'ads.access')
+        self.assertEqual(entry.feature_key, 'commercial.access')
         self.assertEqual(entry.role, 'standard')
         self.assertEqual(entry.actor_label, 'editor')
 
     def test_flipping_it_back_is_audited_as_a_denial(self):
-        services.set_grant('ads.access', 'standard', True, by=self.actor)
-        services.set_grant('ads.access', 'standard', False, by=self.actor)
+        services.set_grant('commercial.access', 'standard', True, by=self.actor)
+        services.set_grant('commercial.access', 'standard', False, by=self.actor)
 
         self.assertTrue(RoleAuditLog.objects.filter(action='feature.deny').exists())
 
@@ -1338,11 +1362,11 @@ class SetGrantTests(TestCase):
     def test_the_change_takes_effect_immediately(self):
         """The grants cache must not outlive the grant it caches."""
         plain = User.objects.create_user(username='plain8', password='pw')
-        self.assertFalse(can(plain, 'ads.access'))
+        self.assertFalse(can(plain, 'commercial.access'))
 
-        services.set_grant('ads.access', 'standard', True, by=self.actor)
+        services.set_grant('commercial.access', 'standard', True, by=self.actor)
 
-        self.assertTrue(can(plain, 'ads.access'))
+        self.assertTrue(can(plain, 'commercial.access'))
 
 
 class SetGrantApiTests(EnvelopeAssertions, TestCase):
@@ -1362,13 +1386,13 @@ class SetGrantApiTests(EnvelopeAssertions, TestCase):
     def test_an_admin_can_flip_a_cell_and_gets_the_matrix_back(self):
         data = self.assertSuccess(self._post(
             self.admin,
-            {'feature': 'ads.access', 'role': 'standard', 'allowed': True},
+            {'feature': 'commercial.access', 'role': 'standard', 'allowed': True},
         ))
 
         account = next(a for a in data['axes'] if a['axis'] == 'account')
         ads = next(
             f for area in account['areas'] for f in area['features']
-            if f['key'] == 'ads.access'
+            if f['key'] == 'commercial.access'
         )
         self.assertTrue(ads['grants']['standard'])
 
@@ -1376,7 +1400,7 @@ class SetGrantApiTests(EnvelopeAssertions, TestCase):
         self.assertFailure(
             self._post(
                 self.plain,
-                {'feature': 'ads.access', 'role': 'standard', 'allowed': True},
+                {'feature': 'commercial.access', 'role': 'standard', 'allowed': True},
             ),
             status.HTTP_403_FORBIDDEN,
         )
@@ -1397,7 +1421,7 @@ class SetGrantApiTests(EnvelopeAssertions, TestCase):
         self.assertFailure(
             self._post(
                 self.admin,
-                {'feature': 'ads.access', 'role': 'standard', 'allowed': True},
+                {'feature': 'commercial.access', 'role': 'standard', 'allowed': True},
             ),
             status.HTTP_403_FORBIDDEN,
         )
@@ -1416,7 +1440,7 @@ class SetGrantApiTests(EnvelopeAssertions, TestCase):
     def test_the_audit_endpoint_shows_matrix_changes_too(self):
         self._post(
             self.admin,
-            {'feature': 'ads.access', 'role': 'standard', 'allowed': True,
+            {'feature': 'commercial.access', 'role': 'standard', 'allowed': True,
              'note': 'trial'},
         )
 
@@ -1424,7 +1448,7 @@ class SetGrantApiTests(EnvelopeAssertions, TestCase):
         data = self.assertSuccess(self.client.get('/api/v1/rbac/roles/audit/'))
 
         self.assertTrue(any(
-            e['action'] == 'feature.allow' and e['feature_key'] == 'ads.access'
+            e['action'] == 'feature.allow' and e['feature_key'] == 'commercial.access'
             and e['note'] == 'trial'
             for e in data['results']
         ))
@@ -1512,7 +1536,7 @@ class AdvertiserRoleRenameTests(TestCase):
 
     def test_an_operators_edit_to_the_old_role_beats_a_fresh_default(self):
         """0007's ensure_catalogue() may already have seeded `commercial`."""
-        feature = Feature.objects.get(key='ads.access')
+        feature = Feature.objects.get(key='commercial.access')
         self.assertTrue(
             RoleFeature.objects.get(feature=feature, role='commercial').allowed
         )
@@ -1531,3 +1555,86 @@ class AdvertiserRoleRenameTests(TestCase):
         self.rename()
 
         self.assertTrue(RoleAuditLog.objects.filter(role='advertiser').exists())
+
+
+class AdsAccessRenameTests(TestCase):
+    """rbac/0010 renames the feature `ads.access` to `commercial.access`.
+
+    Called directly, like the role rename above: every migration has already
+    run over an empty database, which seeded `commercial.access` from the
+    registry and never had `ads.access` at all.
+    """
+
+    def setUp(self):
+        import importlib
+
+        from django.apps import apps
+
+        migration = importlib.import_module(
+            'rbac.migrations.0010_rename_ads_access_to_commercial_access'
+        )
+        self.rename = lambda: migration.forwards(apps, None)
+
+    def make_old_feature(self, standard_allowed):
+        """The row an existing database has: `ads.access`, as an operator left it."""
+        old = Feature.objects.create(
+            key='ads.access',
+            label='Open the advertising area',
+            area='Advertising',
+            axis=Feature.Axis.ACCOUNT,
+            sort_order=50,
+        )
+        RoleFeature.objects.create(feature=old, role='commercial', allowed=True)
+        RoleFeature.objects.create(feature=old, role='standard', allowed=standard_allowed)
+        return old
+
+    def test_a_fresh_database_is_left_alone(self):
+        before = Feature.objects.get(key='commercial.access')
+
+        self.rename()
+
+        after = Feature.objects.get(key='commercial.access')
+        self.assertEqual(after.pk, before.pk)
+        self.assertFalse(Feature.objects.filter(key='ads.access').exists())
+
+    def test_the_old_row_and_an_operators_grants_beat_the_fresh_twin(self):
+        """Somebody let `standard` in on the permissions screen; that survives."""
+        old = self.make_old_feature(standard_allowed=True)
+
+        self.rename()
+
+        renamed = Feature.objects.get(key='commercial.access')
+        self.assertEqual(renamed.pk, old.pk)
+        self.assertEqual(renamed.label, 'Use the commercial dashboard')
+        self.assertEqual(renamed.area, 'Commercial')
+        self.assertTrue(
+            RoleFeature.objects.get(feature=renamed, role='standard').allowed
+        )
+        self.assertFalse(Feature.objects.filter(key='ads.access').exists())
+        self.assertEqual(
+            RoleFeature.objects.filter(feature__key='commercial.access').count(), 2
+        )
+
+    def test_the_check_answers_to_the_new_key_straight_away(self):
+        """The grant cache is keyed by feature; a stale entry would deny."""
+        user = User.objects.create_user(username='shop', password='pw')
+        services.start_as_commercial(user)
+        self.assertTrue(can(user, 'commercial.access'))
+
+        self.make_old_feature(standard_allowed=False)
+        self.rename()
+
+        self.assertTrue(can(user, 'commercial.access'))
+        self.assertFalse(can(user, 'ads.access'))
+
+    def test_the_audit_log_keeps_the_name_the_change_was_made_under(self):
+        old = self.make_old_feature(standard_allowed=False)
+        RoleAuditLog.objects.create(
+            action='feature.allow', feature=old, feature_key='ads.access'
+        )
+
+        self.rename()
+
+        entry = RoleAuditLog.objects.get()
+        self.assertEqual(entry.feature_key, 'ads.access')
+        self.assertEqual(entry.feature.key, 'commercial.access')

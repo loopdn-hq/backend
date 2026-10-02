@@ -71,6 +71,8 @@ class RoleViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
         boundary, in one place rather than on four handlers.
         """
         super().initial(request, *args, **kwargs)
+        # The admin site's door, then this resource's own feature.
+        require(request.user, 'platform.access')
         require(request.user, 'platform.role.grant')
 
     def get_queryset(self):

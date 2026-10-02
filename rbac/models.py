@@ -129,7 +129,7 @@ class Feature(models.Model):
     label = models.CharField(max_length=128)
     description = models.CharField(max_length=255, blank=True, default='', db_default='')
 
-    # Groups the rows on the permissions screen: 'Messaging', 'Advertising',
+    # Groups the rows on the permissions screen: 'Messaging', 'Commercial',
     # 'Platform'. Free text rather than choices, because a new area is a
     # registry edit and not a schema change.
     area = models.CharField(max_length=40)

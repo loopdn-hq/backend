@@ -135,6 +135,8 @@ class MatrixViewSet(viewsets.ViewSet):
     }
 
     def list(self, request):
+        # The admin site's door, then this resource's own feature.
+        require(request.user, 'platform.access')
         require(request.user, 'platform.permissions.view')
         return Response(build_matrix())
 
@@ -147,6 +149,7 @@ class MatrixViewSet(viewsets.ViewSet):
         "some of your edits applied" is the worst answer a permissions screen
         can give.
         """
+        require(request.user, 'platform.access')
         require(request.user, 'platform.permissions.edit')
 
         serializer = SetGrantSerializer(data=request.data)
