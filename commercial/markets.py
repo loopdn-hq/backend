@@ -9,6 +9,8 @@ defaulting from the country, and every amount that company ever sees is in it.
 Codes are ISO 4217, upper case. Stripe wants them lower case; convert at the
 Stripe call, not here.
 """
+from zoneinfo import ZoneInfo
+
 from django.db import models
 
 from utils import regions
@@ -35,6 +37,19 @@ DEFAULT_CURRENCY = {
 
 def default_currency(country):
     return DEFAULT_CURRENCY[Country(country)]
+
+
+#: Where a company's "day" is: a daily cap and a day of results run from
+#: midnight to midnight here. One zone for the Philippines. The US has
+#: several; New York stands in until a company can say which is theirs.
+TIME_ZONE = {
+    Country.PHILIPPINES: 'Asia/Manila',
+    Country.UNITED_STATES: 'America/New_York',
+}
+
+
+def time_zone(country):
+    return ZoneInfo(TIME_ZONE[Country(country)])
 
 
 #: The least a company may add to its balance in one payment, in minor units.

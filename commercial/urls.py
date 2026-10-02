@@ -20,6 +20,7 @@ from commercial.viewsets.v1.companies import (
     MarketListView,
 )
 from commercial.viewsets.v1.creatives import CreativeViewSet
+from commercial.viewsets.v1.serving import ImpressionView, ServeView
 
 app_name = 'commercial'
 
@@ -35,5 +36,8 @@ urlpatterns = [
     path('categories/', CategoryListView.as_view(), name='categories'),
     path('reach-estimate/', ReachEstimateView.as_view(), name='reach-estimate'),
     path('pricing/', PricingView.as_view(), name='pricing'),
+    # For members, from the chat app (slice 5).
+    path('serve/', ServeView.as_view(), name='serve'),
+    path('impressions/', ImpressionView.as_view(), name='impressions'),
     *router.urls,
 ]

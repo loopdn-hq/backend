@@ -27,7 +27,7 @@ from commercial.serializers import (
     market_options,
 )
 from commercial.services import companies as services
-from commercial.services import payments
+from commercial.services import payments, stats
 from commercial.viewsets.v1.refusals import service_errors
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,7 @@ class CompanyViewSet(
         'partial_update': 'Company updated.',
         'checkout': 'Checkout started.',
         'transactions': 'Transactions fetched.',
+        'report': 'Report fetched.',
     }
 
     def get_queryset(self):
@@ -110,6 +111,11 @@ class CompanyViewSet(
             logger.warning('Stripe request failed: %s', exc)
             return Response({'detail': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
         return Response({'checkout_url': session['url']})
+
+    @action(detail=True, methods=['get'])
+    def report(self, request, pk=None):
+        """Every campaign's results, by day and by campaign: aggregates only."""
+        return Response(stats.company_report(self.get_object()))
 
     @action(detail=True, methods=['get'], pagination_class=TransactionPagination)
     def transactions(self, request, pk=None):

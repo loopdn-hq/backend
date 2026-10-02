@@ -1024,6 +1024,19 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'commercial.run_campaign_schedule',
         'schedule': 60.0,
     },
+    # Charge what was seen, then roll the day's totals up for reports
+    # (commercial/services/settlement.py, stats.py). Every five minutes: the
+    # most a campaign can be seen past its money is five minutes' worth, and
+    # that is recorded, never charged.
+    'commercial-settle-and-roll-up': {
+        'task': 'commercial.settle_and_roll_up',
+        'schedule': 300.0,
+    },
+    # Per-view rows past SPONSORED_VIEW_RETENTION_DAYS.
+    'commercial-prune-views': {
+        'task': 'commercial.prune_views',
+        'schedule': 86400.0,
+    },
     # OFF (2026-09-25, Yul's call). This sweep buys a real number, from a real
     # provider, for every group that has not got one - and a laptop running the
     # staging env file has live Telnyx credentials, so starting the stack bought
@@ -1098,6 +1111,23 @@ MIN_GROUP_SIZE_FOR_ADS = int(os.environ.get('MIN_GROUP_SIZE_FOR_ADS', '3'))
 # range over two groups narrows down to the groups, and §13 forbids naming one.
 MIN_ELIGIBLE_GROUPS = int(os.environ.get('MIN_ELIGIBLE_GROUPS', '5'))
 MIN_ELIGIBLE_MEMBERS = int(os.environ.get('MIN_ELIGIBLE_MEMBERS', '3'))
+
+# Campaigns: serving and measurement (slice 5)
+#
+# Frequency caps (decision 13), per person, per calendar day: how often one
+# person may see one campaign (on the campaign's day, its company's time zone),
+# and sponsored cards at all (on their own day: their verified phone's
+# country's time zone, UTC when unknown).
+SPONSORED_VIEWS_PER_CAMPAIGN_PER_DAY = int(
+    os.environ.get('SPONSORED_VIEWS_PER_CAMPAIGN_PER_DAY', '3')
+)
+SPONSORED_VIEWS_PER_DAY = int(os.environ.get('SPONSORED_VIEWS_PER_DAY', '10'))
+# How long a served card's token may be reported as seen. A card left on
+# screen longer than this is not counted.
+SPONSORED_TOKEN_MAX_AGE_SECONDS = int(os.environ.get('SPONSORED_TOKEN_MAX_AGE_SECONDS', '3600'))
+# Per-view rows are deleted after this many days (decision 15); the daily
+# totals are kept for good.
+SPONSORED_VIEW_RETENTION_DAYS = int(os.environ.get('SPONSORED_VIEW_RETENTION_DAYS', '90'))
 
 
 # Stripe (payments and webhooks)

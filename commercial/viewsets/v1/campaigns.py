@@ -30,7 +30,7 @@ from commercial.serializers import (
     ReachEstimateSerializer,
 )
 from commercial.services import campaigns as services
-from commercial.services import pricing, reach, transitions
+from commercial.services import pricing, reach, stats, transitions
 from commercial.viewsets.v1.refusals import manageable_company, service_errors
 
 
@@ -52,6 +52,7 @@ class CampaignViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets
     POST   campaigns/{id}/resume/       paused -> running
     POST   campaigns/{id}/cancel/       approved, running or paused -> ended, its
                                         unspent money returned
+    GET    campaigns/{id}/report/       its results, by day: aggregates only
 
     No PUT on a campaign itself: the builder saves a step at a time.
     """
@@ -76,6 +77,7 @@ class CampaignViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets
         'pause': 'Campaign paused.',
         'resume': 'Campaign resumed.',
         'cancel': 'Campaign cancelled.',
+        'report': 'Report fetched.',
     }
 
     def get_queryset(self):
@@ -196,6 +198,10 @@ class CampaignViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets
         with service_errors():
             campaign = transitions.cancel(self.get_object(), request.user)
         return Response(self._detail(campaign))
+
+    @action(detail=True, methods=['get'])
+    def report(self, request, pk=None):
+        return Response(stats.campaign_report(self.get_object()))
 
     def _company_from_query(self):
         raw = self.request.query_params.get('company', '').strip()

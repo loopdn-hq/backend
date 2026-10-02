@@ -446,3 +446,39 @@ class BudgetIncreaseSerializer(serializers.Serializer):
     """POST campaigns/{id}/budget/: the new, larger total."""
 
     total_budget_cents = serializers.IntegerField(min_value=1, max_value=MAX_BUDGET_CENTS)
+
+
+class ServedCardSerializer(serializers.Serializer):
+    """GET serve/: the card a member is shown - the creative, its company's
+    name and logo, and the token to report the view with. Nothing about the
+    campaign's audience, budget or the company's other details."""
+
+    def to_representation(self, served):
+        creative = served.creative
+        company = creative.campaign.company
+        request = self.context.get('request')
+
+        def url(field):
+            if not field:
+                return None
+            return request.build_absolute_uri(field.url) if request else field.url
+
+        return {
+            'token': served.token,
+            'placement': creative.campaign.placement,
+            'company': {'name': company.name, 'logo_url': url(company.logo)},
+            'creative': {
+                'headline': creative.headline,
+                'body': creative.body,
+                'image_url': url(creative.image),
+                'cta_label': creative.cta_label,
+                'cta_kind': creative.cta_kind,
+                'cta_target': creative.cta_target,
+            },
+        }
+
+
+class ImpressionSerializer(serializers.Serializer):
+    """POST impressions/: the token the card was served with."""
+
+    token = serializers.CharField(max_length=500)

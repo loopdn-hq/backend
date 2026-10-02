@@ -302,6 +302,16 @@ def submit_problems(campaign):
         )
     )
 
+    if (
+        campaign.pacing == Campaign.Pacing.STANDARD
+        and campaign.ends_at is None
+        and not campaign.daily_budget_cents
+    ):
+        problems['pacing'] = (
+            '"Spread evenly" needs days to spread over: set an end date or a daily '
+            'cap, or choose "As fast as possible".'
+        )
+
     now = timezone.now()
     if campaign.starts_at is not None and campaign.starts_at < now:
         problems['starts_at'] = (

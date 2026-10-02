@@ -1,13 +1,21 @@
 from django.db import models
+from django.db.models import Q
+from django.utils import timezone
 
 
 class AdImpression(models.Model):
-    """One delivery of a sponsored message to one member on one channel.
+    """One sponsored card one member actually saw: the billable view.
 
-    That is what "impression" means everywhere in this app: a delivery, not a
-    render on screen. The Ads Manager README counts renders; this app does not,
-    because SMS has no render event. It is the unit reach and delivered are
-    counted in (plan 2a), and the unit a per-impression price is charged on.
+    docs/campaigns_final_plan.md, sections 10 and 11 (slice 5). Serving writes
+    nothing; this row is written when the chat app reports that at least half
+    the card was on screen for a second (decision 9), with the delivery token
+    the serve signed. One row per token - `delivery_token` is the token's
+    nonce, unique - so a retried report never counts twice.
+
+    `billable` is decided when it is written: a view past the campaign's
+    reservation or its daily cap is recorded and never charged. Settlement
+    (services/settlement.py) charges the billable ones in bulk and stamps
+    `settled_at`; until then a view is "spent, not yet settled".
 
     `participant` must never reach a company-facing serializer. It is the
     join from commercial data to a person; reports only aggregate over it.
@@ -15,20 +23,19 @@ class AdImpression(models.Model):
     The links into chat are SET_NULL - not CASCADE, and not PROTECT. A group is
     hard-deleted when an admin deletes it for everyone: CASCADE would erase a
     billing record, and PROTECT would stop the admin deleting their own group.
-    What survives is the creative, the cost and the time, which is enough to
-    bill and report on and no longer points at anybody's conversation.
+
+    Rows are deleted once older than SPONSORED_VIEW_RETENTION_DAYS (decision
+    15); CampaignStatsDaily keeps the totals for good.
     """
 
-    class Channel(models.TextChoices):
-        # In the conversation, in the web and desktop apps. The only channel
-        # anything writes before Stage 5.
-        APP = 'app', 'App'
-        # The `ads_sms` delivery channel, on its own numbers (plan, Stage 5).
-        ADS_SMS = 'ads_sms', 'Sponsored SMS'
-
+    campaign = models.ForeignKey(
+        'commercial.Campaign', on_delete=models.PROTECT, related_name='impressions'
+    )
     creative = models.ForeignKey(
         'commercial.Creative', on_delete=models.PROTECT, related_name='impressions'
     )
+    # Campaign.Placement: where on screen it was seen.
+    placement = models.CharField(max_length=16)
     conversation = models.ForeignKey(
         'chat.Conversation',
         on_delete=models.SET_NULL,
@@ -43,39 +50,26 @@ class AdImpression(models.Model):
         null=True,
         blank=True,
     )
-    message = models.ForeignKey(
-        'chat.Message',
-        on_delete=models.SET_NULL,
-        related_name='+',
-        null=True,
-        blank=True,
-    )
-    channel = models.CharField(max_length=8, choices=Channel.choices)
+    # The signed token's nonce: what makes one serve one view at most.
+    delivery_token = models.CharField(max_length=64, unique=True)
 
-    cost_cents = models.PositiveIntegerField(default=0, db_default=0)
-    # Sponsored SMS only. Recognises a person for frequency capping without
-    # storing their number beside commercial data, as SmsDelivery's does.
-    counterpart_hash = models.CharField(max_length=64, blank=True, default='', db_default='')
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    # An app impression is delivered when it is written; an SMS one when the
-    # provider says so.
-    delivered_at = models.DateTimeField(null=True, blank=True)
+    billable = models.BooleanField(default=True, db_default=True)
+    # Null until settlement has charged (or, if not billable, passed over) it.
+    settled_at = models.DateTimeField(null=True, blank=True)
+    viewed_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
-        ordering = ['-created_at']
-        constraints = [
-            # A retried serve must not bill twice for the same delivery. Rows
-            # whose message or participant was deleted hold NULLs, which never
-            # collide, so this cannot fail on history.
-            models.UniqueConstraint(
-                fields=['message', 'participant', 'channel'],
-                name='commercial_adimpression_once_per_member_per_channel',
-            ),
-        ]
+        ordering = ['-viewed_at']
         indexes = [
-            models.Index(fields=['creative', 'created_at'], name='commercial_impression_idx'),
+            # A campaign's views by day: reports, roll-ups, today's count.
+            models.Index(fields=['campaign', 'viewed_at'], name='commercial_impression_idx'),
+            # What settlement has still to charge.
+            models.Index(
+                fields=['campaign'],
+                condition=Q(settled_at__isnull=True),
+                name='commercial_unsettled_idx',
+            ),
         ]
 
     def __str__(self):
-        return f'{self.creative_id} via {self.channel}'
+        return f'{self.campaign_id}: viewed {self.viewed_at:%Y-%m-%d %H:%M}'

@@ -91,6 +91,35 @@ def reserve(campaign, amount_cents, *, description=''):
         )
 
 
+def spend(campaign, amount_cents, *, description=''):
+    """Charge `campaign` `amount_cents` of what it has reserved: views seen.
+
+    Only ever from the reservation - available is not touched - and never more
+    than is reserved: the caller (services/settlement.py) caps the charge, and
+    this refuses rather than overdraw. `campaign` must be the caller's locked
+    row; it is saved here.
+    """
+    if amount_cents <= 0:
+        raise ValueError('A charge takes money.')
+    if amount_cents > campaign.reserved_cents:
+        raise ValueError('A campaign is never charged more than it reserved.')
+    with transaction.atomic():
+        company = _lock(campaign.company)
+        company.reserved_cents -= amount_cents
+        company.save(update_fields=['reserved_cents', 'updated_at'])
+        campaign.company = company
+        campaign.reserved_cents -= amount_cents
+        campaign.spent_cents += amount_cents
+        campaign.save(update_fields=['reserved_cents', 'spent_cents', 'updated_at'])
+        return _record(
+            company,
+            AdTransaction.Kind.CAMPAIGN_SPEND,
+            campaign=campaign,
+            reserved=-amount_cents,
+            description=description or f'Views of {campaign}',
+        )
+
+
 def release(campaign, *, description=''):
     """Return everything `campaign` has reserved and not spent to available.
 

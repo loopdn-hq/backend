@@ -82,11 +82,14 @@ class Campaign(models.Model):
         default=Status.DRAFT,
         db_default=Status.DRAFT,
     )
+    # "As fast as possible" by default: "spread evenly" needs days to spread
+    # over - an end date, or a daily cap - and a new draft has neither.
+    # Submit refuses "spread evenly" without one (services/campaigns.py).
     pacing = models.CharField(
         max_length=16,
         choices=Pacing.choices,
-        default=Pacing.STANDARD,
-        db_default=Pacing.STANDARD,
+        default=Pacing.ACCELERATED,
+        db_default=Pacing.ACCELERATED,
     )
 
     # In the company's currency. Null on a draft whose budget step is not done
@@ -104,6 +107,10 @@ class Campaign(models.Model):
     # and what it has been charged. Only services/wallet.py writes them.
     reserved_cents = models.PositiveIntegerField(default=0, db_default=0)
     spent_cents = models.PositiveIntegerField(default=0, db_default=0)
+    # Billable views settlement has counted (services/settlement.py). What is
+    # charged is always billed_views x cpm_cents / 1000, rounded down, so a
+    # price that is a fraction of a cent per view is still exact.
+    billed_views = models.PositiveBigIntegerField(default=0, db_default=0)
 
     # Null while it is a draft nobody has scheduled yet.
     starts_at = models.DateTimeField(null=True, blank=True)

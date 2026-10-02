@@ -13,10 +13,11 @@ builder promised is what runs.
 from django.conf import settings
 from django.db.models import Count, Q
 
-from billing.models import Plan
+from billing.models import Plan, Subscription
 from chat.models import Conversation, GroupCategory, Participant
 from commercial.markets import region_codes
 from commercial.services.errors import Invalid
+from sms.provisioning import country_for_number
 
 TOO_SMALL = 'Audience is too small.'
 
@@ -169,6 +170,33 @@ def allows_ads():
     return allowed
 
 
+def viewer_sees_ads(user):
+    """Whether this person may be shown ads at all (decision 14): their own
+    plan shows them. Somebody with no subscription row yet is on Free.
+
+    Read-only on purpose - billing's plan_for creates the row, and serving
+    writes nothing.
+    """
+    shows = (
+        Subscription.objects.filter(user_id=user.pk).values_list('plan__shows_ads', flat=True).first()
+    )
+    if shows is None:
+        return Plan.objects.filter(code=Plan.Code.FREE, shows_ads=True).exists()
+    return shows
+
+
+def group_country(group):
+    """The country a group is in, by the same rule as `in_country`: the one
+    its declared region is in, else its creator's verified phone's, else None.
+    """
+    if group.region:
+        return group.region.split('-', 1)[0]
+    profile = getattr(group.created_by, 'profile', None)
+    if profile is None or not profile.phone_no_verified or not profile.phone_number:
+        return None
+    return country_for_number(profile.phone_number)
+
+
 def in_country(country):
     """Groups in `country`: it, or one of its regions, declared - or, with
     none declared, a creator whose verified phone is from there."""
@@ -185,8 +213,9 @@ def creator_in(country):
     The rule that already decides which country a group's SMS number comes
     from (sms/provisioning.country_for), read from the same prefix table - but
     not SMS_FORCE_COUNTRY, which is about where numbers can be bought, not
-    where anybody is. Longest prefix wins there, so a longer prefix mapped to
-    another country is excluded here.
+    where anybody is. Longest prefix wins there (country_for_number, which
+    `group_country` uses), so a longer prefix mapped to another country is
+    excluded here.
     """
     table = settings.SMS_COUNTRY_BY_PREFIX
     mine = [prefix for prefix, code in table.items() if code == country]

@@ -10,8 +10,9 @@ The owner's moves: submit and withdraw (slice 1), which move money since
 slice 3 - submit fixes the price and sets the whole budget aside, withdraw
 returns it - raising a running or paused campaign's budget (slice 3), and
 pause, resume and cancel (slice 4). An admin's: approve and reject (slice 2,
-from the admin site). The scheduler's: start and end on the campaign's dates
-(slice 4, services/schedule.py).
+from the admin site). The system's: start and end on the campaign's dates
+(slice 4, services/schedule.py), and end when its budget is spent (slice 5,
+services/settlement.py).
 
 A move that also moves money still writes ONE event: the money goes in that
 event's `metadata` (what was reserved, released, at what price).
@@ -20,7 +21,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from commercial.models import Campaign, CampaignEvent, Creative
-from commercial.services import campaigns, pricing, review, wallet
+from commercial.services import campaigns, pricing, review, serving, settlement, wallet
 from commercial.services.errors import Invalid, Refused
 
 
@@ -199,6 +200,14 @@ def reject(campaign, actor, note, creative_notes=None):
 #: Where cancel and end may come from: anything reviewed and not over.
 STOPPABLE = (Campaign.Status.APPROVED, Campaign.Status.RUNNING, Campaign.Status.PAUSED)
 
+#: Why a campaign ended on its own.
+END_DATE = 'end_date'
+BUDGET_SPENT = 'budget_spent'
+ENDED_BECAUSE = {
+    END_DATE: 'Its end date passed.',
+    BUDGET_SPENT: 'Its budget was spent.',
+}
+
 
 def start(campaign):
     """approved -> running, by the scheduler once its start date has come.
@@ -250,8 +259,8 @@ def cancel(campaign, actor):
 
     Allowed while running or paused as well as approved - section 8 of the
     plan lists approved only, but then a paused campaign with no end date
-    would hold its money forever (decision 32). From slice 5, any views not
-    yet settled are charged before the release.
+    would hold its money forever (decision 32). Views already seen and not
+    yet settled are charged first; the rest is released.
     """
     with transaction.atomic():
         campaign = _lock(campaign)
@@ -262,9 +271,11 @@ def cancel(campaign, actor):
         return _finish(campaign, CampaignEvent.Kind.CANCELLED, actor)
 
 
-def end(campaign):
-    """approved, running or paused -> ended, by the scheduler: its end date
-    has passed. Unspent money returns to available, as on cancel.
+def end(campaign, *, reason=END_DATE):
+    """approved, running or paused -> ended, by the system, because its end
+    date has passed (the scheduler) or its budget is spent (settlement).
+    Unsettled views are charged and the rest returns to available, as on
+    cancel. The reason is the event's note, which the company reads.
 
     An approved campaign can reach its end date without ever starting - one
     approved after it - and ends the same way, never having run.
@@ -273,9 +284,13 @@ def end(campaign):
         campaign = _lock(campaign)
         if campaign.status not in STOPPABLE:
             raise TransitionRefused('Only an approved, running or paused campaign can end.')
-        if not _past_end(campaign, timezone.now()):
+        if reason == END_DATE and not _past_end(campaign, timezone.now()):
             raise TransitionRefused('Its end date has not come yet.')
-        return _finish(campaign, CampaignEvent.Kind.ENDED, None)
+        if reason == BUDGET_SPENT:
+            settlement.settle_locked(campaign)
+            if not settlement.spent(campaign):
+                raise TransitionRefused('Its budget is not spent yet.')
+        return _finish(campaign, CampaignEvent.Kind.ENDED, None, note=ENDED_BECAUSE[reason])
 
 
 def increase_budget(campaign, actor, total_budget_cents):
@@ -304,6 +319,7 @@ def increase_budget(campaign, actor, total_budget_cents):
 
         campaign.total_budget_cents = total_budget_cents
         campaign.save(update_fields=['total_budget_cents', 'updated_at'])
+        transaction.on_commit(serving.forget_live)
         CampaignEvent.record(
             campaign,
             CampaignEvent.Kind.BUDGET_INCREASED,
@@ -336,22 +352,23 @@ def _past_end(campaign, now):
     return campaign.ends_at is not None and campaign.ends_at <= now
 
 
-def _finish(campaign, kind, actor):
-    """-> ended, returning what is reserved; one event saying how much."""
+def _finish(campaign, kind, actor, *, note=''):
+    """-> ended: charge what was seen, return the rest; one event saying how much."""
     was = campaign.status
+    charged = settlement.settle_locked(campaign)
     released = campaign.reserved_cents
     wallet.release(campaign)
-    return _move(
-        campaign,
-        Campaign.Status.ENDED,
-        kind,
-        actor,
-        metadata={'from': was, 'released_cents': released},
-    )
+    metadata = {'from': was, 'released_cents': released}
+    if charged:
+        metadata['charged_cents'] = charged
+    return _move(campaign, Campaign.Status.ENDED, kind, actor, note=note, metadata=metadata)
 
 
 def _move(campaign, status, kind, actor, *, note='', metadata=None):
     campaign.status = status
     campaign.save(update_fields=['status', 'updated_at'])
     CampaignEvent.record(campaign, kind, actor=actor, note=note, metadata=metadata)
+    # Serving's cached list of running campaigns is a minute old at most;
+    # a stop should not wait that long.
+    transaction.on_commit(serving.forget_live)
     return campaign

@@ -13,20 +13,24 @@ import itertools
 import json
 import shutil
 import tempfile
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from unittest import mock
+from zoneinfo import ZoneInfo
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import ProtectedError
 from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from commercial import tokens
 from commercial.markets import region_codes
 from commercial.models import (
     AdImpression,
@@ -34,6 +38,7 @@ from commercial.models import (
     AdTransaction,
     Campaign,
     CampaignEvent,
+    CampaignStatsDaily,
     CommercialPreference,
     Company,
     Creative,
@@ -43,10 +48,22 @@ from commercial.models import (
 )
 from commercial.services import campaigns as campaign_services
 from commercial.services import companies as services
-from commercial.services import eligibility, pricing, reach, schedule, transitions, wallet
+from commercial.services import (
+    counters,
+    eligibility,
+    measurement,
+    pacing,
+    pricing,
+    reach,
+    schedule,
+    serving,
+    settlement,
+    stats,
+    transitions,
+    wallet,
+)
 from commercial.services.errors import Invalid, Refused
 from chat.models import Conversation, GroupCategory, Participant
-from chat.services import create_message
 from rbac.services import start_as_commercial
 
 User = get_user_model()
@@ -288,20 +305,19 @@ class ImpressionTests(AdsTestCase):
         self.admin = User.objects.create_user(username='maria', password='pw')
         self.group = Conversation.start_group(self.admin, 'Our street')
         self.member = self.group.participants.get(user=self.admin)
-        self.message = create_message(self.group, sender=self.admin, text='hello')
 
-    def impression(self):
+    def impression(self, token='nonce-1'):
         return AdImpression.objects.create(
+            campaign=self.campaign,
             creative=self.creative,
+            placement='chat',
             conversation=self.group,
             participant=self.member,
-            message=self.message,
-            channel=AdImpression.Channel.APP,
-            cost_cents=12,
+            delivery_token=token,
         )
 
-    def test_a_member_is_counted_once_per_message_per_channel(self):
-        """A retried serve must not bill the company twice for one delivery."""
+    def test_one_token_is_one_view(self):
+        """A retried report must not bill the company twice for one view."""
         self.impression()
         self.assertRefused(self.impression)
 
@@ -313,10 +329,9 @@ class ImpressionTests(AdsTestCase):
         impression.refresh_from_db()
         self.assertIsNone(impression.conversation_id)
         self.assertIsNone(impression.participant_id)
-        self.assertIsNone(impression.message_id)
-        self.assertEqual(impression.cost_cents, 12)
+        self.assertEqual(impression.campaign_id, self.campaign.pk)
 
-    def test_a_creative_that_was_delivered_cannot_be_deleted(self):
+    def test_a_creative_that_was_seen_cannot_be_deleted(self):
         self.impression()
         with self.assertRaises(ProtectedError):
             self.creative.delete()
@@ -2280,3 +2295,447 @@ class GroupMatchTests(TestCase):
             for group in groups:
                 matches, failed = self.explain(group, **audience)
                 self.assertEqual(matches, not failed, (group.name, audience, failed))
+
+
+# --- slice 5: serving, views, settlement, reports ------------------------------
+
+
+@SMALL_FLOORS
+class ServingTestCase(TestCase):
+    """A running campaign, groups to show it in, and the switch on."""
+
+    def setUp(self):
+        cache.clear()
+        AdSettings.objects.update(serving_enabled=True)
+        self.owner = make_commercial_user('maria')
+        self.reviewer = User.objects.create_user(username='reviewer', password='pw')
+        self.company = make_company(self.owner)  # PH, PHP: 5,000 per 1,000 views
+        fund(self.company, 1_000_000)
+        self.group = make_group('school', 5, category=category('school'), region='PH-00')
+        make_group('family', 5, category=category('family-friends'))
+        self.viewer = self.member_of(self.group)
+
+    def member_of(self, group, index=0):
+        return [
+            p.user for p in group.participants.filter(user__isnull=False).order_by('pk')
+            if p.user_id != group.created_by_id
+        ][index]
+
+    def running(self, name='Lunch deal', budget_cents=50_000, daily_cents=None,
+                pacing=Campaign.Pacing.ACCELERATED, ends_at=None, **audience):
+        campaign = campaign_services.create_draft(
+            self.company, self.owner, objective=Campaign.Objective.WEBSITE, name=name
+        )
+        campaign_services.set_targeting(campaign, **audience)
+        campaign_services.update_draft(
+            campaign, total_budget_cents=budget_cents, daily_budget_cents=daily_cents,
+            pacing=pacing, ends_at=ends_at,
+        )
+        campaign_services.add_creative(
+            campaign, headline='Lunch for two', body='Half price until 2pm.',
+            cta_label='Go', cta_target='https://luna.example',
+        )
+        transitions.submit(campaign, self.owner)
+        transitions.approve(campaign, self.reviewer)
+        campaign = transitions.start(campaign)
+        serving.forget_live()  # on_commit does this outside a test transaction
+        return campaign
+
+    def serve(self, viewer=None, group=None, now=None):
+        return serving.get_ad(viewer or self.viewer, group or self.group, now=now)
+
+    def see(self, served, viewer=None, now=None):
+        impression, _created = measurement.record_view(
+            viewer or self.viewer, served.token, now=now
+        )
+        return impression
+
+    def view(self, viewer=None, group=None, now=None):
+        """Served a card, and saw it."""
+        viewer = viewer or self.viewer
+        return self.see(self.serve(viewer, group, now=now), viewer, now=now)
+
+
+class ServingTests(ServingTestCase):
+    def test_a_member_of_a_matching_group_is_served_a_card(self):
+        campaign = self.running()
+        served = self.serve()
+        self.assertEqual(served.creative.campaign_id, campaign.pk)
+        self.assertEqual(tokens.read_delivery(served.token)['viewer_id'], self.viewer.pk)
+
+    def test_serving_writes_nothing_to_the_database(self):
+        self.running()
+        self.serve()  # warm the caches, as a busy server's are
+        with CaptureQueriesContext(connection) as queries:
+            self.assertIsNotNone(self.serve())
+        writes = [q['sql'] for q in queries if not q['sql'].lstrip().upper().startswith('SELECT')]
+        self.assertEqual(writes, [])
+        self.assertFalse(AdImpression.objects.exists())
+
+    def test_the_switch_off_stops_everything(self):
+        self.running()
+        row = AdSettings.objects.get()
+        row.serving_enabled = False
+        row.save()
+        self.assertIsNone(self.serve())
+
+    def test_only_a_running_campaign_inside_its_dates_is_served(self):
+        campaign = self.running()
+        transitions.pause(campaign, self.owner)
+        serving.forget_live()
+        self.assertIsNone(self.serve())
+
+        transitions.resume(campaign, self.owner)
+        Campaign.objects.filter(pk=campaign.pk).update(ends_at=timezone.now() - timedelta(minutes=1))
+        serving.forget_live()
+        self.assertIsNone(self.serve())
+
+    def test_the_audience_decides_which_groups(self):
+        make_group('cousins', 5, category=category('family-friends'))
+        self.running(categories=[category('family-friends')])
+        self.assertIsNone(self.serve())
+        family = Conversation.objects.get(name='family')
+        self.assertIsNotNone(self.serve(self.member_of(family), family))
+
+    def test_a_small_group_or_an_ad_free_owner_carries_no_ads(self):
+        from billing.models import Plan, Subscription
+
+        self.running()
+        small = make_group('small', 2)
+        self.assertIsNone(self.serve(self.member_of(small), small))
+
+        paid = make_group('paid', 5)
+        Subscription.objects.create(user=paid.created_by, plan=Plan.objects.get(code='premium'))
+        self.assertIsNone(self.serve(self.member_of(paid), paid))
+
+    def test_an_ad_free_viewer_never_sees_one_even_in_a_free_group(self):
+        from billing.models import Plan, Subscription
+
+        self.running()
+        Subscription.objects.create(user=self.viewer, plan=Plan.objects.get(code='premium'))
+        self.assertIsNone(self.serve())
+        self.assertIsNotNone(self.serve(self.member_of(self.group, 1)))
+
+    @override_settings(SPONSORED_VIEWS_PER_CAMPAIGN_PER_DAY=2, SPONSORED_VIEWS_PER_DAY=3)
+    def test_frequency_caps(self):
+        first = self.running('First')
+        for _ in range(2):
+            self.see(self.serve())
+        # Two of the first: it is capped for this person; another campaign is not.
+        second = self.running('Second')
+        served = self.serve()
+        self.assertEqual(served.creative.campaign_id, second.pk)
+        self.see(served)
+        # Three in a day, whatever the campaign.
+        self.assertIsNone(self.serve())
+        # Somebody else still sees the first.
+        other = self.serve(self.member_of(self.group, 1))
+        self.assertIn(other.creative.campaign_id, {first.pk, second.pk})
+
+    @override_settings(SPONSORED_VIEWS_PER_CAMPAIGN_PER_DAY=1)
+    def test_a_campaigns_cap_starts_again_at_its_companys_midnight(self):
+        self.running()
+        manila = ZoneInfo('Asia/Manila')
+        day = (timezone.now().astimezone(manila) + timedelta(days=1)).date()
+        late = datetime.combine(day, time(23, 30), tzinfo=manila)
+        self.view(now=late)
+        self.assertIsNone(self.serve(now=late + timedelta(minutes=20)))
+        self.assertIsNotNone(self.serve(now=late + timedelta(minutes=45)))  # 00:15
+
+    @override_settings(SPONSORED_VIEWS_PER_DAY=1)
+    def test_the_cap_on_cards_in_all_starts_again_at_the_viewers_midnight(self):
+        self.running()
+        self.assertEqual(counters.viewer_zone(self.viewer).key, 'UTC')  # no phone
+        profile = self.viewer.profile
+        profile.phone_number = '+14155550100'
+        profile.phone_no_verified = True
+        profile.save()
+        self.assertEqual(counters.viewer_zone(self.viewer).key, 'America/New_York')
+
+        new_york = ZoneInfo('America/New_York')
+        day = (timezone.now().astimezone(new_york) + timedelta(days=1)).date()
+        late = datetime.combine(day, time(23, 30), tzinfo=new_york)
+        self.view(now=late)
+        self.assertIsNone(self.serve(now=late + timedelta(minutes=20)))
+        self.assertIsNotNone(self.serve(now=late + timedelta(minutes=45)))  # 00:15
+
+    def test_no_budget_left_means_no_card(self):
+        self.running(budget_cents=10)  # buys 2 views at 5,000 per 1,000
+        self.see(self.serve())
+        self.view(self.member_of(self.group, 1))
+        self.assertIsNone(self.serve(self.member_of(self.group, 2)))
+
+    def test_serving_matches_what_reach_counts(self):
+        groups = [
+            self.group,
+            make_group('two', 3, category=category('community')),
+            make_group('three', 8, region='US-CA', country='US'),
+            make_group('four', 6, region='PH-07'),
+            make_group('nowhere', 6, country=None),
+        ]
+        audiences = [
+            {},
+            {'categories': [category('school')]},
+            {'regions': ['PH-00', 'PH-07'], 'min_group_size': 6},
+            {'max_group_size': 5},
+        ]
+        for audience in audiences:
+            covered = set(reach.audience_groups('PH', **audience).values_list('pk', flat=True))
+            row = {
+                'country': 'PH',
+                'categories': [c.pk for c in audience.get('categories', [])],
+                'regions': audience.get('regions', []),
+                'min_group_size': audience.get('min_group_size'),
+                'max_group_size': audience.get('max_group_size'),
+            }
+            for group in groups:
+                facts = serving.group_facts(group)
+                served = facts['carries_ads'] and serving.matches(row, facts)
+                self.assertEqual(served, group.pk in covered, (group.name, audience))
+
+
+class PacingTests(ServingTestCase):
+    def row(self, **fields):
+        row = {
+            'id': 999_999, 'country': 'PH', 'pacing': Campaign.Pacing.STANDARD,
+            'cpm_cents': 5_000, 'total_budget_cents': 100_000, 'daily_budget_cents': None,
+            'billed_views': 0, 'starts_at': None, 'ends_at': None,
+        }
+        row.update(fields)
+        return row
+
+    def test_spread_evenly_shares_what_is_left_over_the_days_and_the_hours(self):
+        _day, start, _end = counters.local_day('PH', timezone.now())
+        row = self.row(ends_at=start + timedelta(days=4))  # 20,000 views over 4 days
+        self.assertEqual(pacing.views_left_today(row, start + timedelta(minutes=30)), 209)
+        self.assertEqual(pacing.views_left_today(row, start + timedelta(hours=23, minutes=30)), 5_000)
+
+    def test_the_daily_cap_holds_both_pacings(self):
+        _day, start, _end = counters.local_day('PH', timezone.now())
+        noon = start + timedelta(hours=12)
+        capped = self.row(daily_budget_cents=1_000)  # 200 views a day
+        self.assertEqual(pacing.views_left_today(capped, noon), 109)  # 13 of 24 hours
+        fast = self.row(daily_budget_cents=1_000, pacing=Campaign.Pacing.ACCELERATED)
+        self.assertEqual(pacing.views_left_today(fast, start), 200)
+        uncapped = self.row(pacing=Campaign.Pacing.ACCELERATED)
+        self.assertEqual(pacing.views_left_today(uncapped, start), 20_000)
+
+    def test_spread_evenly_needs_an_end_date_or_a_daily_cap_to_submit(self):
+        campaign = campaign_services.create_draft(self.company, self.owner, objective='website', name='x')
+        self.assertEqual(campaign.pacing, Campaign.Pacing.ACCELERATED)
+        campaign_services.update_draft(campaign, pacing=Campaign.Pacing.STANDARD)
+        campaign.refresh_from_db()
+        self.assertIn('pacing', campaign_services.submit_problems(campaign))
+        campaign_services.update_draft(campaign, daily_budget_cents=1_000, total_budget_cents=5_000)
+        campaign.refresh_from_db()
+        self.assertNotIn('pacing', campaign_services.submit_problems(campaign))
+
+
+class MeasurementTests(ServingTestCase):
+    def test_a_view_is_recorded_once_per_token(self):
+        self.running()
+        served = self.serve()
+        first, created = measurement.record_view(self.viewer, served.token)
+        again, created_again = measurement.record_view(self.viewer, served.token)
+        self.assertEqual((created, created_again, first.pk), (True, False, again.pk))
+        self.assertTrue(first.billable)
+        self.assertEqual(AdImpression.objects.count(), 1)
+
+    def test_a_forged_borrowed_or_stale_token_records_nothing(self):
+        self.running()
+        served = self.serve()
+        for viewer, token in (
+            (self.viewer, served.token[:-2] + 'xx'),
+            (self.member_of(self.group, 1), served.token),
+            (self.viewer, 'not a token'),
+        ):
+            with self.assertRaises(Invalid):
+                measurement.record_view(viewer, token)
+        with override_settings(SPONSORED_TOKEN_MAX_AGE_SECONDS=-1), self.assertRaises(Invalid):
+            measurement.record_view(self.viewer, served.token)
+        self.assertFalse(AdImpression.objects.exists())
+
+    def test_somebody_who_left_the_group_cannot_report_a_view(self):
+        self.running()
+        served = self.serve()
+        self.group.participants.filter(user=self.viewer).update(status=Participant.Status.LEFT)
+        with self.assertRaises(Invalid):
+            measurement.record_view(self.viewer, served.token)
+
+    def test_views_past_the_budget_or_the_cap_are_recorded_and_not_billable(self):
+        self.running(budget_cents=10)  # 2 views
+        cards = [self.serve(self.member_of(self.group, i)) for i in range(3)]
+        seen = [self.see(card, self.member_of(self.group, i)) for i, card in enumerate(cards)]
+        self.assertEqual([v.billable for v in seen], [True, True, False])
+
+        cache.clear()
+        AdSettings.objects.update(serving_enabled=True)
+        self.running('Capped', budget_cents=100, daily_cents=5)  # 1 view a day
+        family = Conversation.objects.get(name='family')
+        cards = [self.serve(self.member_of(family, i), family) for i in range(2)]
+        seen = [self.see(card, self.member_of(family, i)) for i, card in enumerate(cards)]
+        self.assertEqual([v.billable for v in seen], [True, False])
+
+    def test_a_view_of_an_ended_campaign_is_not_billable(self):
+        campaign = self.running()
+        served = self.serve()
+        transitions.cancel(campaign, self.owner)
+        self.assertFalse(self.see(served).billable)
+
+
+class SettlementTests(ServingTestCase):
+    def balance(self):
+        self.company.refresh_from_db()
+        return self.company.balance_cents, self.company.reserved_cents
+
+    def test_settlement_charges_billed_views_at_the_price(self):
+        campaign = self.running(budget_cents=50_000)
+        for i in range(3):
+            self.view(self.member_of(self.group, i))
+
+        self.assertEqual(settlement.settle_all(), {'settled': 1, 'charged_cents': 15, 'ended': 0})
+        campaign.refresh_from_db()
+        self.assertEqual((campaign.billed_views, campaign.spent_cents, campaign.reserved_cents),
+                         (3, 15, 49_985))
+        self.assertEqual(self.balance(), (950_000, 49_985))
+        row = AdTransaction.objects.get(kind='campaign_spend')
+        self.assertEqual((row.amount_cents, row.reserved_change_cents), (0, -15))
+        self.assertEqual(settlement.settle_all()['settled'], 0)  # nothing new
+
+    def test_a_fraction_of_a_cent_per_view_is_exact_over_time(self):
+        usd = make_company(self.owner, 'Luna US', country='US', currency='USD')
+        fund(usd, 100_000)
+        self.company = usd
+        group = make_group('us', 5, country='US')
+        make_group('us-too', 5, country='US')
+        self.group = group
+        campaign = self.running(budget_cents=1_000)  # $1 per 1,000 views
+        for i in range(3):
+            self.view(self.member_of(group, i), group)
+        settlement.settle_all()
+        campaign.refresh_from_db()
+        self.assertEqual((campaign.billed_views, campaign.spent_cents), (3, 0))
+        # A thousand views is a dollar, however they were settled.
+        AdImpression.objects.bulk_create([
+            AdImpression(campaign=campaign, creative=campaign.creatives.get(), placement='chat',
+                         delivery_token=f'bulk-{i}')
+            for i in range(997)
+        ])
+        counters.forget_unsettled(campaign.pk)
+        settlement.settle_all()
+        campaign.refresh_from_db()
+        self.assertEqual((campaign.billed_views, campaign.spent_cents), (1_000, 100))
+
+    def test_a_spent_campaign_ends_and_returns_the_rounding(self):
+        campaign = self.running(budget_cents=12)  # 2 views (10 cents); 2 left over
+        for i in range(2):
+            self.view(self.member_of(self.group, i))
+        self.assertEqual(settlement.settle_all()['ended'], 1)
+        campaign.refresh_from_db()
+        self.assertEqual((campaign.status, campaign.spent_cents, campaign.reserved_cents),
+                         ('ended', 10, 0))
+        ended = campaign.events.get(kind='ended')
+        self.assertEqual(ended.note, 'Its budget was spent.')
+        self.assertEqual(ended.metadata['released_cents'], 2)
+        self.assertEqual(self.balance(), (1_000_000 - 10, 0))
+
+    def test_cancel_charges_what_was_seen_before_returning_the_rest(self):
+        campaign = self.running(budget_cents=50_000)
+        self.see(self.serve())
+        campaign = transitions.cancel(campaign, self.owner)
+        self.assertEqual((campaign.spent_cents, campaign.reserved_cents), (5, 0))
+        self.assertEqual(
+            campaign.events.get(kind='cancelled').metadata,
+            {'from': 'running', 'released_cents': 49_995, 'charged_cents': 5},
+        )
+        self.assertEqual(self.balance(), (1_000_000 - 5, 0))
+
+    def test_never_more_than_was_reserved(self):
+        campaign = self.running(budget_cents=10)
+        AdImpression.objects.bulk_create([
+            AdImpression(campaign=campaign, creative=campaign.creatives.get(), placement='chat',
+                         delivery_token=f'over-{i}')
+            for i in range(50)
+        ])
+        settlement.settle_all()
+        campaign.refresh_from_db()
+        self.assertEqual((campaign.spent_cents, campaign.reserved_cents, campaign.status),
+                         (10, 0, 'ended'))
+
+
+class StatsTests(ServingTestCase):
+    def test_roll_up_and_the_report(self):
+        campaign = self.running()
+        viewers = [self.member_of(self.group, i) for i in range(3)]
+        for viewer in viewers:
+            self.view(viewer)
+        self.view(viewers[0])  # the same person twice
+        settlement.settle_all()
+        self.assertEqual(stats.roll_up(), 1)  # today; yesterday had nothing
+        row = CampaignStatsDaily.objects.get(campaign=campaign)
+        self.assertEqual(
+            (row.served, row.viewed, row.reach, row.reach_to_date, row.spend_cents),
+            (4, 4, 3, 3, 20),
+        )
+        self.assertEqual(row.day, timezone.now().astimezone(ZoneInfo('Asia/Manila')).date())
+
+        campaign.refresh_from_db()
+        report = stats.campaign_report(campaign)
+        self.assertEqual(report['totals']['viewed'], 4)
+        self.assertIsNone(report['totals']['reach'])  # 3 people: under the floor of 4
+        self.assertEqual(report['totals']['spend_cents'], 20)
+        self.assertEqual(report['totals']['cost_per_1000_views_cents'], 5_000)
+        with override_settings(MIN_ELIGIBLE_MEMBERS=3):
+            self.assertEqual(stats.campaign_report(campaign)['totals']['reach'], 3)
+
+        company = stats.company_report(self.company)
+        self.assertEqual(company['totals']['viewed'], 4)
+        self.assertEqual(company['campaigns'][0]['spend_cents'], 20)
+
+    def test_prune_keeps_the_totals(self):
+        campaign = self.running()
+        self.see(self.serve())
+        settlement.settle_all()
+        stats.roll_up()
+        later = timezone.now() + timedelta(days=settings.SPONSORED_VIEW_RETENTION_DAYS + 1)
+        self.assertEqual(stats.prune(later), 1)
+        self.assertEqual(CampaignStatsDaily.objects.get(campaign=campaign).viewed, 1)
+
+
+class ServingApiTests(ServingTestCase, APITestCase):
+    def test_serve_and_count_a_view(self):
+        self.running()
+        self.client.force_authenticate(user=self.viewer)
+        body = self.client.get(f'/api/v1/commercial/serve/?conversation={self.group.pk}').json()
+        card = body['data']
+        self.assertEqual(card['company']['name'], "Joe's Pizza")
+        self.assertEqual(card['creative']['headline'], 'Lunch for two')
+        self.assertNotIn('targeting', card)
+
+        first = self.client.post('/api/v1/commercial/impressions/', {'token': card['token']}, format='json')
+        again = self.client.post('/api/v1/commercial/impressions/', {'token': card['token']}, format='json')
+        self.assertEqual((first.status_code, again.status_code), (201, 200))
+        bad = self.client.post('/api/v1/commercial/impressions/', {'token': 'nope'}, format='json')
+        self.assertEqual(bad.status_code, 400)
+
+    def test_nothing_to_show_is_null_and_a_stranger_gets_404(self):
+        self.client.force_authenticate(user=self.viewer)
+        body = self.client.get(f'/api/v1/commercial/serve/?conversation={self.group.pk}').json()
+        self.assertIsNone(body['data'])
+        stranger = User.objects.create_user(username='stranger', password='pw')
+        self.client.force_authenticate(user=stranger)
+        response = self.client.get(f'/api/v1/commercial/serve/?conversation={self.group.pk}')
+        self.assertEqual(response.status_code, 404)
+
+    def test_reports_are_the_owners_only(self):
+        campaign = self.running()
+        self.client.force_authenticate(user=self.owner)
+        report = self.client.get(f'/api/v1/commercial/campaigns/{campaign.pk}/report/').json()
+        self.assertEqual(report['data']['totals']['viewed'], 0)
+        company = self.client.get(f'/api/v1/commercial/companies/{self.company.pk}/report/')
+        self.assertEqual(company.status_code, 200)
+
+        self.client.force_authenticate(user=make_commercial_user('someone-else'))
+        self.assertEqual(
+            self.client.get(f'/api/v1/commercial/campaigns/{campaign.pk}/report/').status_code, 404
+        )
