@@ -1,14 +1,20 @@
 """The commercial app.
 
-Two halves. The schema tests hold the models to what
+Three parts. The schema tests hold the models to what
 docs/advertising_integration_plan.md promises of them: the money cannot go
 wrong, deleting things cannot erase what was delivered or spent, and ads stay
 off until somebody switches them on. The company tests are slice 0 of
 docs/campaigns_final_plan.md (section 16): companies, and which one is active.
+The campaign tests are slice 1: drafts, audience and reach, creatives, and the
+two owner transitions, submit and withdraw.
 """
 import io
+import itertools
+import json
 import shutil
 import tempfile
+from datetime import timedelta
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
@@ -26,14 +32,19 @@ from commercial.models import (
     AdSettings,
     AdTransaction,
     Campaign,
+    CampaignEvent,
     CommercialPreference,
     Company,
     Creative,
     Industry,
+    PricingRate,
     TargetingCriteria,
 )
+from commercial.services import campaigns as campaign_services
 from commercial.services import companies as services
-from chat.models import Conversation, GroupCategory
+from commercial.services import pricing, reach, transitions, wallet
+from commercial.services.errors import Invalid, Refused
+from chat.models import Conversation, GroupCategory, Participant
 from chat.services import create_message
 from rbac.services import start_as_commercial
 
@@ -48,6 +59,19 @@ def make_company(owner, name="Joe's Pizza", **fields):
     fields.setdefault('country', 'PH')
     fields.setdefault('currency', 'PHP')
     return Company.objects.create(owner=owner, name=name, **fields)
+
+
+_payments = itertools.count(1)
+
+
+def fund(company, amount_cents=1_000_000):
+    """Money in, as a cleared card payment would put it there."""
+    wallet.credit_purchase(
+        company,
+        amount_cents=amount_cents,
+        stripe_payment_intent_id=f'pi_test_{next(_payments)}',
+    )
+    company.refresh_from_db()
 
 
 def make_commercial_user(username):
@@ -160,11 +184,33 @@ class MoneyTests(AdsTestCase):
         self.assertRefused(
             lambda: AdTransaction.objects.create(
                 company=self.company,
-                kind=AdTransaction.Kind.USAGE_DEBIT,
-                amount_cents=-500,
+                kind=AdTransaction.Kind.CAMPAIGN_SPEND,
+                amount_cents=0,
                 balance_after_cents=0,
+                reserved_change_cents=-500,
+                reserved_after_cents=0,
             )
         )
+
+    def test_a_reservation_moves_the_same_money_between_the_buckets(self):
+        def reserve(available, reserved):
+            AdTransaction.objects.create(
+                company=self.company,
+                campaign=self.campaign,
+                kind=AdTransaction.Kind.CAMPAIGN_RESERVE,
+                amount_cents=available,
+                balance_after_cents=0,
+                reserved_change_cents=reserved,
+                reserved_after_cents=500,
+            )
+
+        self.assertRefused(lambda: reserve(-500, 400))
+        self.assertRefused(lambda: reserve(500, -500))
+        reserve(-500, 500)
+
+    def test_neither_bucket_can_go_negative(self):
+        self.company.reserved_cents = -1
+        self.assertRefused(self.company.save)
 
     def test_the_same_payment_cannot_be_credited_twice(self):
         """A Stripe webhook retried after it was handled must not pay out twice."""
@@ -184,15 +230,30 @@ class MoneyTests(AdsTestCase):
         AdTransaction.objects.create(
             company=self.company,
             campaign=self.campaign,
-            kind=AdTransaction.Kind.USAGE_DEBIT,
-            amount_cents=-500,
+            kind=AdTransaction.Kind.CAMPAIGN_SPEND,
+            amount_cents=0,
             balance_after_cents=0,
+            reserved_change_cents=-500,
+            reserved_after_cents=0,
         )
         with self.assertRaises(ProtectedError):
             self.campaign.delete()
 
 
 class CampaignTests(AdsTestCase):
+    def test_a_draft_may_have_no_budget_yet_but_never_a_zero_one(self):
+        self.campaign.total_budget_cents = None
+        self.campaign.save()
+        self.campaign.total_budget_cents = 0
+        self.assertRefused(self.campaign.save)
+
+    def test_a_campaign_event_cannot_be_rewritten(self):
+        event = CampaignEvent.record(self.campaign, CampaignEvent.Kind.CREATED, actor=self.owner)
+        self.assertEqual(event.actor_label, 'joe')
+        event.note = 'changed my mind'
+        with self.assertRaises(ValueError):
+            event.save()
+
     def test_a_daily_budget_cannot_exceed_the_total(self):
         self.campaign.daily_budget_cents = 100_001
         self.assertRefused(self.campaign.save)
@@ -441,7 +502,7 @@ class CompanyApiTests(APITestCase):
         self.client.force_authenticate(user=None)
         self.refused(self.client.get(self.list_url), status.HTTP_401_UNAUTHORIZED)
 
-    def test_an_account_without_ads_access_gets_nothing(self):
+    def test_an_account_without_commercial_access_gets_nothing(self):
         plain = User.objects.create_user(username='plain', password='pw')
         self.client.force_authenticate(user=plain)
         for url in (
@@ -721,14 +782,1044 @@ class CompanyApiTests(APITestCase):
 
     def test_markets_say_which_currency_each_country_starts_with(self):
         markets = self.data(self.client.get('/api/v1/commercial/markets/'))
+        countries = [
+            {key: country[key] for key in ('code', 'name', 'default_currency')}
+            for country in markets['countries']
+        ]
         self.assertIn(
-            {'code': 'PH', 'name': 'Philippines', 'default_currency': 'PHP'},
-            markets['countries'],
+            {'code': 'PH', 'name': 'Philippines', 'default_currency': 'PHP'}, countries
         )
         self.assertIn(
-            {'code': 'US', 'name': 'United States', 'default_currency': 'USD'},
-            markets['countries'],
+            {'code': 'US', 'name': 'United States', 'default_currency': 'USD'}, countries
         )
         self.assertEqual(
             {row['code'] for row in markets['currencies']}, {'PHP', 'USD'}
         )
+
+
+# --- slice 1: campaigns -------------------------------------------------------
+
+#: Small floors, so a test audience is a handful of groups rather than hundreds.
+SMALL_FLOORS = override_settings(
+    MIN_GROUP_SIZE_FOR_ADS=3, MIN_ELIGIBLE_GROUPS=2, MIN_ELIGIBLE_MEMBERS=4
+)
+
+
+def make_group(name, size, *, category=None, region='', phone_only=0, members=None):
+    """A group with `size` active members: an admin, account holders, and then
+    `phone_only` SMS-only members. `members` adds these accounts instead of new
+    ones, for people who are in more than one group.
+    """
+    admin = User.objects.create_user(username=f'{name}-admin', password='pw')
+    group = Conversation.start_group(admin, name)
+    accounts = list(members or []) or [
+        User.objects.create_user(username=f'{name}-{i}', password='pw')
+        for i in range(size - 1 - phone_only)
+    ]
+    for user in accounts:
+        group.add_participant(user)
+    for i in range(phone_only):
+        group.add_phone_participant(f'+63917000{i:04d}', f'Member {i}')
+    group.category = category
+    group.region = region
+    group.save(update_fields=['category', 'region'])
+    return group
+
+
+def category(slug):
+    return GroupCategory.objects.get(slug=slug)
+
+
+@SMALL_FLOORS
+class ReachTests(TestCase):
+    def setUp(self):
+        self.owner = make_commercial_user('maria')
+        self.company = make_company(self.owner)  # in PH
+
+    def estimate(self, **audience):
+        return reach.estimate(self.company.country, **audience)
+
+    def test_too_small_says_so_and_gives_no_number_at_all(self):
+        make_group('only-one', 5)
+        self.assertEqual(
+            self.estimate(), {'available': False, 'reason': 'Audience is too small.'}
+        )
+
+    def test_a_big_enough_audience_is_ranges_never_counts(self):
+        make_group('a', 5)
+        make_group('b', 6)
+
+        estimate = self.estimate()
+
+        self.assertTrue(estimate['available'])
+        # 2 groups and 11 accounts, given only as the ranges around them.
+        self.assertEqual(estimate['groups'], {'low': 1, 'high': 5})
+        self.assertEqual(estimate['members'], {'low': 10, 'high': 25})
+        self.assertNotIn(2, estimate['groups'].values())
+        self.assertNotIn(11, estimate['members'].values())
+
+    def test_groups_under_the_floor_are_never_counted(self):
+        make_group('a', 5)
+        make_group('tiny', 2)
+        self.assertFalse(self.estimate()['available'])
+
+    def test_sms_only_members_size_a_group_but_cannot_see_an_ad(self):
+        """Chat ads are seen in the app, so reach counts accounts only."""
+        make_group('a', 5, phone_only=4)  # one account: the admin
+        make_group('b', 5, phone_only=4)
+        self.assertEqual(reach.audience_groups('PH').count(), 2)
+        self.assertFalse(self.estimate()['available'])  # 2 accounts < 4
+
+    def test_a_person_in_two_groups_is_one_person(self):
+        shared = [User.objects.create_user(username=f'shared-{i}', password='pw') for i in range(2)]
+        make_group('a', 3, members=shared)
+        make_group('b', 3, members=shared)
+        # Two admins and the same two members: four people, not six.
+        self.assertEqual(self.estimate()['members'], {'low': 1, 'high': 5})
+
+    def test_undeclared_groups_match_any_but_never_a_named_choice(self):
+        make_group('school-1', 5, category=category('school'), region='PH-10')
+        make_group('school-2', 5, category=category('school'), region='PH-10')
+        make_group('unsaid-1', 5)
+        make_group('unsaid-2', 5)
+
+        self.assertEqual(reach.audience_groups('PH').count(), 4)
+        self.assertEqual(
+            reach.audience_groups('PH', categories=[category('school')]).count(), 2
+        )
+        self.assertEqual(reach.audience_groups('PH', regions=['PH-10']).count(), 2)
+
+    def test_anywhere_means_the_companys_own_country(self):
+        make_group('manila', 5, region='PH-00')
+        make_group('whole-ph', 5, region='PH')
+        make_group('california', 5, region='US-CA')
+        self.assertEqual(reach.audience_groups('PH').count(), 2)
+        self.assertEqual(reach.audience_groups('US').count(), 1)
+
+    def test_group_size_limits_narrow_it(self):
+        make_group('small', 4)
+        make_group('big', 8)
+        self.assertEqual(reach.audience_groups('PH', min_group_size=5).count(), 1)
+        self.assertEqual(reach.audience_groups('PH', max_group_size=5).count(), 1)
+
+    def test_only_regions_of_the_companys_country(self):
+        audience = reach.clean_audience(self.company, regions=['ph-10', 'PH-10'])
+        self.assertEqual(audience['regions'], ['PH-10'])
+        for code in ('US-CA', 'PH', 'PH-10-01', ''):
+            with self.assertRaises(Invalid):
+                reach.clean_audience(self.company, regions=[code])
+
+    def test_the_largest_group_size_cannot_be_below_the_smallest(self):
+        with self.assertRaises(Invalid):
+            reach.clean_audience(self.company, min_group_size=50, max_group_size=10)
+
+    def test_ranges(self):
+        self.assertEqual(reach.as_range(1), {'low': 1, 'high': 5})
+        self.assertEqual(reach.as_range(100), {'low': 100, 'high': 250})
+        self.assertEqual(reach.as_range(249), {'low': 100, 'high': 250})
+        self.assertEqual(reach.as_range(2_000_000), {'low': 1_000_000, 'high': None})
+
+
+@SMALL_FLOORS
+class CampaignServiceTests(TestCase):
+    def setUp(self):
+        self.owner = make_commercial_user('maria')
+        self.company = make_company(self.owner)
+        fund(self.company)
+        make_group('a', 5)
+        make_group('b', 5)
+
+    def draft(self, **fields):
+        fields.setdefault('objective', Campaign.Objective.WEBSITE)
+        return campaign_services.create_draft(self.company, self.owner, **fields)
+
+    def ready(self):
+        """A draft with every step done, ready to submit."""
+        campaign = self.draft(name='Lunch deal')
+        campaign_services.set_targeting(campaign)
+        campaign_services.update_draft(campaign, total_budget_cents=50_000)
+        campaign_services.add_creative(
+            campaign,
+            headline='Lunch for two',
+            body='Half price until 2pm.',
+            cta_label='See the menu',
+            cta_target='https://luna.example/menu',
+        )
+        return campaign
+
+    def kinds(self, campaign):
+        return list(campaign.events.values_list('kind', flat=True))
+
+    # --- drafts ----------------------------------------------------------
+
+    def test_a_new_campaign_is_a_draft_in_chat_with_its_creation_recorded(self):
+        campaign = self.draft()
+        self.assertEqual(campaign.status, Campaign.Status.DRAFT)
+        self.assertEqual(campaign.placement, Campaign.Placement.CHAT)
+        event = campaign.events.get()
+        self.assertEqual((event.kind, event.actor), ('created', self.owner))
+
+    def test_call_and_text_stay_hidden(self):
+        for objective in (Campaign.Objective.CALL, Campaign.Objective.TEXT):
+            with self.assertRaises(Invalid):
+                self.draft(objective=objective)
+        campaign = self.draft()
+        with self.assertRaises(Invalid):
+            campaign_services.update_draft(campaign, objective=Campaign.Objective.CALL)
+
+    def test_an_incomplete_draft_saves(self):
+        campaign = self.draft()
+        campaign_services.update_draft(campaign, daily_budget_cents=1_000)
+        campaign.refresh_from_db()
+        self.assertEqual((campaign.name, campaign.total_budget_cents), ('', None))
+        self.assertEqual(campaign.daily_budget_cents, 1_000)
+
+    def test_rules_between_fields_are_checked_as_soon_as_both_are_set(self):
+        campaign = self.draft()
+        campaign_services.update_draft(campaign, total_budget_cents=5_000)
+        with self.assertRaises(Invalid) as caught:
+            campaign_services.update_draft(campaign, daily_budget_cents=6_000)
+        self.assertIn('daily_budget_cents', caught.exception.errors)
+
+        start = timezone.now() + timedelta(days=2)
+        campaign_services.update_draft(campaign, starts_at=start)
+        with self.assertRaises(Invalid) as caught:
+            campaign_services.update_draft(campaign, ends_at=start)
+        self.assertIn('ends_at', caught.exception.errors)
+
+    def test_status_company_and_placement_are_not_editable(self):
+        campaign = self.draft()
+        for field, value in (
+            ('status', 'running'),
+            ('company', make_company(self.owner, 'Other')),
+            ('placement', 'chat'),
+        ):
+            with self.assertRaises(TypeError):
+                campaign_services.update_draft(campaign, **{field: value})
+
+    def test_a_draft_with_money_history_cannot_be_deleted(self):
+        campaign = self.draft()
+        AdTransaction.objects.create(
+            company=self.company,
+            campaign=campaign,
+            kind=AdTransaction.Kind.ADJUSTMENT,
+            amount_cents=100,
+            balance_after_cents=100,
+        )
+        with self.assertRaises(Refused):
+            campaign_services.delete_draft(campaign)
+        self.assertTrue(Campaign.objects.filter(pk=campaign.pk).exists())
+
+    def test_deleting_a_draft_takes_its_history_with_it(self):
+        campaign = self.draft()
+        campaign_services.delete_draft(campaign)
+        self.assertFalse(CampaignEvent.objects.exists())
+
+    # --- creatives -----------------------------------------------------
+
+    def creative(self, campaign, **fields):
+        fields.setdefault('headline', 'Lunch for two')
+        fields.setdefault('body', 'Half price until 2pm.')
+        fields.setdefault('cta_label', 'Go')
+        return campaign_services.add_creative(campaign, **fields)
+
+    def test_the_button_comes_from_the_objective(self):
+        creative = self.creative(self.draft(), cta_target='https://luna.example')
+        self.assertEqual(creative.cta_kind, 'link')
+
+    def test_a_link_must_be_https(self):
+        campaign = self.draft()
+        for target in ('http://luna.example', 'javascript:alert(1)', 'luna.example', ''):
+            with self.assertRaises(Invalid) as caught:
+                self.creative(campaign, cta_target=target)
+            self.assertIn('cta_target', caught.exception.errors)
+
+    def test_the_button_must_fit_the_objective(self):
+        with self.assertRaises(Invalid) as caught:
+            self.creative(
+                self.draft(), cta_kind='group_join', cta_target='https://loopdn.com/join/'
+            )
+        self.assertIn('cta_kind', caught.exception.errors)
+
+    @override_settings(FRONTEND_URL='https://loopdn.com')
+    def test_a_group_join_goes_to_loopdn_and_nowhere_else(self):
+        campaign = self.draft(objective=Campaign.Objective.GROUP_JOIN)
+        self.creative(campaign, cta_target='https://loopdn.com/join/?code=ABC234')
+        for target in (
+            'https://evil.example/loopdn.com',
+            'https://loopdn.com.evil.example/',
+            'https://user@loopdn.com/',
+            'http://loopdn.com/',
+        ):
+            with self.assertRaises(Invalid):
+                self.creative(campaign, cta_target=target)
+
+    def test_a_campaign_has_at_most_five_creatives(self):
+        campaign = self.draft()
+        for _ in range(campaign_services.MAX_CREATIVES_PER_CAMPAIGN):
+            self.creative(campaign, cta_target='https://luna.example')
+        with self.assertRaises(Refused):
+            self.creative(campaign, cta_target='https://luna.example')
+
+    # --- submit and withdraw -----------------------------------------------
+
+    def test_submit_names_every_missing_piece(self):
+        campaign = self.draft()
+        with self.assertRaises(transitions.SubmitRefused) as caught:
+            transitions.submit(campaign, self.owner)
+        self.assertEqual(
+            set(caught.exception.errors),
+            {'name', 'audience', 'total_budget_cents', 'creatives'},
+        )
+        campaign.refresh_from_db()
+        self.assertEqual(campaign.status, Campaign.Status.DRAFT)
+        self.assertEqual(self.kinds(campaign), ['created'])
+
+    def test_submit_refuses_an_audience_that_is_too_small(self):
+        campaign = self.ready()
+        campaign_services.set_targeting(campaign, categories=[category('school')])
+        with self.assertRaises(transitions.SubmitRefused) as caught:
+            transitions.submit(campaign, self.owner)
+        self.assertEqual(set(caught.exception.errors), {'audience'})
+
+    def test_submit_refuses_a_start_date_that_has_passed(self):
+        campaign = self.ready()
+        Campaign.objects.filter(pk=campaign.pk).update(
+            starts_at=timezone.now() - timedelta(hours=1)
+        )
+        with self.assertRaises(transitions.SubmitRefused) as caught:
+            transitions.submit(campaign, self.owner)
+        self.assertEqual(set(caught.exception.errors), {'starts_at'})
+
+    def test_a_suspended_company_cannot_submit(self):
+        campaign = self.ready()
+        Company.objects.filter(pk=self.company.pk).update(status=Company.Status.SUSPENDED)
+        with self.assertRaises(transitions.SubmitRefused) as caught:
+            transitions.submit(campaign, self.owner)
+        self.assertEqual(set(caught.exception.errors), {'company'})
+
+    def test_submit_sends_the_campaign_and_its_creatives_to_review(self):
+        campaign = transitions.submit(self.ready(), self.owner)
+
+        self.assertEqual(campaign.status, Campaign.Status.PENDING_REVIEW)
+        self.assertEqual(
+            set(campaign.creatives.values_list('status', flat=True)), {'pending_review'}
+        )
+        self.assertEqual(self.kinds(campaign), ['created', 'submitted'])
+
+    def test_nothing_reviewed_changes_after_submit(self):
+        campaign = transitions.submit(self.ready(), self.owner)
+        creative = campaign.creatives.get()
+
+        for change in (
+            lambda: campaign_services.update_draft(campaign, name='Changed'),
+            lambda: campaign_services.update_draft(campaign, total_budget_cents=1),
+            lambda: campaign_services.set_targeting(campaign),
+            lambda: self.creative(campaign, cta_target='https://luna.example'),
+            lambda: campaign_services.update_creative(creative, headline='Changed'),
+            lambda: campaign_services.delete_creative(creative),
+            lambda: campaign_services.delete_draft(campaign),
+        ):
+            with self.assertRaises(campaign_services.CampaignLocked):
+                change()
+
+        campaign.refresh_from_db()
+        creative.refresh_from_db()
+        self.assertEqual((campaign.name, campaign.total_budget_cents), ('Lunch deal', 50_000))
+        self.assertEqual(creative.headline, 'Lunch for two')
+
+    def test_an_edit_made_with_a_stale_copy_is_still_refused(self):
+        """The view's copy says draft; the row says submitted. The row wins."""
+        campaign = self.ready()
+        stale = Campaign.objects.get(pk=campaign.pk)
+        transitions.submit(campaign, self.owner)
+        with self.assertRaises(campaign_services.CampaignLocked):
+            campaign_services.update_draft(stale, name='Sneaked in')
+
+    def test_withdraw_returns_it_to_a_draft_that_can_change_again(self):
+        campaign = transitions.submit(self.ready(), self.owner)
+        campaign = transitions.withdraw(campaign, self.owner)
+
+        self.assertEqual(campaign.status, Campaign.Status.DRAFT)
+        self.assertEqual(set(campaign.creatives.values_list('status', flat=True)), {'draft'})
+        self.assertEqual(self.kinds(campaign), ['created', 'submitted', 'withdrawn'])
+        campaign_services.update_draft(campaign, name='Lunch deal, again')
+
+    def test_every_other_move_is_refused_and_writes_nothing(self):
+        draft = self.ready()
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.withdraw(draft, self.owner)
+
+        submitted = transitions.submit(self.ready(), self.owner)
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.submit(submitted, self.owner)
+
+        for status_ in ('approved', 'running', 'paused', 'ended'):
+            Campaign.objects.filter(pk=draft.pk).update(status=status_)
+            for move in (transitions.submit, transitions.withdraw):
+                with self.assertRaises(transitions.TransitionRefused):
+                    move(draft, self.owner)
+        self.assertEqual(self.kinds(draft), ['created'])
+        self.assertEqual(self.kinds(submitted), ['created', 'submitted'])
+
+
+@SMALL_FLOORS
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class CampaignApiTests(APITestCase):
+    url = '/api/v1/commercial/campaigns/'
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(MEDIA_ROOT, ignore_errors=True)
+
+    def setUp(self):
+        self.owner = make_commercial_user('maria')
+        self.company = make_company(self.owner, 'Luna Cafe')
+        fund(self.company)
+        self.stranger = make_commercial_user('someone-else')
+        self.strangers_company = make_company(self.stranger, 'City Fitness')
+        make_group('a', 5)
+        make_group('b', 5)
+        self.client.force_authenticate(user=self.owner)
+
+    def data(self, response, expected_status=status.HTTP_200_OK):
+        body = response.json()
+        self.assertEqual(response.status_code, expected_status, body)
+        self.assertEqual(body['code'], 1, body)
+        return body['data']
+
+    def refused(self, response, expected_status):
+        body = response.json()
+        self.assertEqual(response.status_code, expected_status, body)
+        self.assertEqual(body['code'], -1, body)
+        return body
+
+    def create(self, company=None, **fields):
+        body = {'company': (company or self.company).pk, 'objective': 'website'}
+        body.update(fields)
+        return self.client.post(self.url, body, format='json')
+
+    def detail(self, campaign_id, suffix=''):
+        return f'{self.url}{campaign_id}/{suffix}'
+
+    def add_creative(self, campaign_id, **fields):
+        body = {
+            'headline': 'Lunch for two',
+            'body': 'Half price until 2pm.',
+            'cta_label': 'See the menu',
+            'cta_target': 'https://luna.example/menu',
+        }
+        body.update(fields)
+        return self.client.post(self.detail(campaign_id, 'creatives/'), body, format='multipart')
+
+    def ready(self):
+        campaign = self.data(self.create(name='Lunch deal'), status.HTTP_201_CREATED)
+        self.data(self.client.put(self.detail(campaign['id'], 'targeting/'), {}, format='json'))
+        self.data(
+            self.client.patch(
+                self.detail(campaign['id']), {'total_budget_cents': 50_000}, format='json'
+            )
+        )
+        self.data(self.add_creative(campaign['id']), status.HTTP_201_CREATED)
+        return campaign
+
+    # --- who may call it ------------------------------------------------
+
+    def test_an_account_without_commercial_access_gets_nothing(self):
+        plain = User.objects.create_user(username='plain', password='pw')
+        self.client.force_authenticate(user=plain)
+        for url in (
+            f'{self.url}?company={self.company.pk}',
+            '/api/v1/commercial/categories/',
+        ):
+            self.refused(self.client.get(url), status.HTTP_403_FORBIDDEN)
+        self.refused(self.create(), status.HTTP_403_FORBIDDEN)
+        self.refused(
+            self.client.post(
+                '/api/v1/commercial/reach-estimate/', {'company': self.company.pk}, format='json'
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertFalse(Campaign.objects.exists())
+
+    def test_somebody_elses_campaign_is_a_404_everywhere(self):
+        theirs = campaign_services.create_draft(
+            self.strangers_company, self.stranger, objective='website'
+        )
+        creative = campaign_services.add_creative(
+            theirs, headline='h', body='b', cta_label='c', cta_target='https://x.example'
+        )
+        for response in (
+            self.client.get(self.detail(theirs.pk)),
+            self.client.patch(self.detail(theirs.pk), {'name': 'Mine now'}, format='json'),
+            self.client.delete(self.detail(theirs.pk)),
+            self.client.put(self.detail(theirs.pk, 'targeting/'), {}, format='json'),
+            self.client.get(self.detail(theirs.pk, 'creatives/')),
+            self.add_creative(theirs.pk),
+            self.client.post(self.detail(theirs.pk, 'submit/')),
+            self.client.post(self.detail(theirs.pk, 'withdraw/')),
+            self.client.patch(
+                f'/api/v1/commercial/creatives/{creative.pk}/', {'headline': 'x'}, format='json'
+            ),
+            self.client.delete(f'/api/v1/commercial/creatives/{creative.pk}/'),
+        ):
+            self.refused(response, status.HTTP_404_NOT_FOUND)
+
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.name, '')
+        self.assertEqual(theirs.creatives.count(), 1)
+        self.assertFalse(TargetingCriteria.objects.filter(campaign=theirs).exists())
+
+    # --- the list and creating -----------------------------------------
+
+    def test_the_list_names_its_company_and_shows_only_that_one(self):
+        self.refused(self.client.get(self.url), status.HTTP_400_BAD_REQUEST)
+        self.refused(
+            self.client.get(f'{self.url}?company={self.strangers_company.pk}'),
+            status.HTTP_404_NOT_FOUND,
+        )
+
+        second = make_company(self.owner, 'CDO Rentals')
+        mine = self.data(self.create(name='Lunch deal'), status.HTTP_201_CREATED)
+        self.data(self.create(company=second, name='Room for rent'), status.HTTP_201_CREATED)
+
+        page = self.data(self.client.get(f'{self.url}?company={self.company.pk}'))
+        self.assertEqual(page['count'], 1)
+        self.assertEqual(page['results'][0]['id'], mine['id'])
+        self.assertEqual(page['results'][0]['currency'], 'PHP')
+        self.assertEqual(page['results'][0]['country'], 'PH')
+
+    def test_the_list_narrows_by_status_and_name(self):
+        lunch = self.data(self.create(name='Lunch deal'), status.HTTP_201_CREATED)
+        self.data(self.create(name='Dinner deal'), status.HTTP_201_CREATED)
+        Campaign.objects.filter(pk=lunch['id']).update(status='pending_review')
+        url = f'{self.url}?company={self.company.pk}'
+
+        page = self.data(self.client.get(f'{url}&status=pending_review'))
+        self.assertEqual([c['name'] for c in page['results']], ['Lunch deal'])
+
+        page = self.data(self.client.get(f'{url}&search=DINNER'))
+        self.assertEqual([c['name'] for c in page['results']], ['Dinner deal'])
+
+        page = self.data(self.client.get(f'{url}&search=deal&status=draft'))
+        self.assertEqual(page['count'], 1)
+
+        body = self.refused(
+            self.client.get(f'{url}&status=deleted'), status.HTTP_400_BAD_REQUEST
+        )
+        self.assertIn('status', body['data'])
+
+    def test_creating_starts_a_draft_for_the_named_company(self):
+        created = self.data(self.create(name='Lunch deal'), status.HTTP_201_CREATED)
+        self.assertEqual(created['status'], 'draft')
+        self.assertEqual(created['placement'], 'chat')
+        self.assertEqual(created['company'], self.company.pk)
+        self.assertIsNone(created['targeting'])
+        self.assertEqual(created['creatives'], [])
+        self.assertEqual([e['kind'] for e in created['events']], ['created'])
+        self.assertEqual(created['events'][0]['by'], 'maria')
+
+    def test_creating_for_somebody_elses_company_is_a_404(self):
+        self.refused(self.create(company=self.strangers_company), status.HTTP_404_NOT_FOUND)
+        self.assertFalse(Campaign.objects.exists())
+
+    def test_call_and_text_are_refused(self):
+        body = self.refused(self.create(objective='call'), status.HTTP_400_BAD_REQUEST)
+        self.assertIn('objective', body['data'])
+
+    # --- editing a draft ---------------------------------------------------
+
+    def test_a_step_saves_and_the_body_cannot_reach_status_or_company(self):
+        campaign = self.data(self.create(), status.HTTP_201_CREATED)
+        saved = self.data(
+            self.client.patch(
+                self.detail(campaign['id']),
+                {
+                    'name': 'Lunch deal',
+                    'daily_budget_cents': 1_000,
+                    'status': 'running',
+                    'company': self.strangers_company.pk,
+                    'placement': 'elsewhere',
+                },
+                format='json',
+            )
+        )
+        self.assertEqual(saved['name'], 'Lunch deal')
+        self.assertEqual(saved['daily_budget_cents'], 1_000)
+        self.assertEqual(
+            (saved['status'], saved['company'], saved['placement']),
+            ('draft', self.company.pk, 'chat'),
+        )
+
+    def test_a_daily_cap_over_the_total_is_a_field_error(self):
+        campaign = self.data(self.create(), status.HTTP_201_CREATED)
+        body = self.refused(
+            self.client.patch(
+                self.detail(campaign['id']),
+                {'total_budget_cents': 1_000, 'daily_budget_cents': 2_000},
+                format='json',
+            ),
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertIn('daily_budget_cents', body['data'])
+
+    def test_there_is_no_put_on_a_campaign(self):
+        campaign = self.data(self.create(), status.HTTP_201_CREATED)
+        self.refused(
+            self.client.put(self.detail(campaign['id']), {'name': 'x'}, format='json'),
+            status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    def test_the_audience_is_saved_by_slug_and_region_code(self):
+        campaign = self.data(self.create(), status.HTTP_201_CREATED)
+        saved = self.data(
+            self.client.put(
+                self.detail(campaign['id'], 'targeting/'),
+                {'categories': ['school', 'religious'], 'regions': ['PH-10'], 'min_group_size': 20},
+                format='json',
+            )
+        )
+        self.assertEqual(
+            saved['targeting'],
+            {
+                'categories': ['school', 'religious'],
+                'regions': ['PH-10'],
+                'min_group_size': 20,
+                'max_group_size': None,
+            },
+        )
+
+        body = self.refused(
+            self.client.put(
+                self.detail(campaign['id'], 'targeting/'), {'regions': ['US-CA']}, format='json'
+            ),
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertIn('regions', body['data'])
+
+    def test_deleting_a_draft(self):
+        campaign = self.data(self.create(), status.HTTP_201_CREATED)
+        response = self.client.delete(self.detail(campaign['id']))
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Campaign.objects.exists())
+
+    # --- creatives -----------------------------------------------------------
+
+    def test_a_creative_is_added_with_its_image_and_edited(self):
+        campaign = self.data(self.create(), status.HTTP_201_CREATED)
+        creative = self.data(
+            self.add_creative(campaign['id'], image=make_logo_upload('ad.png')),
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(creative['cta_kind'], 'link')
+        self.assertEqual(creative['status'], 'draft')
+        self.assertIn('/commercial/media/', creative['image_url'])
+        self.assertNotIn('/ads/', creative['image_url'])
+
+        url = f'/api/v1/commercial/creatives/{creative["id"]}/'
+        edited = self.data(self.client.patch(url, {'headline': 'Dinner too'}, format='json'))
+        self.assertEqual(edited['headline'], 'Dinner too')
+        self.assertIsNotNone(edited['image_url'])
+
+        cleared = self.data(self.client.patch(url, {'image': None}, format='json'))
+        self.assertIsNone(cleared['image_url'])
+
+    def test_a_creative_needs_an_image_that_is_an_image_and_a_safe_link(self):
+        campaign = self.data(self.create(), status.HTTP_201_CREATED)
+        not_an_image = SimpleUploadedFile('ad.png', b'not an image', content_type='image/png')
+        body = self.refused(
+            self.add_creative(campaign['id'], image=not_an_image), status.HTTP_400_BAD_REQUEST
+        )
+        self.assertIn('image', body['data'])
+
+        body = self.refused(
+            self.add_creative(campaign['id'], cta_target='http://luna.example'),
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertIn('cta_target', body['data'])
+
+        body = self.refused(
+            self.add_creative(campaign['id'], headline='  '), status.HTTP_400_BAD_REQUEST
+        )
+        self.assertIn('headline', body['data'])
+        self.assertFalse(Creative.objects.exists())
+
+    # --- reach ----------------------------------------------------------------
+
+    def test_reach_is_ranges_or_too_small_and_only_for_your_companies(self):
+        url = '/api/v1/commercial/reach-estimate/'
+        estimate = self.data(self.client.post(url, {'company': self.company.pk}, format='json'))
+        self.assertEqual(estimate['available'], True)
+        self.assertEqual(set(estimate['groups']), {'low', 'high'})
+
+        estimate = self.data(
+            self.client.post(
+                url, {'company': self.company.pk, 'categories': ['school']}, format='json'
+            )
+        )
+        self.assertEqual(estimate, {'available': False, 'reason': 'Audience is too small.'})
+
+        self.refused(
+            self.client.post(url, {'company': self.strangers_company.pk}, format='json'),
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    # --- submit and withdraw ---------------------------------------------------
+
+    def test_submit_lists_what_is_missing(self):
+        campaign = self.data(self.create(), status.HTTP_201_CREATED)
+        body = self.refused(
+            self.client.post(self.detail(campaign['id'], 'submit/')),
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(
+            set(body['data']), {'name', 'audience', 'total_budget_cents', 'creatives'}
+        )
+
+    def test_submit_then_locked_then_withdraw(self):
+        campaign = self.ready()
+
+        submitted = self.data(self.client.post(self.detail(campaign['id'], 'submit/')))
+        self.assertEqual(submitted['status'], 'pending_review')
+        self.assertEqual(submitted['creatives'][0]['status'], 'pending_review')
+        self.assertEqual([e['kind'] for e in submitted['events']], ['created', 'submitted'])
+
+        body = self.refused(
+            self.client.patch(self.detail(campaign['id']), {'name': 'x'}, format='json'),
+            status.HTTP_409_CONFLICT,
+        )
+        self.assertIn('Withdraw', body['message'])
+        self.refused(
+            self.client.post(self.detail(campaign['id'], 'submit/')), status.HTTP_409_CONFLICT
+        )
+
+        withdrawn = self.data(self.client.post(self.detail(campaign['id'], 'withdraw/')))
+        self.assertEqual(withdrawn['status'], 'draft')
+        self.assertEqual(withdrawn['events'][-1]['kind'], 'withdrawn')
+
+    # --- the lists the builder picks from -------------------------------------
+
+    def test_categories_are_the_active_ones_in_order(self):
+        GroupCategory.objects.filter(slug='business').update(active=False)
+        categories = self.data(self.client.get('/api/v1/commercial/categories/'))
+        self.assertEqual(categories[0], {'slug': 'family-friends', 'label': 'Family and friends'})
+        self.assertNotIn('business', [c['slug'] for c in categories])
+
+    def test_markets_list_each_countrys_regions(self):
+        markets = self.data(self.client.get('/api/v1/commercial/markets/'))
+        ph = next(c for c in markets['countries'] if c['code'] == 'PH')
+        self.assertIn({'code': 'PH-10', 'name': 'Northern Mindanao'}, ph['regions'])
+
+
+# --- slice 3: money -------------------------------------------------------------
+
+
+@SMALL_FLOORS
+class MoneyFlowTests(TestCase):
+    """Section 9 of the plan: reserve at submit, release on withdraw, never twice."""
+
+    def setUp(self):
+        self.owner = make_commercial_user('maria')
+        self.company = make_company(self.owner)  # PHP
+        make_group('a', 5)
+        make_group('b', 5)
+
+    def ready(self, budget_cents=50_000, name='Lunch deal'):
+        campaign = campaign_services.create_draft(
+            self.company, self.owner, objective=Campaign.Objective.WEBSITE, name=name
+        )
+        campaign_services.set_targeting(campaign)
+        campaign_services.update_draft(campaign, total_budget_cents=budget_cents)
+        campaign_services.add_creative(
+            campaign, headline='h', body='b', cta_label='Go', cta_target='https://luna.example'
+        )
+        return campaign
+
+    def buckets(self):
+        self.company.refresh_from_db()
+        return self.company.balance_cents, self.company.reserved_cents
+
+    def test_the_launch_prices_are_seeded(self):
+        self.assertEqual(pricing.rate_in_force('chat', 'PHP').cpm_cents, 5_000)
+        self.assertEqual(pricing.rate_in_force('chat', 'USD').cpm_cents, 100)
+        self.assertEqual(pricing.views_for(50_000, 5_000), 10_000)
+
+    def test_a_payment_is_credited_once(self):
+        wallet.credit_purchase(self.company, amount_cents=80_000, stripe_payment_intent_id='pi_1')
+        wallet.credit_purchase(self.company, amount_cents=80_000, stripe_payment_intent_id='pi_1')
+        self.assertEqual(self.buckets(), (80_000, 0))
+        row = AdTransaction.objects.get()
+        self.assertEqual((row.kind, row.amount_cents, row.balance_after_cents), ('credit_purchase', 80_000, 80_000))
+
+    def test_submit_fixes_the_price_and_sets_the_budget_aside(self):
+        fund(self.company, 80_000)
+        campaign = transitions.submit(self.ready(50_000), self.owner)
+
+        self.assertEqual(self.buckets(), (30_000, 50_000))
+        self.assertEqual((campaign.cpm_cents, campaign.reserved_cents), (5_000, 50_000))
+        row = AdTransaction.objects.get(kind='campaign_reserve')
+        self.assertEqual(
+            (row.campaign_id, row.amount_cents, row.reserved_change_cents,
+             row.balance_after_cents, row.reserved_after_cents),
+            (campaign.pk, -50_000, 50_000, 30_000, 50_000),
+        )
+        event = campaign.events.get(kind='submitted')
+        self.assertEqual(event.metadata, {'cpm_cents': 5_000, 'reserved_cents': 50_000})
+        self.assertEqual(campaign.events.count(), 2)  # created, submitted: one per move
+
+    def test_short_of_money_nothing_moves_and_submit_says_how_much(self):
+        fund(self.company, 20_000)
+        campaign = self.ready(50_000)
+        with self.assertRaises(transitions.SubmitRefused) as caught:
+            transitions.submit(campaign, self.owner)
+        self.assertEqual(set(caught.exception.errors), {'funds'})
+        self.assertIn('PHP 300.00', caught.exception.errors['funds'])
+
+        campaign.refresh_from_db()
+        self.assertEqual((campaign.status, campaign.cpm_cents, campaign.reserved_cents), ('draft', None, 0))
+        self.assertEqual(self.buckets(), (20_000, 0))
+        self.assertFalse(AdTransaction.objects.filter(kind='campaign_reserve').exists())
+
+    def test_two_campaigns_cannot_be_promised_the_same_money(self):
+        fund(self.company, 60_000)
+        first, second = self.ready(50_000, 'First'), self.ready(50_000, 'Second')
+        transitions.submit(first, self.owner)
+        with self.assertRaises(transitions.SubmitRefused) as caught:
+            transitions.submit(second, self.owner)
+        self.assertIn('funds', caught.exception.errors)
+        self.assertEqual(self.buckets(), (10_000, 50_000))
+
+    def test_withdraw_returns_the_money_and_forgets_the_price(self):
+        fund(self.company, 80_000)
+        campaign = transitions.submit(self.ready(50_000), self.owner)
+        campaign = transitions.withdraw(campaign, self.owner)
+
+        self.assertEqual(self.buckets(), (80_000, 0))
+        self.assertEqual((campaign.cpm_cents, campaign.reserved_cents), (None, 0))
+        row = AdTransaction.objects.get(kind='campaign_release')
+        self.assertEqual((row.amount_cents, row.reserved_change_cents), (50_000, -50_000))
+        self.assertEqual(campaign.events.get(kind='withdrawn').metadata, {'released_cents': 50_000})
+
+    def test_a_campaign_keeps_the_price_it_was_submitted_at(self):
+        fund(self.company, 200_000)
+        campaign = transitions.submit(self.ready(50_000), self.owner)
+        PricingRate.objects.create(
+            placement='chat', currency='PHP', cpm_cents=9_000, effective_from=timezone.now()
+        )
+
+        campaign.refresh_from_db()
+        self.assertEqual(campaign.cpm_cents, 5_000)
+
+        # Withdrawn and resubmitted, it takes the price in force then.
+        transitions.withdraw(campaign, self.owner)
+        campaign = transitions.submit(campaign, self.owner)
+        self.assertEqual(campaign.cpm_cents, 9_000)
+
+    def test_no_price_in_the_currency_means_no_submit(self):
+        fund(self.company, 80_000)
+        PricingRate.objects.filter(currency='PHP').delete()
+        with self.assertRaises(transitions.SubmitRefused) as caught:
+            transitions.submit(self.ready(50_000), self.owner)
+        self.assertEqual(set(caught.exception.errors), {'pricing'})
+
+    def test_a_running_campaigns_budget_only_goes_up_and_reserves_the_difference(self):
+        fund(self.company, 100_000)
+        campaign = transitions.submit(self.ready(50_000), self.owner)
+
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.increase_budget(campaign, self.owner, 80_000)  # still in review
+
+        Campaign.objects.filter(pk=campaign.pk).update(status='running')
+        for smaller in (50_000, 40_000):
+            with self.assertRaises(Invalid):
+                transitions.increase_budget(campaign, self.owner, smaller)
+
+        campaign = transitions.increase_budget(campaign, self.owner, 80_000)
+        self.assertEqual((campaign.total_budget_cents, campaign.reserved_cents), (80_000, 80_000))
+        self.assertEqual(self.buckets(), (20_000, 80_000))
+        event = campaign.events.get(kind='budget_increased')
+        self.assertEqual(event.metadata, {'from_cents': 50_000, 'to_cents': 80_000, 'reserved_cents': 30_000})
+
+        with self.assertRaises(Invalid) as caught:
+            transitions.increase_budget(campaign, self.owner, 200_000)
+        self.assertIn('funds', caught.exception.errors)
+        self.assertEqual(self.buckets(), (20_000, 80_000))
+
+
+def checkout_completed(company, *, event_id='evt_1', payment_intent='pi_1', amount=100_000,
+                       currency='php', paid=True, event_type='checkout.session.completed'):
+    """A Stripe event for a finished company top-up, as the webhook receives it."""
+    return {
+        'id': event_id,
+        'type': event_type,
+        'data': {'object': {
+            'id': f'cs_{event_id}',
+            'mode': 'payment',
+            'payment_status': 'paid' if paid else 'unpaid',
+            'payment_intent': payment_intent,
+            'amount_total': amount,
+            'currency': currency,
+            'metadata': {'kind': 'commercial_funds', 'company_id': str(company.pk), 'amount_cents': str(amount)},
+        }},
+    }
+
+
+@SMALL_FLOORS
+@override_settings(BILLING_ALLOWED_REDIRECT_ORIGINS={'http://commercial.localhost:3000'})
+class MoneyApiTests(APITestCase):
+    webhook_url = '/api/v1/billing/webhooks/stripe/'
+
+    def setUp(self):
+        cache.clear()  # the checkout throttle counts in the cache
+        self.owner = make_commercial_user('maria')
+        self.company = make_company(self.owner, 'Luna Cafe')
+        self.stranger = make_commercial_user('someone-else')
+        self.strangers_company = make_company(self.stranger, 'City Fitness')
+        self.client.force_authenticate(user=self.owner)
+
+    def data(self, response, expected_status=status.HTTP_200_OK):
+        body = response.json()
+        self.assertEqual(response.status_code, expected_status, body)
+        return body['data']
+
+    def checkout(self, company=None, **fields):
+        body = {
+            'amount_cents': 100_000,
+            'success_url': 'http://commercial.localhost:3000/balance/?checkout=success',
+            'cancel_url': 'http://commercial.localhost:3000/balance/?checkout=cancelled',
+        }
+        body.update(fields)
+        return self.client.post(
+            f'/api/v1/commercial/companies/{(company or self.company).pk}/checkout/',
+            body, format='json',
+        )
+
+    def post_event(self, event):
+        with mock.patch('stripe.Webhook.construct_event', return_value=event):
+            return self.client.post(
+                self.webhook_url, data=json.dumps(event), content_type='application/json',
+                HTTP_STRIPE_SIGNATURE='test',
+            )
+
+    def test_pricing_is_the_rate_in_force_for_the_companys_currency(self):
+        rate = self.data(self.client.get(f'/api/v1/commercial/pricing/?company={self.company.pk}'))
+        self.assertEqual((rate['currency'], rate['cpm_cents']), ('PHP', 5_000))
+        self.assertEqual(
+            self.client.get(f'/api/v1/commercial/pricing/?company={self.strangers_company.pk}').status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_checkout_opens_a_stripe_payment_on_the_companys_own_customer(self):
+        with mock.patch('stripe.Customer.create', return_value={'id': 'cus_luna'}) as create_customer, \
+             mock.patch('stripe.checkout.Session.create', return_value={'url': 'https://checkout.stripe.com/x'}) as create_session:
+            started = self.data(self.checkout())
+
+        self.assertEqual(started, {'checkout_url': 'https://checkout.stripe.com/x'})
+        self.assertEqual(create_customer.call_args.kwargs['name'], 'Luna Cafe')
+        kwargs = create_session.call_args.kwargs
+        self.assertEqual(kwargs['customer'], 'cus_luna')
+        self.assertEqual(kwargs['line_items'][0]['price_data']['currency'], 'php')
+        self.assertEqual(kwargs['line_items'][0]['price_data']['unit_amount'], 100_000)
+        self.assertEqual(kwargs['metadata']['kind'], 'commercial_funds')
+        self.company.refresh_from_db()
+        self.assertEqual(self.company.stripe_customer_id, 'cus_luna')
+        # Starting a payment moves no money.
+        self.assertEqual(self.company.balance_cents, 0)
+
+    def test_checkout_refuses_small_amounts_strange_return_addresses_and_strangers(self):
+        with mock.patch('stripe.Customer.create') as create_customer, \
+             mock.patch('stripe.checkout.Session.create') as create_session:
+            body = self.checkout(amount_cents=49_999).json()
+            self.assertIn('amount_cents', body['data'])
+            self.assertIn('PHP 500.00', body['message'])
+            self.assertEqual(
+                self.checkout(success_url='https://evil.example/').status_code,
+                status.HTTP_400_BAD_REQUEST,
+            )
+            self.assertEqual(
+                self.checkout(company=self.strangers_company).status_code,
+                status.HTTP_404_NOT_FOUND,
+            )
+        create_customer.assert_not_called()
+        create_session.assert_not_called()
+
+    def test_a_paid_checkout_credits_the_company_once(self):
+        response = self.post_event(checkout_completed(self.company))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.company.refresh_from_db()
+        self.assertEqual(self.company.balance_cents, 100_000)
+
+        # The same event again, and the same payment under a new event id.
+        self.post_event(checkout_completed(self.company))
+        self.post_event(checkout_completed(self.company, event_id='evt_2'))
+        self.company.refresh_from_db()
+        self.assertEqual(self.company.balance_cents, 100_000)
+        self.assertEqual(AdTransaction.objects.filter(kind='credit_purchase').count(), 1)
+
+    def test_an_unpaid_or_foreign_currency_checkout_credits_nothing(self):
+        self.post_event(checkout_completed(self.company, paid=False))
+        self.post_event(checkout_completed(self.company, event_id='evt_2', payment_intent='pi_2', currency='usd'))
+        self.company.refresh_from_db()
+        self.assertEqual(self.company.balance_cents, 0)
+
+        # A delayed payment that clears later arrives as its own event.
+        self.post_event(checkout_completed(
+            self.company, event_id='evt_3', event_type='checkout.session.async_payment_succeeded'
+        ))
+        self.company.refresh_from_db()
+        self.assertEqual(self.company.balance_cents, 100_000)
+
+    def test_the_ledger_lists_every_movement_newest_first(self):
+        fund(self.company, 80_000)
+        make_group('a', 5)
+        make_group('b', 5)
+        campaign = campaign_services.create_draft(self.company, self.owner, objective='website', name='Lunch deal')
+        campaign_services.set_targeting(campaign)
+        campaign_services.update_draft(campaign, total_budget_cents=50_000)
+        campaign_services.add_creative(campaign, headline='h', body='b', cta_label='Go', cta_target='https://luna.example')
+        transitions.submit(campaign, self.owner)
+
+        page = self.data(self.client.get(f'/api/v1/commercial/companies/{self.company.pk}/transactions/'))
+        self.assertEqual([row['kind'] for row in page['results']], ['campaign_reserve', 'credit_purchase'])
+        self.assertEqual(page['results'][0]['campaign_name'], 'Lunch deal')
+        self.assertEqual(page['results'][0]['reserved_after_cents'], 50_000)
+        self.assertEqual(
+            self.client.get(f'/api/v1/commercial/companies/{self.strangers_company.pk}/transactions/').status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+        company = self.data(self.client.get(f'/api/v1/commercial/companies/{self.company.pk}/'))
+        self.assertEqual((company['balance_cents'], company['reserved_cents']), (30_000, 50_000))
+
+        detail = self.data(self.client.get(f'/api/v1/commercial/campaigns/{campaign.pk}/'))
+        self.assertEqual((detail['cpm_cents'], detail['reserved_cents'], detail['deletable']), (5_000, 50_000, False))
+
+    def test_budget_increase_over_the_api(self):
+        fund(self.company, 100_000)
+        campaign = Campaign.objects.create(
+            company=self.company, name='Running', objective='website', total_budget_cents=50_000,
+            status='running', reserved_cents=0,
+        )
+        url = f'/api/v1/commercial/campaigns/{campaign.pk}/budget/'
+        raised = self.data(self.client.post(url, {'total_budget_cents': 70_000}, format='json'))
+        self.assertEqual(raised['total_budget_cents'], 70_000)
+        self.assertEqual(
+            self.client.post(url, {'total_budget_cents': 60_000}, format='json').status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        Campaign.objects.filter(pk=campaign.pk).update(status='ended')
+        self.assertEqual(
+            self.client.post(url, {'total_budget_cents': 90_000}, format='json').status_code,
+            status.HTTP_409_CONFLICT,
+        )
+
+    def test_without_commercial_access_there_is_no_money_either(self):
+        plain = User.objects.create_user(username='plain', password='pw')
+        self.client.force_authenticate(user=plain)
+        for response in (
+            self.client.get(f'/api/v1/commercial/pricing/?company={self.company.pk}'),
+            self.client.get(f'/api/v1/commercial/companies/{self.company.pk}/transactions/'),
+            self.checkout(),
+        ):
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

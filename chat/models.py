@@ -265,6 +265,27 @@ class Conversation(models.Model):
         related_name='conversations_created',
     )
 
+    # Groups only. What kind of group this is and where it is, as its admin
+    # declares them: the only two facts about a group that advertising may
+    # target on (§13), and never worked out from anything anybody wrote.
+    #
+    # Both start empty. An undeclared group matches a campaign that targets
+    # "any", never one that names a category or a region
+    # (docs/campaigns_final_plan.md, slice 1); the group's settings let an
+    # admin set them in slice 4.
+    #
+    # PROTECT: a category is retired with `active=False`, never deleted.
+    category = models.ForeignKey(
+        GroupCategory,
+        on_delete=models.PROTECT,
+        related_name='conversations',
+        null=True,
+        blank=True,
+    )
+    # ISO 3166: a country ("PH") or a country and its first-level subdivision
+    # ("PH-10"). Never finer - a city on a small group is not aggregate.
+    region = models.CharField(max_length=6, blank=True, default='', db_default='')
+
     # -------------------------
     # SMS SETTINGS
     # -------------------------

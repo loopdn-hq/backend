@@ -123,10 +123,12 @@ CSRF_TRUSTED_ORIGINS = [
 # exactly like a server that is not there. Set it wherever ALLOWED_HOSTS is
 # set, with the scheme included: matching is on scheme, host and port.
 #
-# commercial.localhost is the commercial site in development: the same frontend,
-# told apart by hostname (frontend-web/src/lib/config/site.ts).
+# commercial.localhost and admin.localhost are the commercial and admin sites in
+# development: the same frontend, told apart by hostname
+# (frontend-web/src/lib/config/site.ts).
 _default_cors_origins = (
-    'http://localhost:3000,http://127.0.0.1:3000,http://commercial.localhost:3000'
+    'http://localhost:3000,http://127.0.0.1:3000,http://commercial.localhost:3000,'
+    'http://admin.localhost:3000'
     if DEBUG else ''
 )
 CORS_ALLOWED_ORIGINS = [
@@ -820,6 +822,9 @@ MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024
 # these ceilings to reach the failure path, one app at a time.
 MAX_GROUP_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024
 
+# A campaign creative's image: shown as a card in chat, so the same ceiling.
+MAX_CREATIVE_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024
+
 # Chat attachments. The ceiling is per file, and the count is per message,
 # so one request can carry at most 10 x 25MB.
 MAX_ATTACHMENT_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -1068,6 +1073,21 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 86400.0,
     },
 }
+
+
+# Campaigns: the privacy floors (docs/campaigns_final_plan.md, decision 12)
+#
+# Provisional values, chosen for slice 1's reach estimate and to be settled by
+# slice 5, when ads are first served. Environment-tunable so that settling them
+# is not a deploy.
+#
+# A group smaller than this never carries an ad and is never counted in reach:
+# in a group of four, "a member saw this" is close to naming the member.
+MIN_GROUP_SIZE_FOR_ADS = int(os.environ.get('MIN_GROUP_SIZE_FOR_ADS', '3'))
+# Below either, an audience is "too small" and no number is given at all. A
+# range over two groups narrows down to the groups, and §13 forbids naming one.
+MIN_ELIGIBLE_GROUPS = int(os.environ.get('MIN_ELIGIBLE_GROUPS', '5'))
+MIN_ELIGIBLE_MEMBERS = int(os.environ.get('MIN_ELIGIBLE_MEMBERS', '3'))
 
 
 # Stripe (payments and webhooks)

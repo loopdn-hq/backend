@@ -22,7 +22,14 @@ class Creative(models.Model):
     """What a sponsored message actually says and shows.
 
     Only `approved` creatives are ever selected, and that is a queryset filter
-    in commercial/services.py rather than a check anybody can forget (plan, Stage 4).
+    in commercial/services/serving.py (slice 5) rather than a check anybody can
+    forget. `status` follows the campaign through review: submitting sends
+    every creative to `pending_review`, withdrawing brings them back to `draft`
+    (services/transitions.py).
+
+    Saved whole, never half: the builder's draft may be incomplete, but a
+    creative is added with its button and its destination, which is what lets
+    the constraint below stay.
 
     A call or text CTA carries no number of its own. It uses the campaign's
     tracking number (plan 2c), so no creative can route a response around the

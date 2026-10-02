@@ -2,6 +2,19 @@ from django.db import models
 from django.db.models import F, Q
 
 
+class CampaignQuerySet(models.QuerySet):
+    def manageable_by(self, user):
+        """The campaigns this person may see and change. Every lookup starts here.
+
+        Whatever `Company.objects.manageable_by` allows, so the day several
+        people manage one company (docs/rbac_plan.md, step 9) this follows
+        without a change. Somebody else's campaign is a 404.
+        """
+        from commercial.models import Company
+
+        return self.filter(company__in=Company.objects.manageable_by(user))
+
+
 class Campaign(models.Model):
     """One ad campaign: what the company wants, what it may spend, and when.
 
@@ -12,6 +25,11 @@ class Campaign(models.Model):
     Selection (plan 1b) reads `status`, the dates and the budget; it never runs
     a campaign whose status is not `running`, so every way of stopping one -
     the company, a reviewer, an empty balance - is a status change.
+
+    `status` is the truth, and only services/transitions.py writes it. A draft
+    may be incomplete - the builder saves as it goes - so the name and the
+    budget may be empty until submit, which is the only gate
+    (docs/campaigns_final_plan.md, section 7).
     """
 
     class Objective(models.TextChoices):
@@ -34,6 +52,12 @@ class Campaign(models.Model):
         PAUSED = 'paused', 'Paused'
         ENDED = 'ended', 'Ended'
 
+    class Placement(models.TextChoices):
+        # Where the ad appears. A sponsored card in a group's chat is the only
+        # one at first (plan decision 4), but it is a field from day one so the
+        # group list or Discover later is a new choice, not a new mechanism.
+        CHAT = 'chat', 'In group chats'
+
     class Pacing(models.TextChoices):
         # Spread the budget across the campaign's dates.
         STANDARD = 'standard', 'Spread evenly'
@@ -43,8 +67,15 @@ class Campaign(models.Model):
     company = models.ForeignKey(
         'commercial.Company', on_delete=models.CASCADE, related_name='campaigns'
     )
-    name = models.CharField(max_length=120)
+    # Blank while it is a draft nobody has named yet. Submit requires one.
+    name = models.CharField(max_length=120, blank=True, default='', db_default='')
     objective = models.CharField(max_length=16, choices=Objective.choices)
+    placement = models.CharField(
+        max_length=16,
+        choices=Placement.choices,
+        default=Placement.CHAT,
+        db_default=Placement.CHAT,
+    )
     status = models.CharField(
         max_length=16,
         choices=Status.choices,
@@ -58,9 +89,21 @@ class Campaign(models.Model):
         db_default=Pacing.STANDARD,
     )
 
-    total_budget_cents = models.PositiveIntegerField()
+    # In the company's currency. Null on a draft whose budget step is not done
+    # yet; submit requires it.
+    total_budget_cents = models.PositiveIntegerField(null=True, blank=True)
     # Null means no daily cap: pacing alone decides how the total is spent.
     daily_budget_cents = models.PositiveIntegerField(null=True, blank=True)
+
+    # The price per 1,000 viewed ads, copied from the PricingRate in force
+    # when it was submitted, so a later price change never alters a campaign
+    # already bought. Null on a draft: withdrawing clears it, and resubmitting
+    # takes the price in force then.
+    cpm_cents = models.PositiveIntegerField(null=True, blank=True)
+    # This campaign's share of the company's reserved money, not yet spent,
+    # and what it has been charged. Only services/wallet.py writes them.
+    reserved_cents = models.PositiveIntegerField(default=0, db_default=0)
+    spent_cents = models.PositiveIntegerField(default=0, db_default=0)
 
     # Null while it is a draft nobody has scheduled yet.
     starts_at = models.DateTimeField(null=True, blank=True)
@@ -69,12 +112,17 @@ class Campaign(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = CampaignQuerySet.as_manager()
+
     class Meta:
         ordering = ['-created_at']
         constraints = [
+            # Unset on a draft, but never zero: "no budget" is one state.
             models.CheckConstraint(
-                condition=Q(total_budget_cents__gt=0),
-                name='commercial_campaign_has_a_budget',
+                condition=(
+                    Q(total_budget_cents__isnull=True) | Q(total_budget_cents__gt=0)
+                ),
+                name='commercial_campaign_budget_positive',
             ),
             models.CheckConstraint(
                 condition=(
@@ -98,4 +146,4 @@ class Campaign(models.Model):
         ]
 
     def __str__(self):
-        return self.name
+        return self.name or f'Untitled campaign #{self.pk}'

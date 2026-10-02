@@ -106,8 +106,13 @@ class Company(models.Model):
         db_default=Status.ACTIVE,
     )
 
-    # Cents, like billing.Wallet, so pricing is integer arithmetic.
+    # Cents, like billing.Wallet, so pricing is integer arithmetic. Two
+    # buckets (docs/campaigns_final_plan.md, section 9): `balance_cents` is
+    # AVAILABLE - free to commit to a new campaign - and `reserved_cents` is
+    # committed to submitted campaigns and not yet spent. Only
+    # services/wallet.py writes either.
     balance_cents = models.IntegerField(default=0, db_default=0)
+    reserved_cents = models.IntegerField(default=0, db_default=0)
     # The business's own Stripe customer, not its owner's (that one is on
     # billing.Subscription): receipts carry the company's name and tax details,
     # and the card on file is the business's, not the person's.
@@ -128,6 +133,10 @@ class Company(models.Model):
             models.CheckConstraint(
                 condition=Q(balance_cents__gte=0),
                 name='commercial_company_balance_non_negative',
+            ),
+            models.CheckConstraint(
+                condition=Q(reserved_cents__gte=0),
+                name='commercial_company_reserved_non_negative',
             ),
             # Two companies on one Stripe customer would pay for each other's
             # campaigns. Blank means "no customer yet" and may repeat.
