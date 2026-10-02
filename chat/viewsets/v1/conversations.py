@@ -388,14 +388,20 @@ class ConversationViewSet(
         if not conversation.may_edit_group(request.user):
             raise PermissionDenied('You cannot edit this group.')
 
+        serializer = self.get_serializer(conversation, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+
         # The policy settings stay with admins even where members may edit the
         # name and photo, or a member could simply grant themselves the rest.
-        asked_for = set((request.data.get('settings') or {}))
+        #
+        # Read from what the serializer parsed, not from `request.data`. A photo
+        # makes the request multipart, where the nested object arrives as
+        # `settings.join_mode` keys and `request.data['settings']` is absent -
+        # so checking the raw body let those keys through unchecked.
+        asked_for = set(serializer.validated_data.get('settings') or {})
         if asked_for & ADMIN_ONLY_SETTINGS and not conversation.is_admin(request.user):
             raise PermissionDenied('Only a group admin can change group settings.')
 
-        serializer = self.get_serializer(conversation, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
         conversation = serializer.save()
 
         # No re-fetch, unlike `members`: this writes the conversation row

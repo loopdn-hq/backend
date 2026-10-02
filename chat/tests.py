@@ -2682,6 +2682,46 @@ class GroupCreationWithSettingsTests(EnvelopeAssertions, APITestCase):
             {self.alice.profile.display_label, self.bob.profile.display_label, 'Mom'},
         )
 
+    @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+    def test_everything_in_one_form_with_a_photo(self):
+        # The shape the web app sends when a photo is chosen: a file makes the
+        # request multipart, so lists are repeated keys, the invite list is
+        # `invite[0]phone_number`, and settings are `settings.mode`.
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {
+                    'name': 'Family',
+                    'description': 'Home things',
+                    'image': make_image_upload('group.png'),
+                    'members': ['bob'],
+                    'invite[0]phone_number': '+639171111111',
+                    'invite[0]display_name': 'Mom',
+                    'invite_email': ['aunt@example.com'],
+                    'settings.mode': 'broadcast',
+                    'settings.join_mode': 'code',
+                    'settings.add_member_permission': 'members',
+                    'settings.sms_replies_enabled': 'false',
+                },
+                format='multipart',
+            ),
+            status.HTTP_201_CREATED,
+        )
+        self.assertIsNotNone(data['image_url'])
+        group = Conversation.objects.get(pk=data['id'])
+
+        self.assertEqual(group.description, 'Home things')
+        self.assertEqual(group.mode, Conversation.Mode.BROADCAST)
+        self.assertEqual(group.join_mode, Conversation.JoinMode.CODE)
+        self.assertEqual(group.add_member_permission, 'members')
+        self.assertFalse(group.sms_replies_enabled)
+        self.assertTrue(group.has_participant(self.bob))
+        self.assertTrue(
+            Participant.objects.filter(
+                conversation=group, phone_number='+639171111111'
+            ).exists()
+        )
+
     def test_settings_are_optional_and_default(self):
         group = Conversation.objects.get(pk=self.create()['id'])
         self.assertEqual(group.mode, Conversation.Mode.CHAT)
@@ -2810,6 +2850,28 @@ class GroupPermissionSettingsTests(EnvelopeAssertions, APITestCase):
         )
         self.group.refresh_from_db()
         self.assertEqual(self.group.add_member_permission, 'admins')
+
+    def test_nor_by_sending_them_as_a_form(self):
+        # A photo makes the request multipart, where a nested object arrives
+        # as dotted keys - `settings.join_mode` - and `settings` itself is
+        # absent. The guard has to see those keys too, or a member allowed to
+        # change the photo could open the group in the same request.
+        self.set(edit_group_permission='members')
+        self.client.force_authenticate(self.bob)
+        self.assertFailure(
+            self.client.patch(
+                self.settings_url(),
+                encode_multipart(
+                    BOUNDARY,
+                    {'name': 'Renamed', 'settings.join_mode': 'open'},
+                ),
+                content_type=MULTIPART_CONTENT,
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.group.refresh_from_db()
+        self.assertEqual(self.group.name, 'Family')
+        self.assertNotEqual(self.group.join_mode, 'open')
 
 class EmailInvitationTests(EnvelopeAssertions, APITransactionTestCase):
     """Adding somebody to a group by an address they may not have registered.
