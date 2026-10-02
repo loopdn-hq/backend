@@ -20,6 +20,7 @@ from commercial.models import (
     Company,
     Creative,
     Industry,
+    Lead,
 )
 from user.models import phone_number_validator
 
@@ -457,7 +458,8 @@ class ServedCardSerializer(serializers.Serializer):
 
     The button goes through `click_url`, /c/{token}/ (slice 6), which counts
     the click and sends the member on; the destination itself is not given,
-    so no client can skip the count.
+    so no client can skip the count. A lead form's button has `form_token`
+    instead (slice 7a): it opens Loopd'n's own form.
     """
 
     def to_representation(self, served):
@@ -470,10 +472,8 @@ class ServedCardSerializer(serializers.Serializer):
                 return None
             return request.build_absolute_uri(field.url) if request else field.url
 
-        click_path = reverse('campaign-click', args=[served.click_token])
-        return {
+        card = {
             'token': served.token,
-            'click_url': request.build_absolute_uri(click_path) if request else click_path,
             'placement': creative.campaign.placement,
             'company': {'name': company.name, 'logo_url': url(company.logo)},
             'creative': {
@@ -484,9 +484,51 @@ class ServedCardSerializer(serializers.Serializer):
                 'cta_kind': creative.cta_kind,
             },
         }
+        if creative.cta_kind == Creative.CtaKind.LEAD_FORM:
+            # The button opens Loopd'n's own form (lead-form/, leads/), which
+            # takes the click token itself.
+            card['form_token'] = served.click_token
+        else:
+            click_path = reverse('campaign-click', args=[served.click_token])
+            card['click_url'] = (
+                request.build_absolute_uri(click_path) if request else click_path
+            )
+        return card
 
 
 class ImpressionSerializer(serializers.Serializer):
     """POST impressions/: the token the card was served with."""
 
     token = serializers.CharField(max_length=500)
+
+
+class LeadFormSerializer(serializers.Serializer):
+    """POST lead-form/: the card's click token."""
+
+    token = serializers.CharField(max_length=500)
+
+
+class LeadSendSerializer(serializers.Serializer):
+    """POST leads/: what the member chose to send. Shape only - whether it is
+    enough (a name, and a phone or an email) is services/leads.py's to say."""
+
+    token = serializers.CharField(max_length=500)
+    name = serializers.CharField(max_length=120, required=False, allow_blank=True)
+    phone = serializers.CharField(max_length=32, required=False, allow_blank=True)
+    email = serializers.CharField(max_length=254, required=False, allow_blank=True)
+    message = serializers.CharField(max_length=500, required=False, allow_blank=True)
+
+
+class CompanyLeadSerializer(serializers.ModelSerializer):
+    """A lead as its company sees it: what the member sent, and which campaign.
+    Never the member's account, nor the group the ad was seen in."""
+
+    campaign_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Lead
+        fields = ['id', 'campaign', 'campaign_name', 'name', 'phone', 'email', 'message', 'created_at']
+        read_only_fields = fields
+
+    def get_campaign_name(self, obj):
+        return obj.campaign.name or 'Untitled campaign'

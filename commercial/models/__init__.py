@@ -9,6 +9,8 @@ docs/campaigns_final_plan.md is the build order. Slices 0, 1 and 3 have an
 API: companies and which one is active, building and submitting a campaign,
 and the money - adding funds, and setting a budget aside at submit. Slice 5
 serves campaigns in chat and measures them: AdImpression, CampaignStatsDaily.
+Slices 6 and 7 count clicks (AdClick) and results (AdConversion; Lead holds
+what a member sent through a lead form).
 """
 from .ad_click import AdClick
 from .ad_conversion import AdConversion
@@ -23,6 +25,7 @@ from .commercial_preference import CommercialPreference
 from .company import Company, company_logo_upload_to
 from .creative import Creative, creative_image_upload_to
 from .industry import Industry
+from .lead import Lead
 from .pricing_rate import PricingRate
 from .targeting_criteria import TargetingCriteria
 
@@ -40,6 +43,7 @@ __all__ = [
     'Company',
     'Creative',
     'Industry',
+    'Lead',
     'PricingRate',
     'TargetingCriteria',
     'company_logo_upload_to',

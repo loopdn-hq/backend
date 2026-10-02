@@ -57,11 +57,14 @@ def follow(token, *, ip='', user_agent='', record=True, now=None):
         return None
     destination = creative.cta_target or settings.FRONTEND_URL
     if record and fresh:
-        _record(data, ip, user_agent, now)
+        record_press(data, ip=ip, user_agent=user_agent, now=now)
     return destination
 
 
-def _record(data, ip, user_agent, now):
+def record_press(data, *, ip='', user_agent='', now=None):
+    """Record one press of a served card's button, by the rules above, from
+    its token's facts. Returns the AdClick, or None when none was recorded.
+    Also how a lead form's opening is counted (leads.py)."""
     try:
         impression, _created = measurement.record(data, now)
     except Invalid:

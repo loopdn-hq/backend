@@ -11,6 +11,10 @@ below MIN_ELIGIBLE_MEMBERS is given as null, "too few to show", never as a
 number: a reach of 2 in a day narrows down to people. Views and spend are
 always shown; they are what the company pays for. Clicks (slice 6) are the
 counted ones only (services/clicks.py), on the day they were pressed.
+
+Results (slice 7): what each objective asked for - a website campaign's are
+its clicks, a lead campaign's its leads (AdConversion rows), each with the
+cost of one. `result` names which, so the dashboard can say "leads".
 """
 from datetime import datetime, time, timedelta
 
@@ -21,6 +25,7 @@ from django.utils import timezone
 from commercial.markets import time_zone
 from commercial.models import (
     AdClick,
+    AdConversion,
     AdImpression,
     AdTransaction,
     Campaign,
@@ -36,9 +41,11 @@ def roll_up(now=None):
     since = now - timedelta(days=2)
     viewed = AdImpression.objects.filter(viewed_at__gte=since).values('campaign_id')
     clicked = AdClick.objects.filter(clicked_at__gte=since).values('impression__campaign_id')
+    converted = AdConversion.objects.filter(occurred_at__gte=since).values('campaign_id')
     campaigns = Campaign.objects.filter(
         Q(pk__in=viewed)
         | Q(pk__in=clicked)
+        | Q(pk__in=converted)
         | Q(status__in=[Campaign.Status.RUNNING, Campaign.Status.PAUSED])
     ).select_related('company')
     written = 0
@@ -64,16 +71,20 @@ def campaign_report(campaign):
     rows = list(campaign.daily_stats.order_by('day'))
     viewed = sum(row.viewed for row in rows)
     clicks = sum(row.clicks for row in rows)
+    kind = result_of(campaign)
+    results = sum(_results(row, kind) for row in rows)
     return {
         'currency': campaign.company.currency,
         'reach_shown_from': settings.MIN_ELIGIBLE_MEMBERS,
+        'result': kind,
         'totals': {
             'served': sum(row.served for row in rows),
             'viewed': viewed,
             'reach': _shown(rows[-1].reach_to_date) if rows else None,
             'clicks': clicks,
+            'results': results,
             'spend_cents': campaign.spent_cents,
-            **_costs(campaign.spent_cents, viewed, clicks),
+            **_costs(campaign.spent_cents, viewed, clicks, results),
         },
         'days': [
             {
@@ -82,11 +93,40 @@ def campaign_report(campaign):
                 'viewed': row.viewed,
                 'reach': _shown(row.reach),
                 'clicks': row.clicks,
+                'results': _results(row, kind),
                 'spend_cents': row.spend_cents,
             }
             for row in rows
         ],
     }
+
+
+#: What counts as a result, by objective (section 11). A booking campaign,
+#: from before bookings were hidden, can only have counted clicks.
+RESULT_OF = {
+    Campaign.Objective.WEBSITE: 'clicks',
+    Campaign.Objective.BOOKING: 'clicks',
+    Campaign.Objective.LEAD: 'leads',
+    Campaign.Objective.GROUP_JOIN: 'joins',
+    Campaign.Objective.CALL: 'calls',
+    Campaign.Objective.TEXT: 'texts',
+}
+
+
+def result_of(campaign):
+    """What a campaign's results are called: 'clicks', 'leads', 'joins'..."""
+    if campaign.objective == Campaign.Objective.LEAD and not _has_form(campaign):
+        # Submitted before the lead form, with a link button: clicks.
+        return 'clicks'
+    return RESULT_OF[campaign.objective]
+
+
+def _has_form(campaign):
+    return campaign.creatives.filter(cta_kind='lead_form').exists()
+
+
+def _results(row, kind):
+    return row.clicks if kind == 'clicks' else row.results
 
 
 def company_report(company):
@@ -98,6 +138,7 @@ def company_report(company):
             viewed=Sum('daily_stats__viewed'),
             served=Sum('daily_stats__served'),
             clicks=Sum('daily_stats__clicks'),
+            result_count=Sum('daily_stats__results'),
         )
         .order_by('-created_at', '-pk')
     )
@@ -138,9 +179,20 @@ def company_report(company):
                 'clicks': c.clicks or 0,
                 'reach': _shown(reach.get(c.pk, 0)),
                 'spend_cents': c.spent_cents,
+                **_campaign_results(c),
             }
             for c in campaigns
         ],
+    }
+
+
+def _campaign_results(campaign):
+    kind = result_of(campaign)
+    results = (campaign.clicks if kind == 'clicks' else campaign.result_count) or 0
+    return {
+        'result': kind,
+        'results': results,
+        'cost_per_result_cents': campaign.spent_cents // results if results else None,
     }
 
 
@@ -156,12 +208,16 @@ def _latest_reach(company):
     return latest
 
 
-def _costs(spend, viewed, clicks):
-    """What a company reads off its spend: per 1,000 views, and per click."""
-    return {
+def _costs(spend, viewed, clicks, results=None):
+    """What a company reads off its spend: per 1,000 views, per click, and -
+    for one campaign - per result."""
+    costs = {
         'cost_per_1000_views_cents': spend * 1000 // viewed if viewed else None,
         'cost_per_click_cents': spend // clicks if clicks else None,
     }
+    if results is not None:
+        costs['cost_per_result_cents'] = spend // results if results else None
+    return costs
 
 
 def _shown(people):
@@ -188,8 +244,11 @@ def _roll_day(campaign, day):
     clicks = AdClick.objects.filter(
         impression__campaign=campaign, counted=True, clicked_at__gte=start, clicked_at__lt=end
     ).count()
+    results = AdConversion.objects.filter(
+        campaign=campaign, occurred_at__gte=start, occurred_at__lt=end
+    ).count()
     row = CampaignStatsDaily.objects.filter(campaign=campaign, day=day).first()
-    if row is None and not (viewed or served or spend or clicks):
+    if row is None and not (viewed or served or spend or clicks or results):
         return 0
 
     people = 'participant__user_id'
@@ -208,6 +267,7 @@ def _roll_day(campaign, day):
     row.reach = reach
     row.reach_to_date = max(row.reach_to_date, reach_to_date)
     row.clicks = clicks
+    row.results = results
     row.spend_cents = spend
     row.save()
     return 1

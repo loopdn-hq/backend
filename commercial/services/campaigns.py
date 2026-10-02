@@ -36,14 +36,15 @@ class CampaignLocked(Refused):
 
 
 #: Decision 3: call and text need a tracking number per campaign (slice 8) and
-#: stay hidden until then, though the model already knows them.
+#: stay hidden until then, though the model already knows them. Bookings too
+#: (decision 38): nothing tells Loopd'n a booking happened on a company's own
+#: site, so a booking campaign could only count clicks and call them bookings.
 AVAILABLE_OBJECTIVES = (
     Campaign.Objective.WEBSITE,
     Campaign.Objective.LEAD,
-    Campaign.Objective.BOOKING,
     Campaign.Objective.GROUP_JOIN,
 )
-OBJECTIVE_UNAVAILABLE = "Call and text campaigns aren't available yet."
+OBJECTIVE_UNAVAILABLE = "That kind of campaign isn't available yet."
 
 #: Decision 4: chat is the only placement at first.
 AVAILABLE_PLACEMENTS = (Campaign.Placement.CHAT,)
@@ -52,7 +53,9 @@ AVAILABLE_PLACEMENTS = (Campaign.Placement.CHAT,)
 #: may leave `cta_kind` out and get this one.
 CTA_KIND_FOR = {
     Campaign.Objective.WEBSITE: Creative.CtaKind.LINK,
-    Campaign.Objective.LEAD: Creative.CtaKind.LINK,
+    # Loopd'n's own form (slice 7, decision 38): a lead is what a member
+    # sends, not a click to somebody else's page.
+    Campaign.Objective.LEAD: Creative.CtaKind.LEAD_FORM,
     Campaign.Objective.BOOKING: Creative.CtaKind.LINK,
     Campaign.Objective.GROUP_JOIN: Creative.CtaKind.GROUP_JOIN,
     Campaign.Objective.CALL: Creative.CtaKind.CALL,
@@ -230,9 +233,13 @@ def button_errors(objective, cta_kind, cta_target):
 
     The button must fit the objective (section 7's table), and go somewhere
     safe: a link only to an https:// address, a group join only to Loopd'n.
+    A lead form goes nowhere else: it opens Loopd'n's form.
     """
     if cta_kind != CTA_KIND_FOR.get(objective):
         return {'cta_kind': "This button doesn't fit the campaign's objective."}
+
+    if cta_kind == Creative.CtaKind.LEAD_FORM and cta_target:
+        return {'cta_target': "A form button opens Loopd'n's form; it has no address."}
 
     if cta_kind == Creative.CtaKind.LINK:
         try:

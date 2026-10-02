@@ -40,9 +40,12 @@ class Creative(models.Model):
     class CtaKind(models.TextChoices):
         CALL = 'call', 'Call'
         TEXT = 'text', 'Text'
-        # A web address - the website, a booking page, a lead form.
+        # A web address - the website, a booking page.
         LINK = 'link', 'Open a link'
         GROUP_JOIN = 'group_join', 'Join a group'
+        # Loopd'n's own lead form (slice 7): the member chooses what to send
+        # the company, without leaving the app. No address of its own.
+        LEAD_FORM = 'lead_form', 'Open a form'
 
     class Status(models.TextChoices):
         DRAFT = 'draft', 'Draft'
@@ -59,7 +62,8 @@ class Creative(models.Model):
 
     cta_label = models.CharField(max_length=30)
     cta_kind = models.CharField(max_length=16, choices=CtaKind.choices)
-    # The URL for a link, the join link for a group. Blank for call and text.
+    # The URL for a link, the join link for a group. Blank for call, text and
+    # a lead form.
     cta_target = models.CharField(max_length=500, blank=True, default='', db_default='')
 
     # Sponsored SMS only (plan, Stage 5), which is gated; nothing sends it yet.
@@ -81,7 +85,7 @@ class Creative(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=(
-                    Q(cta_kind__in=['call', 'text'], cta_target='')
+                    Q(cta_kind__in=['call', 'text', 'lead_form'], cta_target='')
                     | (Q(cta_kind__in=['link', 'group_join']) & ~Q(cta_target=''))
                 ),
                 name='commercial_creative_cta_target_matches_kind',

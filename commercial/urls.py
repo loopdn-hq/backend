@@ -20,6 +20,7 @@ from commercial.viewsets.v1.companies import (
     MarketListView,
 )
 from commercial.viewsets.v1.creatives import CreativeViewSet
+from commercial.viewsets.v1.leads import LeadFormView, LeadSendView
 from commercial.viewsets.v1.serving import ImpressionView, ServeView
 
 app_name = 'commercial'
@@ -39,5 +40,8 @@ urlpatterns = [
     # For members, from the chat app (slice 5).
     path('serve/', ServeView.as_view(), name='serve'),
     path('impressions/', ImpressionView.as_view(), name='impressions'),
+    # The lead form, for members (slice 7a).
+    path('lead-form/', LeadFormView.as_view(), name='lead-form'),
+    path('leads/', LeadSendView.as_view(), name='leads'),
     *router.urls,
 ]

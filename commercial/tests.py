@@ -29,12 +29,13 @@ from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from commercial import tokens
 from commercial.markets import region_codes
 from commercial.models import (
     AdClick,
+    AdConversion,
     AdImpression,
     AdSettings,
     AdTransaction,
@@ -45,6 +46,7 @@ from commercial.models import (
     Company,
     Creative,
     Industry,
+    Lead,
     PricingRate,
     TargetingCriteria,
 )
@@ -53,6 +55,7 @@ from commercial.services import companies as services
 from commercial.services import (
     counters,
     eligibility,
+    leads,
     measurement,
     pacing,
     pricing,
@@ -64,6 +67,7 @@ from commercial.services import (
     transitions,
     wallet,
 )
+from commercial.serializers import ServedCardSerializer
 from commercial.services.errors import Invalid, Refused
 from chat.models import Conversation, GroupCategory, Participant
 from rbac.services import start_as_commercial
@@ -2324,18 +2328,23 @@ class ServingTestCase(TestCase):
         ][index]
 
     def running(self, name='Lunch deal', budget_cents=50_000, daily_cents=None,
-                pacing=Campaign.Pacing.ACCELERATED, ends_at=None, **audience):
+                pacing=Campaign.Pacing.ACCELERATED, ends_at=None,
+                objective=Campaign.Objective.WEBSITE, **audience):
         campaign = campaign_services.create_draft(
-            self.company, self.owner, objective=Campaign.Objective.WEBSITE, name=name
+            self.company, self.owner, objective=objective, name=name
         )
         campaign_services.set_targeting(campaign, **audience)
         campaign_services.update_draft(
             campaign, total_budget_cents=budget_cents, daily_budget_cents=daily_cents,
             pacing=pacing, ends_at=ends_at,
         )
+        button = (
+            {'cta_label': 'Get a quote'}
+            if objective == Campaign.Objective.LEAD
+            else {'cta_label': 'Go', 'cta_target': 'https://luna.example'}
+        )
         campaign_services.add_creative(
-            campaign, headline='Lunch for two', body='Half price until 2pm.',
-            cta_label='Go', cta_target='https://luna.example',
+            campaign, headline='Lunch for two', body='Half price until 2pm.', **button
         )
         transitions.submit(campaign, self.owner)
         transitions.approve(campaign, self.reviewer)
@@ -2848,3 +2857,166 @@ class ClickTests(ServingTestCase):
         self.assertEqual(report['days'][-1]['clicks'], 2)
         company = stats.company_report(self.company)
         self.assertEqual((company['totals']['clicks'], company['campaigns'][0]['clicks']), (2, 2))
+
+
+# --- slice 7a: the lead form ----------------------------------------------------
+
+
+class LeadFormTests(ServingTestCase):
+    def setUp(self):
+        super().setUp()
+        profile = self.viewer.profile
+        profile.display_name = 'Ana Reyes'
+        profile.phone_number = '+639171112222'
+        profile.phone_no_verified = True
+        profile.save()
+        self.viewer.email = 'ana@example.com'
+        self.viewer.save()
+        self.campaign = self.running('Quotes', objective=Campaign.Objective.LEAD)
+
+    def card(self, viewer=None):
+        return self.serve(viewer)
+
+    def test_a_lead_card_opens_the_form_not_a_link(self):
+        served = self.card()
+        self.assertEqual(served.creative.cta_kind, 'lead_form')
+        data = ServedCardSerializer(served).data
+        self.assertEqual(data['form_token'], served.click_token)
+        self.assertNotIn('click_url', data)
+
+    def test_opening_the_form_counts_a_click_and_starts_from_the_profile(self):
+        served = self.card()
+        form = leads.open_form(self.viewer, served.click_token, user_agent=BROWSER)
+        self.assertEqual(form['company_name'], "Joe's Pizza")
+        # The email is not verified, so it is not offered.
+        self.assertEqual(form['fields'], {'name': 'Ana Reyes', 'phone': '+639171112222', 'email': ''})
+        self.assertIn("Joe's Pizza will receive what you send here", form['consent'])
+        self.assertFalse(form['already_sent'])
+        self.assertTrue(AdClick.objects.get().counted)
+        self.assertTrue(AdImpression.objects.exists())  # opening it proves it was seen
+
+    def test_sending_keeps_exactly_what_was_sent(self):
+        served = self.card()
+        lead = leads.send(
+            self.viewer, served.click_token,
+            name=' Ana R. ', phone='', email='ana.work@example.com', message='Two people, Friday?',
+        )
+        self.assertEqual(
+            (lead.name, lead.phone, lead.email, lead.message),
+            ('Ana R.', '', 'ana.work@example.com', 'Two people, Friday?'),
+        )
+        self.assertEqual(lead.consent_text, leads.consent_for(self.company))
+        self.assertEqual(lead.conversion.kind, 'lead')
+        self.assertEqual(lead.conversion.impression.participant.user, self.viewer)
+
+        # A profile changed afterwards does not change what the company has.
+        self.viewer.profile.display_name = 'Someone else'
+        self.viewer.profile.save()
+        lead.refresh_from_db()
+        self.assertEqual(lead.name, 'Ana R.')
+
+    def test_one_lead_per_member_per_campaign(self):
+        leads.send(self.viewer, self.card().click_token, name='Ana', phone='+639171112222')
+        with self.assertRaises(Refused):
+            leads.send(self.viewer, self.card().click_token, name='Ana', phone='+639171112222')
+        form = leads.open_form(self.viewer, self.card().click_token)
+        self.assertTrue(form['already_sent'])
+        # Held by the database, not only by the service.
+        first = Lead.objects.get()
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Lead.objects.create(
+                conversion=AdConversion.objects.create(campaign=self.campaign, kind='lead'),
+                campaign=self.campaign, member=self.viewer, name='Ana', consent_text='x',
+            )
+        self.assertEqual(Lead.objects.count(), 1)
+        self.assertEqual(first.member, self.viewer)
+
+    def test_each_wrong_field_is_named(self):
+        token = self.card().click_token
+        with self.assertRaises(Invalid) as caught:
+            leads.send(self.viewer, token, name='', phone='', email='')
+        self.assertEqual(set(caught.exception.errors), {'name', 'phone'})
+        with self.assertRaises(Invalid) as caught:
+            leads.send(self.viewer, token, name='Ana', phone='0917', email='not-an-email')
+        self.assertEqual(set(caught.exception.errors), {'phone', 'email'})
+        self.assertFalse(Lead.objects.exists())
+
+    def test_only_the_member_it_was_served_to_while_it_is_fresh(self):
+        token = self.card().click_token
+        with self.assertRaises(Invalid):
+            leads.send(self.member_of(self.group, 1), token, name='Bo', phone='+639170000009')
+        with override_settings(SPONSORED_CLICK_TOKEN_MAX_AGE_SECONDS=-1):
+            with self.assertRaises(Invalid) as caught:
+                leads.open_form(self.viewer, token)
+        self.assertEqual(caught.exception.errors['token'], leads.EXPIRED)
+        # A website campaign's card has no form.
+        transitions.pause(self.campaign, self.owner)
+        self.running('Site')
+        website = self.serve(self.member_of(self.group, 2))
+        with self.assertRaises(Invalid):
+            leads.open_form(self.member_of(self.group, 2), website.click_token)
+
+    def test_deleting_the_details_keeps_the_count(self):
+        leads.send(self.viewer, self.card().click_token, name='Ana', phone='+639171112222')
+        settlement.settle_all()
+        stats.roll_up()
+        Lead.objects.all().delete()
+        self.assertEqual(AdConversion.objects.count(), 1)
+        self.campaign.refresh_from_db()
+        report = stats.campaign_report(self.campaign)
+        self.assertEqual((report['result'], report['totals']['results']), ('leads', 1))
+        self.assertEqual(report['totals']['cost_per_result_cents'], 5)  # one view, 5 cents
+
+    def test_the_company_reads_its_leads_and_nothing_else(self):
+        leads.send(self.viewer, self.card().click_token, name='Ana', email='ana@example.com')
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        body = client.get(f'/api/v1/commercial/companies/{self.company.pk}/leads/').json()
+        row = body['data']['results'][0]
+        self.assertEqual(set(row), {'id', 'campaign', 'campaign_name', 'name', 'phone', 'email', 'message', 'created_at'})
+        self.assertEqual((row['name'], row['campaign_name']), ('Ana', 'Quotes'))
+        narrowed = client.get(
+            f'/api/v1/commercial/companies/{self.company.pk}/leads/?campaign={self.campaign.pk + 999}'
+        ).json()
+        self.assertEqual(narrowed['data']['results'], [])
+
+        client.force_authenticate(user=make_commercial_user('someone-else'))
+        response = client.get(f'/api/v1/commercial/companies/{self.company.pk}/leads/')
+        self.assertEqual(response.status_code, 404)
+
+    def test_the_member_api(self):
+        client = APIClient()
+        client.force_authenticate(user=self.viewer)
+        card = client.get(f'/api/v1/commercial/serve/?conversation={self.group.pk}').json()['data']
+        opened = client.post('/api/v1/commercial/lead-form/', {'token': card['form_token']}, format='json')
+        self.assertEqual(opened.json()['data']['fields']['name'], 'Ana Reyes')
+        bad = client.post('/api/v1/commercial/leads/', {'token': card['form_token'], 'name': ''}, format='json')
+        self.assertEqual(bad.status_code, 400)
+        sent = client.post(
+            '/api/v1/commercial/leads/',
+            {'token': card['form_token'], 'name': 'Ana', 'phone': '+639171112222'},
+            format='json',
+        )
+        self.assertEqual(sent.status_code, 201)
+        again = client.post(
+            '/api/v1/commercial/leads/',
+            {'token': card['form_token'], 'name': 'Ana', 'phone': '+639171112222'},
+            format='json',
+        )
+        self.assertEqual(again.status_code, 409)
+
+
+class BookingHiddenTests(TestCase):
+    def test_bookings_are_not_offered_and_a_lead_ad_carries_the_form(self):
+        owner = make_commercial_user('maria')
+        company = make_company(owner)
+        with self.assertRaises(Invalid):
+            campaign_services.create_draft(company, owner, objective='booking')
+        campaign = campaign_services.create_draft(company, owner, objective='lead')
+        creative = campaign_services.add_creative(campaign, headline='h', body='b', cta_label='Ask')
+        self.assertEqual((creative.cta_kind, creative.cta_target), ('lead_form', ''))
+        with self.assertRaises(Invalid):
+            campaign_services.add_creative(
+                campaign, headline='h', body='b', cta_label='Ask', cta_kind='link',
+                cta_target='https://luna.example',
+            )

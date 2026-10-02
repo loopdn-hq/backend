@@ -16,11 +16,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from billing.throttles import CheckoutRateThrottle
-from commercial.models import Company, Industry
-from commercial.pagination import CompanyPagination, TransactionPagination
+from commercial.models import Company, Industry, Lead
+from commercial.pagination import CompanyPagination, LeadPagination, TransactionPagination
 from commercial.permissions import CanUseCommercial
 from commercial.serializers import (
     CheckoutSerializer,
+    CompanyLeadSerializer,
     CompanySerializer,
     IndustrySerializer,
     TransactionSerializer,
@@ -58,6 +59,7 @@ class CompanyViewSet(
         'checkout': 'Checkout started.',
         'transactions': 'Transactions fetched.',
         'report': 'Report fetched.',
+        'leads': 'Leads fetched.',
     }
 
     def get_queryset(self):
@@ -111,6 +113,20 @@ class CompanyViewSet(
             logger.warning('Stripe request failed: %s', exc)
             return Response({'detail': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
         return Response({'checkout_url': session['url']})
+
+    @action(detail=True, methods=['get'], pagination_class=LeadPagination)
+    def leads(self, request, pk=None):
+        """What members sent through the company's lead forms, newest first.
+        `?campaign=` narrows to one of its campaigns."""
+        company = self.get_object()
+        rows = Lead.objects.filter(campaign__company=company).select_related('campaign')
+        raw = request.query_params.get('campaign', '').strip()
+        if raw:
+            if not raw.isdigit():
+                raise ValidationError({'campaign': 'Say which campaign, e.g. ?campaign=12.'})
+            rows = rows.filter(campaign_id=int(raw))
+        page = self.paginate_queryset(rows.order_by('-created_at', '-pk'))
+        return self.get_paginated_response(CompanyLeadSerializer(page, many=True).data)
 
     @action(detail=True, methods=['get'])
     def report(self, request, pk=None):

@@ -21,7 +21,7 @@ from commercial.services import clicks
 def follow_click(request, token):
     destination = clicks.follow(
         token,
-        ip=_client_ip(request),
+        ip=client_ip(request),
         user_agent=request.META.get('HTTP_USER_AGENT', ''),
         record=request.method == 'GET' and not _is_prefetch(request),
     )
@@ -37,7 +37,7 @@ def follow_click(request, token):
     return response
 
 
-def _client_ip(request):
+def client_ip(request):
     """The first hop: behind the load balancer REMOTE_ADDR is the balancer.
     Only ever hashed, to tell repeats apart - spoofing it gains nothing."""
     forwarded = request.META.get('HTTP_X_FORWARDED_FOR', '')

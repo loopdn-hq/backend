@@ -23,3 +23,11 @@ class TransactionPagination(PageNumberPagination):
     page_size = 20
     page_size_query_param = 'page_size'
     max_page_size = 100
+
+
+class LeadPagination(PageNumberPagination):
+    """Twenty leads a page, newest first."""
+
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 100
