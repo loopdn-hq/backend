@@ -23,8 +23,10 @@ Each of those is a row in `EmailDelivery` with a reason.
 And it will not mail a direct message at all. That is decided once for every
 channel in `chat/delivery.py:conversation_reason`, not here.
 """
+import base64
 import hashlib
 import logging
+import re
 from email.utils import formataddr
 
 from django.conf import settings
@@ -62,9 +64,72 @@ def from_header(conversation):
     without this one group's name would silently break every email it ever
     sent, permanently and for everybody in it.
     """
+    return formataddr((_sender_label(conversation), settings.DEFAULT_FROM_EMAIL))
+
+
+def reply_to_header(participant, conversation):
+    """`Family via Loopd <reply+312.4f1c...@reply.loopdn.com>`, or None.
+
+    WHY THE NAME. Somebody in two groups holds two reply addresses that differ
+    only in their digits, and a bare one says nothing about where it goes. The
+    name shows up exactly where that gets decided: in the To line of the reply
+    they are writing, and in the suggestions their mail client offers when
+    they start a new email. Pick the wrong bare suggestion and the message
+    posts to the wrong group - one they are in, because `mail/inbound.py`
+    checks that, but not the one they meant.
+
+    WHY NOT `formataddr`, as `from_header` uses. It quotes any name with a
+    comma, a full stop or a letter outside ASCII, and Resend refuses many
+    quoted display names. So a plain name goes out as it is and anything else
+    as RFC 2047 encoded words, which is the form Anymail uses on this same
+    field for this same reason. Neither form ever needs a quote.
+
+    `conversation` is passed in rather than read off the participant because
+    the fan-out does not select it, so reading it would cost a query per
+    recipient. None when there is no reply domain - see `reply_address`.
+    """
+    address = reply_address(participant)
+    if not address:
+        return None
+    return f'{_header_phrase(_sender_label(conversation))} <{address}>'
+
+
+def _sender_label(conversation):
+    """`Family via Loopd`, on one line - the name in front of both our addresses.
+
+    Collapsed for the header-injection reason `from_header` gives.
+    """
     name = ' '.join((_conversation_label(conversation) or '').split())
-    label = f'{name} via {settings.EMAIL_PRODUCT_NAME}'
-    return formataddr((label, settings.DEFAULT_FROM_EMAIL))
+    return f'{name} via {settings.EMAIL_PRODUCT_NAME}'
+
+
+# Letters, digits, spaces and the few marks a group name usually carries. Every
+# one is RFC 5322 `atext`, so a name made only of these needs no quoting at all.
+_PLAIN_PHRASE = re.compile(r"^[A-Za-z0-9 '!&+_-]+$")
+
+# RFC 2047 caps an encoded word at 75 characters. `=?utf-8?b?` and `?=` take
+# 12 of them, and 45 bytes come out of base64 as 60 more.
+_ENCODED_WORD_BYTES = 45
+
+
+def _header_phrase(text):
+    """`text` as a display name that never needs quotes - see `reply_to_header`."""
+    if _PLAIN_PHRASE.match(text):
+        return text
+
+    # Split between characters, never inside one. A decoder joins adjacent
+    # encoded words back together, but each has to hold whole UTF-8 sequences.
+    words, word = [], ''
+    for character in text:
+        if word and len((word + character).encode()) > _ENCODED_WORD_BYTES:
+            words.append(word)
+            word = ''
+        word += character
+    words.append(word)
+
+    return ' '.join(
+        f'=?utf-8?b?{base64.b64encode(word.encode()).decode()}?=' for word in words
+    )
 
 
 def _conversation_label(conversation):
@@ -375,7 +440,7 @@ def _deliver(record, message, participant, sender, body):
     whether trying again could help, and the provider's wording is in the log.
     """
     address = address_for(participant)
-    reply_to = reply_address(participant)
+    reply_to = reply_to_header(participant, message.conversation)
     stop_url = unsubscribe_url(participant)
 
     template, context = _template_and_context(

@@ -1,1 +1,5 @@
-You won{{ "'" }}t hear from us here again
+{% comment %}
+Names the conversation, for the reason bridge_accepted's subject gives - and it
+matters as much here, because a YES replied to this email turns that
+conversation's email back on.
+{% endcomment %}You won{{ "'" }}t hear from {% if group_name %}{{ group_name }}{% else %}{{ sender_name }}{% endif %} here again

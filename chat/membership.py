@@ -1354,8 +1354,8 @@ def _email_invitation(conversation, participant, by):
     from django.template.loader import render_to_string
 
     from mail import commands
-    from mail.outbound import _headers_for, from_header
-    from mail.tokens import reply_address, unsubscribe_url
+    from mail.outbound import _headers_for, from_header, reply_to_header
+    from mail.tokens import unsubscribe_url
     from utils.mail import GROUP_INVITATION, EmailError, send_templated_email
 
     address = participant.email
@@ -1363,7 +1363,7 @@ def _email_invitation(conversation, participant, by):
         return
 
     inviter = getattr(getattr(by, 'profile', None), 'display_label', None)
-    reply_to = reply_address(participant)
+    reply_to = reply_to_header(participant, conversation)
     stop_url = unsubscribe_url(participant)
     context = {
         'group_name': conversation.name,

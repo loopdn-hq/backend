@@ -1,1 +1,6 @@
-You{{ "'" }}re all set on {{ product_name }}
+{% comment %}
+Names the conversation, never just the product. Somebody who says YES to two
+groups would otherwise get two identical subjects from one sender address, a
+mail client threads those together, and Reply in that thread answers whichever
+group's email happens to be selected.
+{% endcomment %}{% if group_name %}You{{ "'" }}re in {{ group_name }} on {{ product_name }}{% else %}You{{ "'" }}re all set with {{ sender_name }} on {{ product_name }}{% endif %}
