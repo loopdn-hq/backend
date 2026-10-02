@@ -12,7 +12,7 @@ the builder promised is what runs.
 from django.conf import settings
 from django.db.models import Count, Q
 
-from chat.models import Conversation, Participant
+from chat.models import Conversation, GroupCategory, Participant
 from commercial.markets import region_codes
 from commercial.services.errors import Invalid
 
@@ -31,6 +31,11 @@ def clean_audience(company, *, categories=(), regions=(), min_group_size=None, m
 
     Regions must be in the company's own country - the market it advertises
     in - and are upper-cased and de-duplicated. Raises Invalid otherwise.
+
+    Every option chosen is saved as none chosen: "any". Ticking every kind of
+    group means any kind of group, and every region means the whole country -
+    but named choices only match groups that declared one, so without this a
+    full set of ticks would quietly match fewer groups than none.
     """
     allowed = region_codes(company.country)
     cleaned = []
@@ -52,8 +57,15 @@ def clean_audience(company, *, categories=(), regions=(), min_group_size=None, m
             'max_group_size': "The largest group size can't be below the smallest.",
         })
 
+    categories = list(categories)
+    every_category = set(GroupCategory.objects.filter(active=True).values_list('pk', flat=True))
+    if categories and every_category <= {category.pk for category in categories}:
+        categories = []
+    if cleaned and set(cleaned) == allowed:
+        cleaned = []
+
     return {
-        'categories': list(categories),
+        'categories': categories,
         'regions': cleaned,
         'min_group_size': min_group_size,
         'max_group_size': max_group_size,
@@ -63,10 +75,12 @@ def clean_audience(company, *, categories=(), regions=(), min_group_size=None, m
 def audience_groups(country, *, categories=(), regions=(), min_group_size=None, max_group_size=None):
     """The groups an audience covers, each annotated with `member_count`.
 
-    An empty part means "any", and "any" includes a group that has not
-    declared it: an undeclared group matches a campaign that targets any
-    category or anywhere, and never one that names a category or a region.
-    "Anywhere" is the company's own country.
+    An empty part means "any". A group that has not declared a category
+    matches any category, never a named one. "Anywhere" is the company's own
+    country, and a group is in a country when it declared a region there, or -
+    having declared none - when its creator's verified phone is from there
+    (`_creator_in`). A group whose country cannot be known matches no country's
+    "anywhere", so an ad never reaches a group abroad by default.
 
     A group under MIN_GROUP_SIZE_FOR_ADS is never covered, whatever the
     audience says. Size counts every active member, SMS-only ones included:
@@ -81,7 +95,9 @@ def audience_groups(country, *, categories=(), regions=(), min_group_size=None, 
         groups = groups.filter(region__in=regions)
     else:
         groups = groups.filter(
-            Q(region='') | Q(region=country) | Q(region__startswith=f'{country}-')
+            Q(region=country)
+            | Q(region__startswith=f'{country}-')
+            | (Q(region='') & _creator_in(country))
         )
 
     groups = groups.annotate(
@@ -139,6 +155,36 @@ def estimate_for(targeting):
         min_group_size=targeting.min_group_size,
         max_group_size=targeting.max_group_size,
     )
+
+
+def _creator_in(country):
+    """Groups whose creator's verified phone is from `country`.
+
+    The rule that already decides which country a group's SMS number comes
+    from (sms/provisioning.country_for), read from the same prefix table - but
+    not SMS_FORCE_COUNTRY, which is about where numbers can be bought, not
+    where anybody is. Longest prefix wins there, so a longer prefix mapped to
+    another country is excluded here.
+    """
+    table = settings.SMS_COUNTRY_BY_PREFIX
+    mine = [prefix for prefix, code in table.items() if code == country]
+    if not mine:
+        return Q(pk__in=[])
+    theirs = [
+        prefix
+        for prefix, code in table.items()
+        if code != country and any(prefix.startswith(own) for own in mine)
+    ]
+
+    phone = 'created_by__profile__phone_number'
+    matches = Q(created_by__profile__phone_no_verified=True)
+    any_mine = Q()
+    for prefix in mine:
+        any_mine |= Q(**{f'{phone}__startswith': prefix})
+    matches &= any_mine
+    for prefix in theirs:
+        matches &= ~Q(**{f'{phone}__startswith': prefix})
+    return matches
 
 
 def as_range(count):

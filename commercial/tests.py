@@ -27,6 +27,7 @@ from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from commercial.markets import region_codes
 from commercial.models import (
     AdImpression,
     AdSettings,
@@ -805,12 +806,27 @@ SMALL_FLOORS = override_settings(
 )
 
 
-def make_group(name, size, *, category=None, region='', phone_only=0, members=None):
+_phones = itertools.count(1)
+
+#: A verified number in each country, for a group's creator: the evidence of
+#: where an undeclared group is (services/reach.py, _creator_in).
+_PHONE_FORMAT = {'PH': '+63917{:07d}', 'US': '+1415{:07d}'}
+
+
+def make_group(name, size, *, category=None, region='', phone_only=0, members=None,
+               country='PH'):
     """A group with `size` active members: an admin, account holders, and then
     `phone_only` SMS-only members. `members` adds these accounts instead of new
     ones, for people who are in more than one group.
+
+    Its creator has a verified phone in `country` - None for nobody knows -
+    which is where a group that declares no region counts as being.
     """
     admin = User.objects.create_user(username=f'{name}-admin', password='pw')
+    if country:
+        admin.profile.phone_number = _PHONE_FORMAT[country].format(next(_phones))
+        admin.profile.phone_no_verified = True
+        admin.profile.save()
     group = Conversation.start_group(admin, name)
     accounts = list(members or []) or [
         User.objects.create_user(username=f'{name}-{i}', password='pw')
@@ -895,6 +911,41 @@ class ReachTests(TestCase):
         make_group('california', 5, region='US-CA')
         self.assertEqual(reach.audience_groups('PH').count(), 2)
         self.assertEqual(reach.audience_groups('US').count(), 1)
+
+    def test_an_undeclared_group_is_where_its_creators_phone_is(self):
+        """Never abroad by default: a group says nothing, its creator's verified
+        number does - the rule that picks its SMS number's country.
+        """
+        make_group('here', 5, country='PH')
+        make_group('abroad', 5, country='US')
+        make_group('unknown', 5, country=None)
+
+        self.assertEqual(
+            list(reach.audience_groups('PH').values_list('name', flat=True)), ['here']
+        )
+        self.assertEqual(
+            list(reach.audience_groups('US').values_list('name', flat=True)), ['abroad']
+        )
+
+    def test_a_declared_region_wins_over_the_creators_phone(self):
+        make_group('moved', 5, region='US-CA', country='PH')
+        self.assertEqual(reach.audience_groups('PH').count(), 0)
+        self.assertEqual(reach.audience_groups('US').count(), 1)
+
+    def test_every_option_ticked_is_saved_as_any(self):
+        every_category = list(GroupCategory.objects.filter(active=True))
+        every_region = sorted(region_codes('PH'))
+        audience = reach.clean_audience(
+            self.company, categories=every_category, regions=every_region
+        )
+        self.assertEqual((audience['categories'], audience['regions']), ([], []))
+
+        # Short of every one, the choice stands.
+        audience = reach.clean_audience(
+            self.company, categories=every_category[:2], regions=every_region[:3]
+        )
+        self.assertEqual(len(audience['categories']), 2)
+        self.assertEqual(len(audience['regions']), 3)
 
     def test_group_size_limits_narrow_it(self):
         make_group('small', 4)
