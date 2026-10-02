@@ -1016,6 +1016,14 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'sms.requeue_stalled_deliveries',
         'schedule': 600.0,
     },
+    # Campaigns start and end on their dates (commercial/services/schedule.py).
+    # Every minute, so "as soon as it's approved" means about a minute. Without
+    # a beat running, approved campaigns never start and ended ones keep their
+    # money reserved.
+    'commercial-run-campaign-schedule': {
+        'task': 'commercial.run_campaign_schedule',
+        'schedule': 60.0,
+    },
     # OFF (2026-09-25, Yul's call). This sweep buys a real number, from a real
     # provider, for every group that has not got one - and a laptop running the
     # staging env file has live Telnyx credentials, so starting the stack bought

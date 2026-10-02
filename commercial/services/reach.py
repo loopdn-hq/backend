@@ -6,12 +6,14 @@ exact number and never names a group, and below the privacy floors (decision
 12) it is no number at all.
 
 `audience_groups` is the one definition of which groups an audience covers.
-Reach counts it now; serving (slice 5) matches against the same rules, so what
-the builder promised is what runs.
+Reach counts it now, an admin's "why does this group match" (eligibility.py)
+asks it, and serving (slice 5) matches against the same rules, so what the
+builder promised is what runs.
 """
 from django.conf import settings
 from django.db.models import Count, Q
 
+from billing.models import Plan
 from chat.models import Conversation, GroupCategory, Participant
 from commercial.markets import region_codes
 from commercial.services.errors import Invalid
@@ -79,14 +81,15 @@ def audience_groups(country, *, categories=(), regions=(), min_group_size=None, 
     matches any category, never a named one. "Anywhere" is the company's own
     country, and a group is in a country when it declared a region there, or -
     having declared none - when its creator's verified phone is from there
-    (`_creator_in`). A group whose country cannot be known matches no country's
+    (`in_country`). A group whose country cannot be known matches no country's
     "anywhere", so an ad never reaches a group abroad by default.
 
-    A group under MIN_GROUP_SIZE_FOR_ADS is never covered, whatever the
-    audience says. Size counts every active member, SMS-only ones included:
-    it is a fact about the group.
+    Whatever the audience says, a group is never covered when it is under
+    MIN_GROUP_SIZE_FOR_ADS or its owner's plan is ad-free (`allows_ads`).
+    Size counts every active member, SMS-only ones included: it is a fact
+    about the group.
     """
-    groups = Conversation.objects.filter(kind=Conversation.Kind.GROUP)
+    groups = Conversation.objects.filter(kind=Conversation.Kind.GROUP).filter(allows_ads())
 
     if categories:
         groups = groups.filter(category__in=categories)
@@ -94,11 +97,7 @@ def audience_groups(country, *, categories=(), regions=(), min_group_size=None, 
     if regions:
         groups = groups.filter(region__in=regions)
     else:
-        groups = groups.filter(
-            Q(region=country)
-            | Q(region__startswith=f'{country}-')
-            | (Q(region='') & _creator_in(country))
-        )
+        groups = groups.filter(in_country(country))
 
     groups = groups.annotate(
         member_count=Count(
@@ -157,7 +156,30 @@ def estimate_for(targeting):
     )
 
 
-def _creator_in(country):
+def allows_ads():
+    """Groups whose owner's plan lets them carry ads (`Plan.shows_ads`).
+
+    The owner is whoever created the group, as for its member cap. Somebody
+    with no subscription row yet is on Free (billing.services), so they count
+    exactly when Free shows ads.
+    """
+    allowed = Q(created_by__subscription__plan__shows_ads=True)
+    if Plan.objects.filter(code=Plan.Code.FREE, shows_ads=True).exists():
+        allowed |= Q(created_by__subscription__isnull=True)
+    return allowed
+
+
+def in_country(country):
+    """Groups in `country`: it, or one of its regions, declared - or, with
+    none declared, a creator whose verified phone is from there."""
+    return (
+        Q(region=country)
+        | Q(region__startswith=f'{country}-')
+        | (Q(region='') & creator_in(country))
+    )
+
+
+def creator_in(country):
     """Groups whose creator's verified phone is from `country`.
 
     The rule that already decides which country a group's SMS number comes

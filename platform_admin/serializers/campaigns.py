@@ -161,3 +161,27 @@ class RejectSerializer(serializers.Serializer):
 
     note = serializers.CharField(max_length=2000)
     creatives = CreativeNoteSerializer(many=True, required=False)
+
+
+class MatchCheckSerializer(serializers.Serializer):
+    code = serializers.CharField()
+    label = serializers.CharField()
+    passed = serializers.BooleanField()
+    detail = serializers.CharField()
+
+
+class GroupMatchSerializer(serializers.Serializer):
+    """GET campaigns/{id}/match/?group=: one group against the audience, each
+    rule named (commercial/services/eligibility.py)."""
+
+    group = serializers.SerializerMethodField()
+    matches = serializers.BooleanField()
+    checks = MatchCheckSerializer(many=True)
+
+    def get_group(self, obj):
+        group = self.context['group']
+        return {
+            'id': group.pk,
+            'name': group.name,
+            'member_count': obj['member_count'],
+        }

@@ -43,7 +43,7 @@ from commercial.models import (
 )
 from commercial.services import campaigns as campaign_services
 from commercial.services import companies as services
-from commercial.services import pricing, reach, transitions, wallet
+from commercial.services import eligibility, pricing, reach, schedule, transitions, wallet
 from commercial.services.errors import Invalid, Refused
 from chat.models import Conversation, GroupCategory, Participant
 from chat.services import create_message
@@ -809,7 +809,7 @@ SMALL_FLOORS = override_settings(
 _phones = itertools.count(1)
 
 #: A verified number in each country, for a group's creator: the evidence of
-#: where an undeclared group is (services/reach.py, _creator_in).
+#: where an undeclared group is (services/reach.py, creator_in).
 _PHONE_FORMAT = {'PH': '+63917{:07d}', 'US': '+1415{:07d}'}
 
 
@@ -1938,3 +1938,345 @@ class ReviewFindingsTests(TestCase):
             {'company_suspended', 'not_funded', 'audience_too_small'},
         )
         self.assertEqual(found[0].severity, 'blocker')
+
+
+# --- slice 4: dates, pause, resume, cancel; which groups may carry ads -----------
+
+
+@SMALL_FLOORS
+class LifecycleTests(TestCase):
+    """Section 8's remaining arrows: the scheduler's start and end, and the
+    owner's pause, resume and cancel - each one event, the money back on the
+    two that finish a campaign."""
+
+    def setUp(self):
+        self.owner = make_commercial_user('maria')
+        self.reviewer = User.objects.create_user(username='reviewer', password='pw')
+        self.company = make_company(self.owner)
+        fund(self.company, 200_000)
+        make_group('a', 5)
+        make_group('b', 5)
+
+    def approved(self, name='Lunch deal', budget_cents=50_000):
+        campaign = campaign_services.create_draft(
+            self.company, self.owner, objective=Campaign.Objective.WEBSITE, name=name
+        )
+        campaign_services.set_targeting(campaign)
+        campaign_services.update_draft(campaign, total_budget_cents=budget_cents)
+        campaign_services.add_creative(
+            campaign, headline='h', body='b', cta_label='Go', cta_target='https://luna.example'
+        )
+        transitions.submit(campaign, self.owner)
+        return transitions.approve(campaign, self.reviewer)
+
+    def dated(self, campaign, **dates):
+        Campaign.objects.filter(pk=campaign.pk).update(**dates)
+        campaign.refresh_from_db()
+        return campaign
+
+    def running(self, **dates):
+        campaign = self.dated(self.approved(), **dates)
+        return transitions.start(campaign)
+
+    def balance(self):
+        self.company.refresh_from_db()
+        return self.company.balance_cents, self.company.reserved_cents
+
+    def kinds(self, campaign):
+        return list(campaign.events.values_list('kind', flat=True))
+
+    # --- the scheduler -----------------------------------------------------------
+
+    def test_no_start_date_starts_on_the_next_run_after_approval(self):
+        campaign = self.approved()
+        self.assertEqual(schedule.run(), {'ended': 0, 'started': 1})
+        campaign.refresh_from_db()
+        self.assertEqual(campaign.status, 'running')
+        started = campaign.events.get(kind='started')
+        self.assertEqual((started.actor, started.actor_label), (None, ''))
+
+    def test_a_start_date_waits_for_its_day(self):
+        campaign = self.dated(self.approved(), starts_at=timezone.now() + timedelta(days=1))
+        self.assertEqual(schedule.run(), {'ended': 0, 'started': 0})
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.start(campaign)
+
+        self.dated(campaign, starts_at=timezone.now() - timedelta(minutes=1))
+        self.assertEqual(schedule.run()['started'], 1)
+        campaign.refresh_from_db()
+        self.assertEqual(campaign.status, 'running')
+
+    def test_the_end_date_ends_it_and_returns_what_is_left(self):
+        campaign = self.running()
+        self.assertEqual(self.balance(), (150_000, 50_000))
+        self.dated(campaign, ends_at=timezone.now() - timedelta(minutes=1))
+
+        self.assertEqual(schedule.run(), {'ended': 1, 'started': 0})
+        campaign.refresh_from_db()
+        self.assertEqual((campaign.status, campaign.reserved_cents), ('ended', 0))
+        self.assertEqual(self.balance(), (200_000, 0))
+        ended = campaign.events.get(kind='ended')
+        self.assertEqual(ended.metadata, {'from': 'running', 'released_cents': 50_000})
+        self.assertIsNone(ended.actor)
+        row = AdTransaction.objects.get(kind='campaign_release', campaign=campaign)
+        self.assertEqual((row.amount_cents, row.reserved_change_cents), (50_000, -50_000))
+
+    def test_approved_after_its_end_date_it_ends_without_ever_starting(self):
+        campaign = self.dated(
+            self.approved(),
+            starts_at=timezone.now() - timedelta(days=2),
+            ends_at=timezone.now() - timedelta(days=1),
+        )
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.start(campaign)
+        self.assertEqual(schedule.run(), {'ended': 1, 'started': 0})
+        campaign.refresh_from_db()
+        self.assertEqual(campaign.status, 'ended')
+        self.assertNotIn('started', self.kinds(campaign))
+        self.assertEqual(self.balance(), (200_000, 0))
+
+    def test_a_second_run_finds_nothing_to_do(self):
+        self.approved('First')
+        self.dated(self.running(), ends_at=timezone.now() - timedelta(minutes=1))
+        self.assertEqual(schedule.run(), {'ended': 1, 'started': 1})
+        self.assertEqual(schedule.run(), {'ended': 0, 'started': 0})
+
+    def test_a_campaign_that_cannot_move_is_skipped_and_the_rest_still_move(self):
+        self.approved('First')
+        self.approved('Second')
+        real_start = transitions.start
+        calls = []
+
+        def start_once_refused(campaign):
+            calls.append(campaign.pk)
+            if len(calls) == 1:
+                raise transitions.TransitionRefused('moved meanwhile')
+            return real_start(campaign)
+
+        with mock.patch.object(transitions, 'start', start_once_refused):
+            self.assertEqual(schedule.run(), {'ended': 0, 'started': 1})
+
+    def test_the_task_runs_the_schedule(self):
+        from commercial.tasks import run_campaign_schedule
+
+        self.approved()
+        self.assertEqual(run_campaign_schedule(), {'ended': 0, 'started': 1})
+
+    # --- the owner ---------------------------------------------------------------
+
+    def test_pause_and_resume(self):
+        campaign = self.running()
+        campaign = transitions.pause(campaign, self.owner)
+        self.assertEqual(campaign.status, 'paused')
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.pause(campaign, self.owner)
+
+        campaign = transitions.resume(campaign, self.owner)
+        self.assertEqual(campaign.status, 'running')
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.resume(campaign, self.owner)
+
+        self.assertEqual(self.kinds(campaign)[-3:], ['started', 'paused', 'resumed'])
+        self.assertEqual(campaign.events.get(kind='paused').actor, self.owner)
+        # Pausing keeps the money for when it resumes.
+        self.assertEqual(self.balance(), (150_000, 50_000))
+
+    def test_resume_is_refused_past_the_end_date_or_with_nothing_left_to_spend(self):
+        campaign = transitions.pause(self.running(), self.owner)
+        self.dated(campaign, ends_at=timezone.now() - timedelta(minutes=1))
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.resume(campaign, self.owner)
+
+        self.dated(campaign, ends_at=None, reserved_cents=0)
+        with self.assertRaises(transitions.TransitionRefused) as caught:
+            transitions.resume(campaign, self.owner)
+        self.assertIn('Add budget', str(caught.exception))
+
+    def test_cancel_returns_the_money_from_approved_running_or_paused(self):
+        approved = self.approved('Approved')
+        running = self.running()
+        paused = transitions.pause(self.running(), self.owner)
+        self.assertEqual(self.balance(), (50_000, 150_000))
+
+        for campaign, was in ((approved, 'approved'), (running, 'running'), (paused, 'paused')):
+            campaign = transitions.cancel(campaign, self.owner)
+            self.assertEqual((campaign.status, campaign.reserved_cents), ('ended', 0))
+            cancelled = campaign.events.get(kind='cancelled')
+            self.assertEqual(cancelled.metadata, {'from': was, 'released_cents': 50_000})
+            self.assertEqual(cancelled.actor, self.owner)
+        self.assertEqual(self.balance(), (200_000, 0))
+
+    def test_cancel_is_refused_before_review_ends_and_after_it_is_over(self):
+        draft = campaign_services.create_draft(self.company, self.owner, objective='website')
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.cancel(draft, self.owner)
+
+        campaign = transitions.cancel(self.approved(), self.owner)
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.cancel(campaign, self.owner)
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.end(campaign)
+        self.assertEqual(self.kinds(campaign).count('cancelled'), 1)
+
+    def test_end_is_only_for_a_campaign_whose_end_date_has_passed(self):
+        campaign = self.running(ends_at=timezone.now() + timedelta(days=1))
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.end(campaign)
+        campaign = self.running()  # no end date: runs until it is spent
+        with self.assertRaises(transitions.TransitionRefused):
+            transitions.end(campaign)
+
+
+@SMALL_FLOORS
+class LifecycleApiTests(APITestCase):
+    def setUp(self):
+        self.owner = make_commercial_user('maria')
+        self.company = make_company(self.owner, 'Luna Cafe')
+        fund(self.company, 100_000)
+        make_group('a', 5)
+        make_group('b', 5)
+        campaign = campaign_services.create_draft(
+            self.company, self.owner, objective='website', name='Lunch deal'
+        )
+        campaign_services.set_targeting(campaign)
+        campaign_services.update_draft(campaign, total_budget_cents=50_000)
+        campaign_services.add_creative(
+            campaign, headline='h', body='b', cta_label='Go', cta_target='https://luna.example'
+        )
+        transitions.submit(campaign, self.owner)
+        self.campaign = transitions.approve(campaign, self.owner)
+        self.client.force_authenticate(user=self.owner)
+
+    def post(self, action, campaign=None):
+        return self.client.post(
+            f'/api/v1/commercial/campaigns/{(campaign or self.campaign).pk}/{action}/'
+        )
+
+    def test_pause_resume_and_cancel(self):
+        self.assertEqual(self.post('pause').status_code, status.HTTP_409_CONFLICT)  # not running yet
+
+        transitions.start(self.campaign)
+        body = self.post('pause').json()
+        self.assertEqual((body['message'], body['data']['status']), ('Campaign paused.', 'paused'))
+        self.assertEqual(self.post('resume').json()['data']['status'], 'running')
+
+        data = self.post('cancel').json()['data']
+        self.assertEqual((data['status'], data['reserved_cents']), ('ended', 0))
+        self.assertEqual(data['events'][-1]['kind'], 'cancelled')
+        self.assertEqual(self.post('cancel').status_code, status.HTTP_409_CONFLICT)
+
+    def test_somebody_elses_campaign_is_not_found(self):
+        stranger = make_commercial_user('someone-else')
+        self.client.force_authenticate(user=stranger)
+        for action in ('pause', 'resume', 'cancel'):
+            self.assertEqual(self.post(action).status_code, status.HTTP_404_NOT_FOUND)
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, 'approved')
+
+
+@SMALL_FLOORS
+class AdFreePlanTests(TestCase):
+    """Plan.shows_ads: a group carries ads only when its owner's plan does."""
+
+    def setUp(self):
+        self.company = make_company(make_commercial_user('maria'))
+
+    def put_on(self, user, code):
+        from billing.models import Plan, Subscription
+
+        Subscription.objects.update_or_create(
+            user=user, defaults={'plan': Plan.objects.get(code=code)}
+        )
+
+    def test_free_shows_ads_and_the_paid_plans_do_not(self):
+        from billing.models import Plan
+
+        self.assertEqual(
+            dict(Plan.objects.values_list('code', 'shows_ads')),
+            {'free': True, 'premium': False, 'business': False, 'enterprise': False},
+        )
+
+    def test_a_group_whose_owner_pays_for_ad_free_is_never_counted(self):
+        free = make_group('free', 5)
+        no_row = make_group('no-row', 5)  # nobody has subscribed: Free
+        paid = make_group('paid', 5)
+        self.put_on(free.created_by, 'free')
+        self.put_on(paid.created_by, 'premium')
+
+        covered = set(reach.audience_groups('PH').values_list('name', flat=True))
+        self.assertEqual(covered, {'free', 'no-row'})
+
+    def test_with_free_made_ad_free_nobody_without_a_subscription_is_counted_either(self):
+        from billing.models import Plan
+
+        make_group('no-row', 5)
+        Plan.objects.filter(code='free').update(shows_ads=False)
+        self.assertFalse(reach.audience_groups('PH').exists())
+
+
+@SMALL_FLOORS
+class GroupMatchTests(TestCase):
+    """services/eligibility.py: each rule named, and the verdict always reach's."""
+
+    def setUp(self):
+        self.owner = make_commercial_user('maria')
+        self.company = make_company(self.owner)
+        self.campaign = campaign_services.create_draft(self.company, self.owner, objective='website')
+
+    def explain(self, group, **audience):
+        campaign_services.set_targeting(self.campaign, **audience)
+        self.campaign.refresh_from_db()
+        result = eligibility.explain(self.campaign, group)
+        failed = {check.code for check in result['checks'] if not check.passed}
+        return result['matches'], failed
+
+    def test_a_group_that_fits_passes_every_check(self):
+        group = make_group('school', 5, category=category('school'), region='PH-00')
+        self.assertEqual(self.explain(group, categories=[category('school')]), (True, set()))
+
+    def test_each_rule_that_fails_is_named(self):
+        small = make_group('small', 2)
+        self.assertEqual(self.explain(small), (False, {'size_floor'}))
+
+        family = make_group('family', 5, category=category('family-friends'), region='PH-07')
+        self.assertEqual(
+            self.explain(family, categories=[category('school')], regions=['PH-00']),
+            (False, {'category', 'place'}),
+        )
+        self.assertEqual(
+            self.explain(family, max_group_size=4), (False, {'size'})
+        )
+
+    def test_where_an_undeclared_group_is_comes_from_its_creators_phone(self):
+        here = make_group('here', 5)
+        abroad = make_group('abroad', 5, country='US')
+        unknown = make_group('unknown', 5, country=None)
+        self.assertEqual(self.explain(here), (True, set()))
+        self.assertEqual(self.explain(abroad), (False, {'place'}))
+        self.assertEqual(self.explain(unknown), (False, {'place'}))
+
+    def test_an_ad_free_owner_is_named(self):
+        from billing.models import Plan, Subscription
+
+        group = make_group('paid', 5)
+        Subscription.objects.create(user=group.created_by, plan=Plan.objects.get(code='premium'))
+        matches, failed = self.explain(group)
+        self.assertEqual((matches, failed), (False, {'allows_ads'}))
+
+    def test_the_verdict_agrees_with_the_checks_for_every_group(self):
+        groups = [
+            make_group('one', 5, category=category('school'), region='PH-00'),
+            make_group('two', 3, category=category('community')),
+            make_group('three', 8, region='US-CA', country='US'),
+            make_group('four', 2, region='PH-00'),
+        ]
+        audiences = [
+            {},
+            {'categories': [category('school')]},
+            {'regions': ['PH-00'], 'min_group_size': 4},
+            {'max_group_size': 3},
+        ]
+        for audience in audiences:
+            for group in groups:
+                matches, failed = self.explain(group, **audience)
+                self.assertEqual(matches, not failed, (group.name, audience, failed))

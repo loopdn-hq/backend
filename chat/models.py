@@ -324,6 +324,18 @@ class Conversation(models.Model):
 
     class Meta:
         ordering = ['-updated_at']
+        indexes = [
+            # Matching a campaign's audience (commercial/services/reach.py):
+            # a region named outright, or every region of a country by prefix
+            # ("PH-%"). The pattern opclass is what lets Postgres use the
+            # index for the prefix as well as for equality. `category` needs
+            # none of its own: its foreign key is indexed already.
+            models.Index(
+                fields=['region'],
+                name='chat_conversation_region_idx',
+                opclasses=['varchar_pattern_ops'],
+            ),
+        ]
 
     def __str__(self):
         return self.name or f'{self.get_kind_display()} #{self.pk}'

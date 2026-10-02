@@ -6,26 +6,32 @@
     GET  campaigns/{id}/            one campaign, with the automatic checks
     POST campaigns/{id}/approve/    {note?}
     POST campaigns/{id}/reject/     {note, creatives?: [{id, note}]}
+    GET  campaigns/{id}/match/?group={id}
+                                    does that group match the audience, and
+                                    why not (slice 4)
 
 Thin: the decisions are commercial/services/transitions.py's (approve,
-reject), the checks commercial/services/review.py's. The queryset is every
+reject), the checks commercial/services/review.py's, the group match
+commercial/services/eligibility.py's. The queryset is every
 company's campaigns - the one kind of route that is not scoped to the caller,
 which is why it sits behind two features, not one.
 """
 from django.db.models import Count, Max, Prefetch, Q
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from chat.models import Conversation
 from commercial.models import Campaign, CampaignEvent, Creative
-from commercial.services import transitions
+from commercial.services import eligibility, transitions
 from commercial.viewsets.v1.refusals import service_errors
 from platform_admin.pagination import AdminPagination
 from platform_admin.permissions import CanReviewCampaigns, CanUseAdmin
 from platform_admin.serializers.campaigns import (
     ApproveSerializer,
+    GroupMatchSerializer,
     RejectSerializer,
     ReviewCampaignSerializer,
     ReviewQueueSerializer,
@@ -41,6 +47,7 @@ class CampaignReviewViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, vi
         'retrieve': 'Campaign fetched.',
         'approve': 'Campaign approved.',
         'reject': 'Campaign sent back to the company.',
+        'match': 'Group checked.',
     }
 
     def get_queryset(self):
@@ -90,6 +97,21 @@ class CampaignReviewViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, vi
                 creative_notes=creative_notes,
             )
         return Response(self._detail(pk))
+
+    @action(detail=True, methods=['get'])
+    def match(self, request, pk=None):
+        raw = request.query_params.get('group', '').strip()
+        if not raw.isdigit():
+            raise ValidationError({'group': "Say which group, by its number: ?group=42."})
+        group = (
+            Conversation.objects.filter(kind=Conversation.Kind.GROUP, pk=int(raw))
+            .select_related('category', 'created_by')
+            .first()
+        )
+        if group is None:
+            raise NotFound('No group has that number.')
+        result = eligibility.explain(self.get_object(), group)
+        return Response(GroupMatchSerializer(result, context={'group': group}).data)
 
     def _filtered(self, campaigns):
         """The queue by default; `?status=` and `?search=` narrow it otherwise."""

@@ -243,3 +243,37 @@ class CampaignReviewApiTests(APITestCase):
         transitions.submit(campaign, self.owner)
         creative.refresh_from_db()
         self.assertEqual((creative.status, creative.review_notes), ('pending_review', ''))
+
+    # --- why a group matches or not (slice 4) --------------------------------------
+
+    def test_match_names_each_rule_for_one_group(self):
+        from commercial.tests import category
+
+        campaign = self.submitted()
+        campaign.targeting.categories.set([category('school')])
+        school = make_group('school', 5, category=category('school'), region='PH-00')
+        family = make_group('family', 5, category=category('family-friends'))
+
+        data = self.data(self.client.get(self.detail(campaign, f'match/?group={school.pk}')))
+        self.assertTrue(data['matches'])
+        self.assertEqual(data['group'], {'id': school.pk, 'name': 'school', 'member_count': 5})
+        self.assertTrue(all(check['passed'] for check in data['checks']))
+
+        data = self.data(self.client.get(self.detail(campaign, f'match/?group={family.pk}')))
+        self.assertFalse(data['matches'])
+        failed = [check for check in data['checks'] if not check['passed']]
+        self.assertEqual([check['code'] for check in failed], ['category'])
+        self.assertEqual(failed[0]['detail'], 'It is "Family and friends".')
+
+    def test_match_needs_a_group_that_exists_and_the_review_feature(self):
+        campaign = self.submitted()
+        self.refused(self.client.get(self.detail(campaign, 'match/')), status.HTTP_400_BAD_REQUEST)
+        self.refused(
+            self.client.get(self.detail(campaign, 'match/?group=999999')), status.HTTP_404_NOT_FOUND
+        )
+        group = make_group('school', 5)
+        self.client.force_authenticate(user=make_commercial_user('someone'))
+        self.refused(
+            self.client.get(self.detail(campaign, f'match/?group={group.pk}')),
+            status.HTTP_403_FORBIDDEN,
+        )

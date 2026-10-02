@@ -62,7 +62,7 @@ from rest_framework.pagination import PageNumberPagination
 from django.utils import timezone
 
 from chat import membership
-from chat.models import Conversation, Message, MessageReaction, Participant
+from chat.models import Conversation, GroupCategory, Message, MessageReaction, Participant
 from chat.serializers import (
     ADMIN_ONLY_SETTINGS,
     MESSAGE_PREFETCH_RELATED,
@@ -91,6 +91,7 @@ from chat.serializers import (
     member_candidates,
 )
 from chat.services import broadcast_conversation_updated, broadcast_message_updated
+from utils import regions
 
 
 class ParticipantPagination(PageNumberPagination):
@@ -166,6 +167,7 @@ class ConversationViewSet(
         'join_code:GET': 'Join code fetched.',
         'join_code:POST': 'New join code issued.',
         'provision_number': 'Number ready.',
+        'group_options': 'Group options fetched.',
     }
 
     def get_serializer_class(self):
@@ -227,6 +229,8 @@ class ConversationViewSet(
             .select_related(
                 'sms_number',
                 'created_by__profile',
+                # Its slug is in every row's settings.
+                'category',
                 # The pinned message is serialized in full on every row. One
                 # join chain for the page, not a query per conversation.
                 *(f'pinned_message__{path}' for path in MESSAGE_SELECT_RELATED),
@@ -398,6 +402,31 @@ class ConversationViewSet(
         # itself, so get_object()'s participant and message prefetches are
         # still current.
         return Response(self._as_conversation(conversation))
+
+    @action(detail=False, methods=['get'], url_path='group-options', url_name='group-options')
+    def group_options(self, request):
+        """What a group may say about itself: the kinds of group, and the places.
+
+        The choices behind `settings.category` and `settings.region`. Every
+        signed-in person may read them - they are the same for every group.
+        """
+        return Response({
+            'categories': [
+                {'slug': category.slug, 'label': category.label}
+                for category in GroupCategory.objects.filter(active=True)
+            ],
+            'countries': [
+                {
+                    'code': code,
+                    'name': name,
+                    'regions': [
+                        {'code': region, 'name': region_name}
+                        for region, region_name in regions.REGIONS[code]
+                    ],
+                }
+                for code, name in regions.COUNTRIES.items()
+            ],
+        })
 
     # -- membership --------------------------------------------------------
 

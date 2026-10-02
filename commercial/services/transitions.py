@@ -8,14 +8,16 @@ services/campaigns.create_draft.
 
 The owner's moves: submit and withdraw (slice 1), which move money since
 slice 3 - submit fixes the price and sets the whole budget aside, withdraw
-returns it - and raising a running or paused campaign's budget (slice 3).
-An admin's: approve and reject (slice 2, from the admin site). Start, pause,
-resume, cancel and end are slice 4.
+returns it - raising a running or paused campaign's budget (slice 3), and
+pause, resume and cancel (slice 4). An admin's: approve and reject (slice 2,
+from the admin site). The scheduler's: start and end on the campaign's dates
+(slice 4, services/schedule.py).
 
 A move that also moves money still writes ONE event: the money goes in that
 event's `metadata` (what was reserved, released, at what price).
 """
 from django.db import transaction
+from django.utils import timezone
 
 from commercial.models import Campaign, CampaignEvent, Creative
 from commercial.services import campaigns, pricing, review, wallet
@@ -194,6 +196,88 @@ def reject(campaign, actor, note, creative_notes=None):
         )
 
 
+#: Where cancel and end may come from: anything reviewed and not over.
+STOPPABLE = (Campaign.Status.APPROVED, Campaign.Status.RUNNING, Campaign.Status.PAUSED)
+
+
+def start(campaign):
+    """approved -> running, by the scheduler once its start date has come.
+
+    No start date means "as soon as it's approved". From here it may be
+    served (slice 5); nothing else changes, and its money stays reserved.
+    """
+    with transaction.atomic():
+        campaign = _lock(campaign)
+        _require(campaign, Campaign.Status.APPROVED, 'Only an approved campaign can start.')
+        now = timezone.now()
+        if campaign.starts_at is not None and campaign.starts_at > now:
+            raise TransitionRefused('Its start date has not come yet.')
+        if _past_end(campaign, now):
+            raise TransitionRefused('Its end date has passed; it ends instead.')
+        return _move(campaign, Campaign.Status.RUNNING, CampaignEvent.Kind.STARTED, None)
+
+
+def pause(campaign, actor):
+    """running -> paused: the owner stops it for now. Nothing is served while
+    it is paused, and its money stays reserved for when it resumes."""
+    with transaction.atomic():
+        campaign = _lock(campaign)
+        _require(campaign, Campaign.Status.RUNNING, 'Only a running campaign can be paused.')
+        return _move(campaign, Campaign.Status.PAUSED, CampaignEvent.Kind.PAUSED, actor)
+
+
+def resume(campaign, actor):
+    """paused -> running: the owner starts it again.
+
+    Refused past its end date - the scheduler ends it - and with nothing left
+    reserved to spend, which the owner fixes by adding budget first.
+    """
+    with transaction.atomic():
+        campaign = _lock(campaign)
+        _require(campaign, Campaign.Status.PAUSED, 'Only a paused campaign can be resumed.')
+        if _past_end(campaign, timezone.now()):
+            raise TransitionRefused('Its end date has passed, so it is ending.')
+        if campaign.reserved_cents <= 0:
+            raise TransitionRefused('Its budget is used up. Add budget to resume it.')
+        return _move(campaign, Campaign.Status.RUNNING, CampaignEvent.Kind.RESUMED, actor)
+
+
+def cancel(campaign, actor):
+    """approved, running or paused -> ended: the owner stops it for good.
+
+    Whatever it has reserved and not spent returns to available. Ended is
+    final: to advertise again, start a new campaign.
+
+    Allowed while running or paused as well as approved - section 8 of the
+    plan lists approved only, but then a paused campaign with no end date
+    would hold its money forever (decision 32). From slice 5, any views not
+    yet settled are charged before the release.
+    """
+    with transaction.atomic():
+        campaign = _lock(campaign)
+        if campaign.status not in STOPPABLE:
+            raise TransitionRefused(
+                'Only an approved, running or paused campaign can be cancelled.'
+            )
+        return _finish(campaign, CampaignEvent.Kind.CANCELLED, actor)
+
+
+def end(campaign):
+    """approved, running or paused -> ended, by the scheduler: its end date
+    has passed. Unspent money returns to available, as on cancel.
+
+    An approved campaign can reach its end date without ever starting - one
+    approved after it - and ends the same way, never having run.
+    """
+    with transaction.atomic():
+        campaign = _lock(campaign)
+        if campaign.status not in STOPPABLE:
+            raise TransitionRefused('Only an approved, running or paused campaign can end.')
+        if not _past_end(campaign, timezone.now()):
+            raise TransitionRefused('Its end date has not come yet.')
+        return _finish(campaign, CampaignEvent.Kind.ENDED, None)
+
+
 def increase_budget(campaign, actor, total_budget_cents):
     """Raise a running or paused campaign's total budget, reserving the difference.
 
@@ -246,6 +330,24 @@ def _lock(campaign):
 def _require(campaign, status, refusal):
     if campaign.status != status:
         raise TransitionRefused(refusal)
+
+
+def _past_end(campaign, now):
+    return campaign.ends_at is not None and campaign.ends_at <= now
+
+
+def _finish(campaign, kind, actor):
+    """-> ended, returning what is reserved; one event saying how much."""
+    was = campaign.status
+    released = campaign.reserved_cents
+    wallet.release(campaign)
+    return _move(
+        campaign,
+        Campaign.Status.ENDED,
+        kind,
+        actor,
+        metadata={'from': was, 'released_cents': released},
+    )
 
 
 def _move(campaign, status, kind, actor, *, note='', metadata=None):

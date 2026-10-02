@@ -13,6 +13,7 @@ from chat.models import (
     BlockedFromConversation,
     ChannelConsent,
     Conversation,
+    GroupCategory,
     Message,
     MessageReaction,
     Participant,
@@ -29,6 +30,7 @@ from user.blocks import blocks_email, has_blocked
 from user.lookups import find_user
 from user.models import phone_number_validator
 from user.serializers import PublicUserSerializer
+from utils import regions
 
 logger = logging.getLogger(__name__)
 
@@ -651,6 +653,25 @@ class GroupSettingsFieldsSerializer(serializers.Serializer):
     sms_replies_enabled = serializers.BooleanField(required=False)
     voice_messages_enabled = serializers.BooleanField(required=False)
 
+    # What kind of group this is and where it is - the only two facts about a
+    # group advertising may target on (Conversation.category). A category's
+    # slug, or null to say nothing; a retired category cannot be chosen.
+    category = serializers.SlugRelatedField(
+        slug_field='slug',
+        queryset=GroupCategory.objects.filter(active=True),
+        required=False,
+        allow_null=True,
+    )
+    # A country ("PH") or one of its regions ("PH-00"), from utils/regions.py;
+    # blank to say nothing.
+    region = serializers.CharField(max_length=6, required=False, allow_blank=True)
+
+    def validate_region(self, value):
+        value = value.strip().upper()
+        if value and not regions.is_region(value):
+            raise serializers.ValidationError(f'"{value}" is not a region we know.')
+        return value
+
 
 #: Changing any of these is an admin decision even in a group where members may
 #: edit the name and photo. A member who could grant themselves permissions
@@ -663,6 +684,9 @@ ADMIN_ONLY_SETTINGS = {
     'sms_delivery_enabled',
     'sms_replies_enabled',
     'voice_messages_enabled',
+    # Which ads the group can carry follows from these two.
+    'category',
+    'region',
 }
 
 
@@ -884,6 +908,8 @@ class ConversationSerializer(serializers.ModelSerializer):
             'sms_delivery_enabled': obj.sms_delivery_enabled,
             'sms_replies_enabled': obj.sms_replies_enabled,
             'voice_messages_enabled': obj.voice_messages_enabled,
+            'category': obj.category.slug if obj.category_id else None,
+            'region': obj.region,
         }
 
     def get_image_url(self, obj):

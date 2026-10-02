@@ -48,6 +48,10 @@ class CampaignViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets
     POST   campaigns/{id}/submit/       draft -> pending review
     POST   campaigns/{id}/withdraw/     pending review -> draft, its money returned
     POST   campaigns/{id}/budget/       raise a running or paused campaign's budget
+    POST   campaigns/{id}/pause/        running -> paused
+    POST   campaigns/{id}/resume/       paused -> running
+    POST   campaigns/{id}/cancel/       approved, running or paused -> ended, its
+                                        unspent money returned
 
     No PUT on a campaign itself: the builder saves a step at a time.
     """
@@ -69,6 +73,9 @@ class CampaignViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets
         'submit': 'Submitted for review.',
         'withdraw': 'Withdrawn from review.',
         'budget': 'Budget raised.',
+        'pause': 'Campaign paused.',
+        'resume': 'Campaign resumed.',
+        'cancel': 'Campaign cancelled.',
     }
 
     def get_queryset(self):
@@ -170,6 +177,24 @@ class CampaignViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets
             campaign = transitions.increase_budget(
                 self.get_object(), request.user, body.validated_data['total_budget_cents']
             )
+        return Response(self._detail(campaign))
+
+    @action(detail=True, methods=['post'])
+    def pause(self, request, pk=None):
+        with service_errors():
+            campaign = transitions.pause(self.get_object(), request.user)
+        return Response(self._detail(campaign))
+
+    @action(detail=True, methods=['post'])
+    def resume(self, request, pk=None):
+        with service_errors():
+            campaign = transitions.resume(self.get_object(), request.user)
+        return Response(self._detail(campaign))
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        with service_errors():
+            campaign = transitions.cancel(self.get_object(), request.user)
         return Response(self._detail(campaign))
 
     def _company_from_query(self):

@@ -30,6 +30,7 @@ from chat.models import (
     Attachment,
     BlockedFromConversation,
     Conversation,
+    GroupCategory,
     Message,
     MessageReaction,
     Participant,
@@ -6746,3 +6747,77 @@ class SearchMembersToAddTests(EnvelopeAssertions, APITestCase):
         self.assertFailure(
             self.client.get(self.url, {'q': 'bob'}), status.HTTP_403_FORBIDDEN
         )
+
+
+class GroupCategoryAndRegionTests(EnvelopeAssertions, APITestCase):
+    """What kind of group and where (slice 4 of docs/campaigns_final_plan.md):
+    an admin declares them in the group's settings, and they are the only two
+    facts about a group a campaign targets on."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', phone='+639170000001')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.url = reverse('chat:conversation-settings', args=[self.group.id])
+
+    def patch(self, user, **group_settings):
+        self.client.force_authenticate(user)
+        return self.client.patch(self.url, {'settings': group_settings}, format='json')
+
+    def test_an_admin_declares_them_and_every_member_reads_them(self):
+        data = self.assertSuccess(self.patch(self.alice, category='school', region='ph-00'))
+        self.assertEqual(
+            (data['settings']['category'], data['settings']['region']), ('school', 'PH-00')
+        )
+        self.group.refresh_from_db()
+        self.assertEqual((self.group.category.slug, self.group.region), ('school', 'PH-00'))
+
+        self.client.force_authenticate(self.bob)
+        read = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
+        )
+        self.assertEqual(read['settings']['category'], 'school')
+
+    def test_a_country_alone_is_a_place_and_both_can_be_taken_back(self):
+        self.assertSuccess(self.patch(self.alice, category='school', region='PH'))
+        self.assertSuccess(self.patch(self.alice, category=None, region=''))
+        self.group.refresh_from_db()
+        self.assertEqual((self.group.category, self.group.region), (None, ''))
+
+    def test_only_a_known_place_and_a_current_category(self):
+        self.assertFailure(self.patch(self.alice, region='PH-99'))
+        self.assertFailure(self.patch(self.alice, region='Manila'))
+        self.assertFailure(self.patch(self.alice, region='JP'))
+        GroupCategory.objects.filter(slug='school').update(active=False)
+        self.assertFailure(self.patch(self.alice, category='school'))
+        self.group.refresh_from_db()
+        self.assertEqual((self.group.category, self.group.region), (None, ''))
+
+    def test_a_member_cannot_declare_them_even_where_members_edit_the_group(self):
+        self.group.edit_group_permission = 'members'
+        self.group.save(update_fields=['edit_group_permission'])
+        self.assertFailure(self.patch(self.bob, category='school'), status.HTTP_403_FORBIDDEN)
+        self.assertFailure(self.patch(self.bob, region='PH'), status.HTTP_403_FORBIDDEN)
+
+    def test_a_new_group_can_say_them_from_the_start(self):
+        self.client.force_authenticate(self.alice)
+        data = self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-group'),
+                {'name': 'Choir', 'settings': {'category': 'religious', 'region': 'PH-07'}},
+                format='json',
+            ),
+            status.HTTP_201_CREATED,
+        )
+        self.assertEqual(
+            (data['settings']['category'], data['settings']['region']), ('religious', 'PH-07')
+        )
+
+    def test_the_choices_are_listed_for_anybody_signed_in(self):
+        self.client.force_authenticate(self.bob)
+        data = self.assertSuccess(self.client.get(reverse('chat:conversation-group-options')))
+        self.assertIn({'slug': 'school', 'label': 'School'}, data['categories'])
+        philippines = next(c for c in data['countries'] if c['code'] == 'PH')
+        self.assertIn({'code': 'PH-00', 'name': 'Metro Manila (NCR)'}, philippines['regions'])
