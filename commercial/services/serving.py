@@ -11,9 +11,10 @@ The checks, in order, stopping at the first "no":
     campaign, on its company's day  ->  pick one (most left today, jittered;
     no auction)  ->  one of its approved creatives
 
-It writes NOTHING to the database. What it served is signed into the
-delivery token (commercial/tokens.py); a row is written only when the card is
-seen (measurement.py). The running campaigns and each group's facts are
+It writes NOTHING to the database. What it served is signed into two tokens
+(commercial/tokens.py): one the app reports the view with - a row is written
+only then (measurement.py) - and one behind the button, /c/{token}/
+(clicks.py). The running campaigns and each group's facts are
 cached for a minute, so a serve is a few cache reads and one creative.
 
 Matching here is the same rule as reach.audience_groups - checked against it
@@ -31,7 +32,7 @@ from django.utils import timezone
 from chat.models import Conversation, Participant
 from commercial.models import AdSettings, Campaign, Creative
 from commercial.services import counters, pacing, reach
-from commercial.tokens import issue_delivery
+from commercial.tokens import issue_click, issue_delivery, new_nonce
 
 LIVE_KEY = 'campaign:live'
 LIVE_TTL = 60
@@ -42,6 +43,7 @@ VIEWER_TTL = 60
 @dataclass(frozen=True)
 class Served:
     token: str
+    click_token: str
     creative: Creative
 
 
@@ -93,14 +95,17 @@ def get_ad(viewer, conversation, placement=Campaign.Placement.CHAT, now=None):
 
     day, _start, _end = counters.local_day(row['country'], now)
     counters.count_served(row['id'], day)
-    token = issue_delivery(
-        campaign_id=row['id'],
-        creative_id=creative.pk,
-        conversation_id=conversation.pk,
-        viewer_id=viewer.pk,
-        placement=placement,
+    facts = {
+        'nonce': new_nonce(),
+        'campaign_id': row['id'],
+        'creative_id': creative.pk,
+        'conversation_id': conversation.pk,
+        'viewer_id': viewer.pk,
+        'placement': placement,
+    }
+    return Served(
+        token=issue_delivery(**facts), click_token=issue_click(**facts), creative=creative
     )
-    return Served(token=token, creative=creative)
 
 
 def matches(row, group):

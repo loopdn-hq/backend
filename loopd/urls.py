@@ -19,6 +19,7 @@ from django.contrib import admin
 from django.urls import include, path, re_path
 from django.views.static import serve
 
+from commercial.views import follow_click
 from loopd.health import healthz
 from mail.views import UnsubscribeView
 
@@ -87,6 +88,10 @@ urlpatterns = [
         UnsubscribeView.as_view(),
         name='mail-unsubscribe',
     ),
+    # A sponsored card's button (campaigns, slice 6). Also not under /api/v1/:
+    # a member's browser opens it in a new tab, with no app token, and it must
+    # work for as long as the card is on screen. Short, and no "ads" in it.
+    path('c/<str:token>/', follow_click, name='campaign-click'),
 ]
 
 if not settings.AWS_STORAGE_BUCKET_NAME:

@@ -9,7 +9,8 @@ never AdImpression. `prune` deletes per-view rows past the retention period
 What a company sees is aggregates only, and reach - a count of people -
 below MIN_ELIGIBLE_MEMBERS is given as null, "too few to show", never as a
 number: a reach of 2 in a day narrows down to people. Views and spend are
-always shown; they are what the company pays for.
+always shown; they are what the company pays for. Clicks (slice 6) are the
+counted ones only (services/clicks.py), on the day they were pressed.
 """
 from datetime import datetime, time, timedelta
 
@@ -18,7 +19,13 @@ from django.db.models import Count, Q, Sum
 from django.utils import timezone
 
 from commercial.markets import time_zone
-from commercial.models import AdImpression, AdTransaction, Campaign, CampaignStatsDaily
+from commercial.models import (
+    AdClick,
+    AdImpression,
+    AdTransaction,
+    Campaign,
+    CampaignStatsDaily,
+)
 from commercial.services import counters
 
 
@@ -26,11 +33,12 @@ def roll_up(now=None):
     """Today's and yesterday's totals for every campaign that had any. Returns
     how many day rows were written."""
     now = now or timezone.now()
-    recent = AdImpression.objects.filter(viewed_at__gte=now - timedelta(days=2)).values(
-        'campaign_id'
-    )
+    since = now - timedelta(days=2)
+    viewed = AdImpression.objects.filter(viewed_at__gte=since).values('campaign_id')
+    clicked = AdClick.objects.filter(clicked_at__gte=since).values('impression__campaign_id')
     campaigns = Campaign.objects.filter(
-        Q(pk__in=recent)
+        Q(pk__in=viewed)
+        | Q(pk__in=clicked)
         | Q(status__in=[Campaign.Status.RUNNING, Campaign.Status.PAUSED])
     ).select_related('company')
     written = 0
@@ -55,6 +63,7 @@ def campaign_report(campaign):
     """{"totals": {...}, "days": [...]} for one campaign."""
     rows = list(campaign.daily_stats.order_by('day'))
     viewed = sum(row.viewed for row in rows)
+    clicks = sum(row.clicks for row in rows)
     return {
         'currency': campaign.company.currency,
         'reach_shown_from': settings.MIN_ELIGIBLE_MEMBERS,
@@ -62,10 +71,9 @@ def campaign_report(campaign):
             'served': sum(row.served for row in rows),
             'viewed': viewed,
             'reach': _shown(rows[-1].reach_to_date) if rows else None,
+            'clicks': clicks,
             'spend_cents': campaign.spent_cents,
-            'cost_per_1000_views_cents': (
-                campaign.spent_cents * 1000 // viewed if viewed else None
-            ),
+            **_costs(campaign.spent_cents, viewed, clicks),
         },
         'days': [
             {
@@ -73,6 +81,7 @@ def campaign_report(campaign):
                 'served': row.served,
                 'viewed': row.viewed,
                 'reach': _shown(row.reach),
+                'clicks': row.clicks,
                 'spend_cents': row.spend_cents,
             }
             for row in rows
@@ -85,7 +94,11 @@ def company_report(company):
     campaign only: people do not add up across campaigns."""
     campaigns = list(
         company.campaigns.exclude(status=Campaign.Status.DRAFT)
-        .annotate(viewed=Sum('daily_stats__viewed'), served=Sum('daily_stats__served'))
+        .annotate(
+            viewed=Sum('daily_stats__viewed'),
+            served=Sum('daily_stats__served'),
+            clicks=Sum('daily_stats__clicks'),
+        )
         .order_by('-created_at', '-pk')
     )
     reach = _latest_reach(company)
@@ -95,12 +108,14 @@ def company_report(company):
         .annotate(
             served=Sum('served'),
             viewed=Sum('viewed'),
+            clicks=Sum('clicks'),
             spend_cents=Sum('spend_cents'),
             campaigns=Count('campaign', distinct=True),
         )
         .order_by('day')
     )
     viewed = sum(c.viewed or 0 for c in campaigns)
+    clicks = sum(c.clicks or 0 for c in campaigns)
     spend = sum(c.spent_cents for c in campaigns)
     return {
         'currency': company.currency,
@@ -108,8 +123,9 @@ def company_report(company):
         'totals': {
             'served': sum(c.served or 0 for c in campaigns),
             'viewed': viewed,
+            'clicks': clicks,
             'spend_cents': spend,
-            'cost_per_1000_views_cents': spend * 1000 // viewed if viewed else None,
+            **_costs(spend, viewed, clicks),
         },
         'days': list(days),
         'campaigns': [
@@ -119,6 +135,7 @@ def company_report(company):
                 'status': c.status,
                 'objective': c.objective,
                 'viewed': c.viewed or 0,
+                'clicks': c.clicks or 0,
                 'reach': _shown(reach.get(c.pk, 0)),
                 'spend_cents': c.spent_cents,
             }
@@ -137,6 +154,14 @@ def _latest_reach(company):
     ):
         latest[campaign_id] = reach
     return latest
+
+
+def _costs(spend, viewed, clicks):
+    """What a company reads off its spend: per 1,000 views, and per click."""
+    return {
+        'cost_per_1000_views_cents': spend * 1000 // viewed if viewed else None,
+        'cost_per_click_cents': spend // clicks if clicks else None,
+    }
 
 
 def _shown(people):
@@ -160,8 +185,11 @@ def _roll_day(campaign, day):
         ).aggregate(total=Sum('reserved_change_cents'))['total']
         or 0
     )
+    clicks = AdClick.objects.filter(
+        impression__campaign=campaign, counted=True, clicked_at__gte=start, clicked_at__lt=end
+    ).count()
     row = CampaignStatsDaily.objects.filter(campaign=campaign, day=day).first()
-    if row is None and not (viewed or served or spend):
+    if row is None and not (viewed or served or spend or clicks):
         return 0
 
     people = 'participant__user_id'
@@ -179,6 +207,7 @@ def _roll_day(campaign, day):
     row.viewed = viewed
     row.reach = reach
     row.reach_to_date = max(row.reach_to_date, reach_to_date)
+    row.clicks = clicks
     row.spend_cents = spend
     row.save()
     return 1

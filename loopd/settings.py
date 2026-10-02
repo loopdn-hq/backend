@@ -1125,6 +1125,11 @@ SPONSORED_VIEWS_PER_DAY = int(os.environ.get('SPONSORED_VIEWS_PER_DAY', '10'))
 # How long a served card's token may be reported as seen. A card left on
 # screen longer than this is not counted.
 SPONSORED_TOKEN_MAX_AGE_SECONDS = int(os.environ.get('SPONSORED_TOKEN_MAX_AGE_SECONDS', '3600'))
+# How long a card's button counts a click (slice 6). Older, the button still
+# opens its destination; the click is just not counted.
+SPONSORED_CLICK_TOKEN_MAX_AGE_SECONDS = int(
+    os.environ.get('SPONSORED_CLICK_TOKEN_MAX_AGE_SECONDS', '86400')
+)
 # Per-view rows are deleted after this many days (decision 15); the daily
 # totals are kept for good.
 SPONSORED_VIEW_RETENTION_DAYS = int(os.environ.get('SPONSORED_VIEW_RETENTION_DAYS', '90'))

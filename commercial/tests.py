@@ -25,6 +25,7 @@ from django.db import IntegrityError, connection, transaction
 from django.db.models import ProtectedError
 from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
 from rest_framework import status
@@ -33,6 +34,7 @@ from rest_framework.test import APITestCase
 from commercial import tokens
 from commercial.markets import region_codes
 from commercial.models import (
+    AdClick,
     AdImpression,
     AdSettings,
     AdTransaction,
@@ -2711,6 +2713,9 @@ class ServingApiTests(ServingTestCase, APITestCase):
         self.assertEqual(card['company']['name'], "Joe's Pizza")
         self.assertEqual(card['creative']['headline'], 'Lunch for two')
         self.assertNotIn('targeting', card)
+        # The button goes through the click address; the destination is not given.
+        self.assertIn('/c/', card['click_url'])
+        self.assertNotIn('cta_target', card['creative'])
 
         first = self.client.post('/api/v1/commercial/impressions/', {'token': card['token']}, format='json')
         again = self.client.post('/api/v1/commercial/impressions/', {'token': card['token']}, format='json')
@@ -2739,3 +2744,107 @@ class ServingApiTests(ServingTestCase, APITestCase):
         self.assertEqual(
             self.client.get(f'/api/v1/commercial/campaigns/{campaign.pk}/report/').status_code, 404
         )
+
+
+# --- slice 6: clicks -----------------------------------------------------------
+
+BROWSER = (
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/129.0 Safari/537.36'
+)
+
+
+class ClickTests(ServingTestCase):
+    def press(self, served, user_agent=BROWSER, method='get', **headers):
+        path = reverse('campaign-click', args=[served.click_token])
+        return getattr(self.client, method)(path, HTTP_USER_AGENT=user_agent, **headers)
+
+    def test_a_press_counts_once_and_goes_on_with_nothing_added(self):
+        campaign = self.running()
+        served = self.serve()
+        self.see(served)
+        response = self.press(served)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response['Location'], campaign.creatives.get().cta_target)
+        self.assertEqual(response['Referrer-Policy'], 'no-referrer')
+        self.assertEqual(response['Cache-Control'], 'no-store')
+
+        self.press(served)  # again
+        clicks = list(AdClick.objects.order_by('pk'))
+        self.assertEqual([click.counted for click in clicks], [True, False])
+        self.assertTrue(all(click.ip_hash and click.user_agent_hash for click in clicks))
+
+    def test_scanners_and_previews_are_not_counted(self):
+        self.running()
+        served = self.serve()
+        self.see(served)
+        self.press(served, user_agent='Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)')
+        self.press(served, user_agent='')
+        self.assertEqual(
+            list(AdClick.objects.values_list('suspected_scanner', 'counted')),
+            [(True, False), (True, False)],
+        )
+        # Nobody pressed these: they are sent on and leave no trace.
+        self.assertEqual(self.press(served, method='head').status_code, 302)
+        self.assertEqual(self.press(served, HTTP_SEC_PURPOSE='prefetch').status_code, 302)
+        self.assertEqual(AdClick.objects.count(), 2)
+        # A person still counts after them.
+        self.press(served)
+        self.assertEqual(AdClick.objects.filter(counted=True).count(), 1)
+
+    def test_a_quick_tap_before_the_view_report_records_the_view_too(self):
+        self.running()
+        served = self.serve()
+        self.press(served)
+        impression = AdImpression.objects.get()
+        self.assertTrue(impression.billable)
+        self.assertTrue(impression.clicks.get().counted)
+        # The app's view report afterwards is that same view, not a second one.
+        _impression, created = measurement.record_view(self.viewer, served.token)
+        self.assertFalse(created)
+
+    def test_a_token_that_is_not_ours_goes_nowhere_and_records_nothing(self):
+        self.running()
+        served = self.serve()
+        for token in (served.click_token[:-3] + 'abc', served.token, 'nonsense'):
+            response = self.client.get(
+                reverse('campaign-click', args=[token]), HTTP_USER_AGENT=BROWSER
+            )
+            self.assertEqual(response.status_code, 404)
+        self.assertFalse(AdClick.objects.exists())
+        self.assertFalse(AdImpression.objects.exists())
+
+    def test_an_old_card_still_opens_but_is_not_counted(self):
+        self.running()
+        served = self.serve()
+        self.see(served)
+        with override_settings(SPONSORED_CLICK_TOKEN_MAX_AGE_SECONDS=-1):
+            self.assertEqual(self.press(served).status_code, 302)
+        self.assertFalse(AdClick.objects.exists())
+
+    def test_somebody_who_left_the_group_is_sent_on_but_not_counted(self):
+        self.running()
+        served = self.serve()
+        self.group.participants.filter(user=self.viewer).update(status=Participant.Status.LEFT)
+        self.assertEqual(self.press(served).status_code, 302)
+        self.assertFalse(AdClick.objects.exists())
+        self.assertFalse(AdImpression.objects.exists())
+
+    def test_clicks_in_the_reports(self):
+        campaign = self.running()
+        for i in range(2):
+            viewer = self.member_of(self.group, i)
+            served = self.serve(viewer)
+            self.see(served, viewer)
+            self.press(served)
+            self.press(served)
+        settlement.settle_all()
+        stats.roll_up()
+        campaign.refresh_from_db()
+
+        report = stats.campaign_report(campaign)
+        self.assertEqual(report['totals']['clicks'], 2)
+        self.assertEqual(report['totals']['cost_per_click_cents'], 5)  # 10 cents, 2 clicks
+        self.assertEqual(report['days'][-1]['clicks'], 2)
+        company = stats.company_report(self.company)
+        self.assertEqual((company['totals']['clicks'], company['campaigns'][0]['clicks']), (2, 2))

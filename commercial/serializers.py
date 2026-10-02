@@ -1,5 +1,6 @@
 """Shapes for the commercial API. They validate input; commercial/services decides."""
 from django.conf import settings
+from django.urls import reverse
 from rest_framework import serializers
 
 from billing.serializers import _validate_redirect_url
@@ -450,8 +451,14 @@ class BudgetIncreaseSerializer(serializers.Serializer):
 
 class ServedCardSerializer(serializers.Serializer):
     """GET serve/: the card a member is shown - the creative, its company's
-    name and logo, and the token to report the view with. Nothing about the
-    campaign's audience, budget or the company's other details."""
+    name and logo, the token to report the view with, and the button's
+    address. Nothing about the campaign's audience, budget or the company's
+    other details.
+
+    The button goes through `click_url`, /c/{token}/ (slice 6), which counts
+    the click and sends the member on; the destination itself is not given,
+    so no client can skip the count.
+    """
 
     def to_representation(self, served):
         creative = served.creative
@@ -463,8 +470,10 @@ class ServedCardSerializer(serializers.Serializer):
                 return None
             return request.build_absolute_uri(field.url) if request else field.url
 
+        click_path = reverse('campaign-click', args=[served.click_token])
         return {
             'token': served.token,
+            'click_url': request.build_absolute_uri(click_path) if request else click_path,
             'placement': creative.campaign.placement,
             'company': {'name': company.name, 'logo_url': url(company.logo)},
             'creative': {
@@ -473,7 +482,6 @@ class ServedCardSerializer(serializers.Serializer):
                 'image_url': url(creative.image),
                 'cta_label': creative.cta_label,
                 'cta_kind': creative.cta_kind,
-                'cta_target': creative.cta_target,
             },
         }
 

@@ -28,20 +28,32 @@ def record_view(viewer, token, now=None):
     """(impression, created). Raises Invalid for a token that names no view
     this person may report - forged, expired, someone else's - with one
     message for all of them."""
-    now = now or timezone.now()
     data = read_delivery(token)
     if data is None or data['viewer_id'] != viewer.pk:
         raise Invalid({'token': NOT_COUNTED})
+    return record(data, now)
 
+
+def record(data, now=None):
+    """(impression, created) for a served card's facts, from a token the
+    caller has checked. A click can arrive before the view report (a quick
+    tap): the click is proof enough the card was seen, so clicks.py records
+    the view through here too. Raises Invalid if the viewer has left the
+    group, or the campaign or creative is gone."""
+    now = now or timezone.now()
     existing = AdImpression.objects.filter(delivery_token=data['nonce']).first()
     if existing is not None:
         return existing, False
 
-    participant = Participant.objects.filter(
-        conversation_id=data['conversation_id'],
-        user_id=viewer.pk,
-        status=Participant.Status.ACTIVE,
-    ).first()
+    participant = (
+        Participant.objects.filter(
+            conversation_id=data['conversation_id'],
+            user_id=data['viewer_id'],
+            status=Participant.Status.ACTIVE,
+        )
+        .select_related('user__profile')
+        .first()
+    )
     campaign = (
         Campaign.objects.filter(pk=data['campaign_id']).select_related('company').first()
     )
@@ -67,6 +79,7 @@ def record_view(viewer, token, now=None):
         # The same report twice at once: the other one wrote it.
         return AdImpression.objects.get(delivery_token=data['nonce']), False
 
+    viewer = participant.user
     counters.count_view(
         impression, campaign.company.country, viewer.pk, counters.viewer_zone(viewer)
     )
