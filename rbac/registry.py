@@ -37,8 +37,8 @@ there is nobody yet for a finer feature to tell apart; a row such as
 `ads.campaign.publish` now would be a switch an operator turns off expecting
 something to stop, when the owner can do everything anyway. Per-action
 features (`ads.campaign.*`, granted to `commercial`) arrive with several people
-per company (step 9). The first campaign feature that does arrive is admin
-review, `platform.campaign.review`, lockable, in slice 2.
+per company (step 9). Reviewing campaigns is an admin feature,
+`platform.campaign.review`, on the admin site (slice 2).
 
 `commercial.access` is the one exception. It is the door to the commercial
 account's dashboard - the whole commercial API
@@ -151,6 +151,14 @@ ACCOUNT_FEATURES = [
                     'and every admin endpoint, alongside each one\'s own feature. '
                     'Not lockable: opening the site grants nothing by itself, '
                     'and a support role reading the permissions matrix needs it.',
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: False},
+    ),
+    dict(
+        key='platform.campaign.review', label='Review campaigns',
+        area='Platform', sort_order=57, default_allowed=False, is_lockable=True,
+        description='Approve or reject the campaigns companies submit, on the '
+                    'admin site (docs/campaigns_final_plan.md, slice 2). '
+                    'Lockable: approving is what lets an ad reach members.',
         grants={ADMIN: True, COMMERCIAL: False, STANDARD: False},
     ),
     dict(

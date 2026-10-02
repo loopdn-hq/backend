@@ -6,11 +6,11 @@ status, and writes exactly one CampaignEvent, all in one transaction. Nothing
 else writes `Campaign.status`; creating a draft, the [*] -> draft arrow, is
 services/campaigns.create_draft.
 
-The owner's moves so far: submit and withdraw (slice 1), which move money
-since slice 3 - submit fixes the price and sets the whole budget aside,
-withdraw returns it - and raising a running or paused campaign's budget
-(slice 3). Approve and reject are slice 2; start, pause, resume, cancel and
-end are slice 4.
+The owner's moves: submit and withdraw (slice 1), which move money since
+slice 3 - submit fixes the price and sets the whole budget aside, withdraw
+returns it - and raising a running or paused campaign's budget (slice 3).
+An admin's: approve and reject (slice 2, from the admin site). Start, pause,
+resume, cancel and end are slice 4.
 
 A move that also moves money still writes ONE event: the money goes in that
 event's `metadata` (what was reserved, released, at what price).
@@ -18,12 +18,16 @@ event's `metadata` (what was reserved, released, at what price).
 from django.db import transaction
 
 from commercial.models import Campaign, CampaignEvent, Creative
-from commercial.services import campaigns, pricing, wallet
+from commercial.services import campaigns, pricing, review, wallet
 from commercial.services.errors import Invalid, Refused
 
 
 class TransitionRefused(Refused):
     pass
+
+
+class ReviewBlocked(Refused):
+    """Approve refused: the automatic checks found a blocker (services/review.py)."""
 
 
 class SubmitRefused(Invalid):
@@ -59,7 +63,9 @@ def submit(campaign, actor):
             # Another submit took the money since submit_problems looked.
             raise SubmitRefused({'funds': exc.message})
 
-        campaign.creatives.update(status=Creative.Status.PENDING_REVIEW)
+        # A resubmitted campaign starts its review clean: the last reviewer's
+        # notes stay in the history (the `rejected` event), not on the work.
+        campaign.creatives.update(status=Creative.Status.PENDING_REVIEW, review_notes='')
         return _move(
             campaign,
             Campaign.Status.PENDING_REVIEW,
@@ -98,6 +104,93 @@ def withdraw(campaign, actor):
             CampaignEvent.Kind.WITHDRAWN,
             actor,
             metadata={'released_cents': released},
+        )
+
+
+def approve(campaign, actor, note=''):
+    """pending_review -> approved: an admin passed it, and its creatives with it.
+
+    Refused while the automatic checks find a blocker (services/review.py);
+    the warnings are the reviewer's to weigh, and are recorded on the event.
+    Its money stays reserved. It waits for its start date (slice 4).
+    """
+    with transaction.atomic():
+        campaign = _lock(campaign)
+        _require(
+            campaign,
+            Campaign.Status.PENDING_REVIEW,
+            'Only a campaign waiting for review can be approved.',
+        )
+
+        found = review.findings(campaign)
+        stopping = review.blockers(found)
+        if stopping:
+            raise ReviewBlocked(
+                "It can't be approved yet: " + ' '.join(f.message for f in stopping)
+            )
+
+        campaign.creatives.update(status=Creative.Status.APPROVED, review_notes='')
+        return _move(
+            campaign,
+            Campaign.Status.APPROVED,
+            CampaignEvent.Kind.APPROVED,
+            actor,
+            note=(note or '').strip(),
+            metadata={'warnings': [finding.code for finding in found]},
+        )
+
+
+def reject(campaign, actor, note, creative_notes=None):
+    """pending_review -> draft, with the reviewer's reasons.
+
+    `note` says why, to the company; it is required. `creative_notes`,
+    {creative id: note}, marks the creatives that were the problem: they become
+    `rejected` with their note, and the rest go back to `draft`. The reserved
+    money returns to available and the price is forgotten, as on withdraw.
+    """
+    note = (note or '').strip()
+    if not note:
+        raise Invalid({'note': 'Say why, so the company knows what to fix.'})
+    creative_notes = {
+        int(pk): text.strip()
+        for pk, text in (creative_notes or {}).items()
+        if (text or '').strip()
+    }
+
+    with transaction.atomic():
+        campaign = _lock(campaign)
+        _require(
+            campaign,
+            Campaign.Status.PENDING_REVIEW,
+            'Only a campaign waiting for review can be rejected.',
+        )
+        unknown = set(creative_notes) - set(campaign.creatives.values_list('pk', flat=True))
+        if unknown:
+            raise Invalid({'creatives': "Those creatives aren't this campaign's."})
+
+        released = campaign.reserved_cents
+        wallet.release(campaign)
+        campaign.cpm_cents = None
+        campaign.save(update_fields=['cpm_cents', 'updated_at'])
+
+        campaign.creatives.exclude(pk__in=creative_notes).update(
+            status=Creative.Status.DRAFT, review_notes=''
+        )
+        for pk, text in creative_notes.items():
+            Creative.objects.filter(pk=pk).update(
+                status=Creative.Status.REJECTED, review_notes=text
+            )
+
+        return _move(
+            campaign,
+            Campaign.Status.DRAFT,
+            CampaignEvent.Kind.REJECTED,
+            actor,
+            note=note,
+            metadata={
+                'released_cents': released,
+                'creatives': {str(pk): text for pk, text in creative_notes.items()},
+            },
         )
 
 

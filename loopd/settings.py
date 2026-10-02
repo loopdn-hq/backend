@@ -207,9 +207,11 @@ INSTALLED_APPS = [
     # media - see calls/livekit.py.
     'calls',
     # What a commercial user does: companies, campaigns, their money and results.
-    # Models only so far - nothing reads these tables yet; see
-    # docs/advertising_integration_plan.md and docs/commercial_rename_plan.md.
+    # See docs/campaigns_final_plan.md.
     'commercial',
+    # The admin site's API (admin.loopdn.com): Loopd'n's own tools, over the
+    # other apps' services. No models of its own.
+    'platform_admin',
 ]
 
 MIDDLEWARE = [

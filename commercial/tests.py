@@ -1823,3 +1823,67 @@ class MoneyApiTests(APITestCase):
             self.checkout(),
         ):
             self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+# --- slice 2: review --------------------------------------------------------------
+
+
+@SMALL_FLOORS
+class ReviewFindingsTests(TestCase):
+    """services/review.py: what review checks before an admin decides."""
+
+    def setUp(self):
+        from commercial.services import review
+
+        self.review = review
+        self.owner = make_commercial_user('maria')
+        self.company = make_company(self.owner, website='https://luna.example')
+        fund(self.company)
+        make_group('a', 5)
+        make_group('b', 5)
+
+    def submitted(self, **creative):
+        campaign = campaign_services.create_draft(
+            self.company, self.owner, objective='website', name='Lunch deal'
+        )
+        campaign_services.set_targeting(campaign)
+        campaign_services.update_draft(campaign, total_budget_cents=50_000)
+        creative.setdefault('headline', 'Lunch for two')
+        creative.setdefault('body', 'Half price until 2pm.')
+        creative.setdefault('cta_target', 'https://luna.example/menu')
+        campaign_services.add_creative(campaign, cta_label='Go', **creative)
+        return transitions.submit(campaign, self.owner)
+
+    def codes(self, campaign):
+        return {(f.code, f.severity) for f in self.review.findings(campaign)}
+
+    def test_a_clean_campaign_has_nothing_to_report(self):
+        self.assertEqual(self.codes(self.submitted()), set())
+
+    def test_numbers_and_addresses_in_the_text_are_flagged(self):
+        campaign = self.submitted(body='Call 0917 123 4567 or see www.luna.example')
+        self.assertEqual(
+            self.codes(campaign),
+            {('phone_in_text', 'warning'), ('link_in_text', 'warning')},
+        )
+
+    def test_a_link_away_from_the_companys_website_is_flagged(self):
+        campaign = self.submitted(cta_target='https://elsewhere.example/deal')
+        self.assertEqual(self.codes(campaign), {('unfamiliar_link', 'warning')})
+        # A subdomain of the company's own site is its own.
+        campaign = self.submitted(cta_target='https://order.luna.example/')
+        self.assertEqual(self.codes(campaign), set())
+
+    def test_blockers(self):
+        campaign = self.submitted()
+        Company.objects.filter(pk=self.company.pk).update(status=Company.Status.SUSPENDED)
+        Campaign.objects.filter(pk=campaign.pk).update(reserved_cents=0)
+        campaign.targeting.categories.set([category('school')])
+        campaign.refresh_from_db()
+
+        found = self.review.findings(campaign)
+        self.assertEqual(
+            {f.code for f in self.review.blockers(found)},
+            {'company_suspended', 'not_funded', 'audience_too_small'},
+        )
+        self.assertEqual(found[0].severity, 'blocker')

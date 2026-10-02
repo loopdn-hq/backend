@@ -61,6 +61,9 @@ urlpatterns = [
     # The commercial dashboard (commercial.loopdn.com): companies today,
     # campaigns next. Never "ads" in the address - see commercial/urls.py.
     path('api/v1/commercial/', include('commercial.urls')),
+    # The admin site (admin.loopdn.com): Loopd'n's own tools. Every route needs
+    # `platform.access` and its own feature - see platform_admin/__init__.py.
+    path('api/v1/admin/', include('platform_admin.urls')),
 
     # Granting and revoking account roles, and the log of who did. Account
     # admins only - the gate is in the viewset, because there is no subset of
