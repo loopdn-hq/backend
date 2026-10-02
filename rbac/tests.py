@@ -1638,3 +1638,72 @@ class AdsAccessRenameTests(TestCase):
         entry = RoleAuditLog.objects.get()
         self.assertEqual(entry.feature_key, 'ads.access')
         self.assertEqual(entry.feature.key, 'commercial.access')
+
+
+class CreateAdminCommandTests(TestCase):
+    """`manage.py create_admin`: a fresh environment's first admin."""
+
+    def run_command(self, *args, env=None):
+        from io import StringIO
+        from unittest import mock
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        with mock.patch.dict('os.environ', env or {}, clear=False):
+            call_command('create_admin', *args, stdout=out)
+        return out.getvalue()
+
+    def test_it_makes_a_verified_admin_who_can_open_the_admin_site(self):
+        from rbac.resolver import can
+
+        output = self.run_command('--email', 'Admin@Loopdn.com')
+
+        user = User.objects.get(email='admin@loopdn.com')
+        self.assertEqual(user.username, 'admin')
+        self.assertTrue(user.is_active)
+        self.assertTrue(user.profile.email_verified)
+        self.assertTrue(UserRole.objects.filter(user=user, role='admin').exists())
+        self.assertTrue(can(user, 'platform.access'))
+
+        password = next(
+            line.split(': ', 1)[1] for line in output.splitlines()
+            if line.startswith('Password: ')
+        )
+        self.assertEqual(len(password), 16)
+        self.assertTrue(user.check_password(password))
+
+    def test_running_it_again_changes_nothing_and_shows_no_password(self):
+        self.run_command('--email', 'admin@loopdn.com', env={'ADMIN_PASSWORD': 'Fj3!kq8Lz-Pw2m#R'})
+        output = self.run_command('--email', 'admin@loopdn.com')
+
+        user = User.objects.get(email='admin@loopdn.com')
+        self.assertTrue(user.check_password('Fj3!kq8Lz-Pw2m#R'))
+        self.assertIn('Password unchanged.', output)
+        self.assertNotIn('Password: ', output)
+        self.assertEqual(UserRole.objects.filter(user=user, role='admin').count(), 1)
+
+    def test_reset_password_sets_a_new_one(self):
+        self.run_command('--email', 'admin@loopdn.com', env={'ADMIN_PASSWORD': 'Fj3!kq8Lz-Pw2m#R'})
+        self.run_command(
+            '--email', 'admin@loopdn.com', '--reset-password',
+            env={'ADMIN_PASSWORD': 'Nw7?tR2x!Vb9qL4e'},
+        )
+        self.assertTrue(User.objects.get(email='admin@loopdn.com').check_password('Nw7?tR2x!Vb9qL4e'))
+
+    def test_it_will_not_quietly_reactivate_a_banned_account(self):
+        from django.core.management.base import CommandError
+
+        User.objects.create_user(
+            username='banned', email='admin@loopdn.com', password='pw', is_active=False
+        )
+        with self.assertRaises(CommandError):
+            self.run_command('--email', 'admin@loopdn.com')
+        self.assertFalse(UserRole.objects.filter(role='admin', user__username='banned').exists())
+
+    def test_a_weak_password_is_refused(self):
+        from django.core.management.base import CommandError
+
+        with self.assertRaises(CommandError):
+            self.run_command('--email', 'admin@loopdn.com', env={'ADMIN_PASSWORD': '12345678'})
+        self.assertFalse(User.objects.filter(email='admin@loopdn.com').exists())
