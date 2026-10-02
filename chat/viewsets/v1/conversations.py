@@ -14,6 +14,8 @@
     GET  /api/v1/chat/conversations/<id>/requests/ admin: who is waiting
     POST /api/v1/chat/conversations/<id>/requests/ admin: approve or decline
     POST /api/v1/chat/conversations/<id>/remove/   admin removes or blocks
+    GET  /api/v1/chat/conversations/<id>/blocked/  admin: who is blocked
+    POST /api/v1/chat/conversations/<id>/unblock/  admin lifts a block
     POST /api/v1/chat/conversations/<id>/delivery/ mute it, or turn its texts
                                                    or emails off
     POST /api/v1/chat/conversations/<id>/role/     admin promotes or demotes
@@ -87,6 +89,7 @@ from chat.serializers import (
     RenameMemberSerializer,
     ParticipantSerializer,
     NudgeMemberSerializer,
+    ParticipantActionSerializer,
     RemoveMemberSerializer,
     member_candidates,
 )
@@ -128,6 +131,7 @@ class ConversationViewSet(
         'join': JoinGroupSerializer,
         'requests': JoinRequestDecisionSerializer,
         'remove': RemoveMemberSerializer,
+        'unblock': ParticipantActionSerializer,
         'nudge': NudgeMemberSerializer,
         'delivery': DeliveryPreferenceSerializer,
         'read': MarkReadSerializer,
@@ -154,6 +158,8 @@ class ConversationViewSet(
         'requests:GET': 'Pending requests fetched.',
         'requests:POST': 'Request handled.',
         'remove': 'Member removed.',
+        'blocked': 'Blocked members fetched.',
+        'unblock': 'Member unblocked.',
         'search_members': 'Search complete.',
         'nudge': 'Reminder sent.',
         'delivery': 'Delivery settings saved.',
@@ -664,6 +670,39 @@ class ConversationViewSet(
             request.user,
             block=serializer.validated_data['block'],
         )
+        return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['get'])
+    def blocked(self, request, pk=None):
+        """Who an admin has blocked from this group. Admins only.
+
+        One row per blocked identity. A person blocked under both their account
+        and their number appears twice, and both have to be lifted - either one
+        alone still keeps them out.
+        """
+        conversation = self.get_object()
+
+        if not conversation.is_admin(request.user):
+            raise PermissionDenied('Only a group admin can see who is blocked.')
+
+        # Participant.objects for the reason `requests` gives: the queryset
+        # above prefetches only ACTIVE rows, so the relation would be empty.
+        rows = Participant.objects.filter(
+            conversation=conversation, status=Participant.Status.BLOCKED
+        ).select_related('user__profile')
+        return Response(ParticipantSerializer(rows, many=True).data)
+
+    @action(detail=True, methods=['post'])
+    def unblock(self, request, pk=None):
+        """Lift a block. They are out of the group but may come back."""
+        conversation = self.get_object()
+        serializer = self.get_serializer(
+            data=request.data,
+            context={**self.get_serializer_context(), 'conversation': conversation},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        participant = membership.unblock(serializer.participant, request.user)
         return Response(ParticipantSerializer(participant).data)
 
     @action(detail=True, methods=['post'])

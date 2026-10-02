@@ -339,6 +339,29 @@ def remove(participant, by, *, block=False):
 
 
 @transaction.atomic
+def unblock(participant, by):
+    """An admin lifts a block, so the person may come back.
+
+    Lands on REMOVED, not ACTIVE. Unblocking says they MAY return, not that
+    they have: they come back the way anybody outside the group does - an admin
+    adds them again, or they use the code or text JOIN as the group's join mode
+    allows. Putting them straight back in would add somebody to a group without
+    asking them, which nothing else here does.
+
+    Re-read under a row lock, like `approve`, so an unblock and a fresh block
+    racing on the same row cannot both act on a stale copy.
+    """
+    _require_admin(participant.conversation, by)
+    participant = _locked(participant)
+    if participant.status != Participant.Status.BLOCKED:
+        raise JoinRefused('That person is not blocked from this group.')
+
+    participant.status = Participant.Status.REMOVED
+    participant.save(update_fields=['status'])
+    return participant
+
+
+@transaction.atomic
 def set_role(participant, role, by):
     """Promote somebody to admin, or demote them back to a member.
 

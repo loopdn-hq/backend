@@ -1735,6 +1735,112 @@ class BlockedMemberCannotReturnTests(EnvelopeAssertions, APITestCase):
         self.assertEqual(row.status, Participant.Status.BLOCKED)
 
 
+class GroupUnblockTests(EnvelopeAssertions, APITestCase):
+    """An admin lifts a block they or another admin made.
+
+    Unblocking lets somebody back in through the usual doors; it does not walk
+    them through one. They land out of the group, as if removed.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', phone='+639170000001')
+        self.bob = make_user('bob', phone='+639170000002')
+        self.carol = make_user('carol', phone='+639170000003')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.join_mode = Conversation.JoinMode.OPEN
+        self.group.save(update_fields=['join_mode'])
+        self.bob_row = self.group.add_participant(self.bob)
+        self.carol_row = self.group.add_participant(self.carol)
+        membership.remove(self.bob_row, self.alice, block=True)
+        self.client.force_authenticate(self.alice)
+
+    def unblock(self, participant):
+        return self.client.post(
+            reverse('chat:conversation-unblock', args=[self.group.id]),
+            {'participant': participant.pk},
+            format='json',
+        )
+
+    def blocked_list(self):
+        return self.client.get(
+            reverse('chat:conversation-blocked', args=[self.group.id])
+        )
+
+    def test_an_admin_sees_who_is_blocked_and_nobody_else(self):
+        # Carol removed but not blocked: she is free to come back, so she is
+        # not somebody an admin needs to find here.
+        membership.remove(self.carol_row, self.alice)
+
+        rows = self.assertSuccess(self.blocked_list())
+
+        self.assertEqual([row['user']['username'] for row in rows], ['bob'])
+
+    def test_a_plain_member_cannot_see_who_is_blocked(self):
+        self.client.force_authenticate(self.carol)
+        self.assertFailure(self.blocked_list(), status.HTTP_403_FORBIDDEN)
+
+    def test_unblocking_leaves_them_out_but_free_to_be_added(self):
+        data = self.assertSuccess(self.unblock(self.bob_row))
+
+        self.assertEqual(data['status'], Participant.Status.REMOVED)
+        self.assertFalse(self.group.has_participant(self.bob))
+        self.assertEqual(self.assertSuccess(self.blocked_list()), [])
+
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-members', args=[self.group.id]),
+                {'members': ['bob']},
+                format='json',
+            )
+        )
+        self.assertTrue(self.group.has_participant(self.bob))
+
+    def test_once_unblocked_they_can_rejoin_with_the_code(self):
+        self.assertSuccess(self.unblock(self.bob_row))
+
+        self.client.force_authenticate(self.bob)
+        self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-join'),
+                {'code': self.group.join_code},
+                format='json',
+            )
+        )
+        self.assertTrue(self.group.has_participant(self.bob))
+
+    def test_a_number_blocked_by_text_can_join_by_text_again(self):
+        phone_row = self.group.add_phone_participant(
+            '+639170000009', display_name='Mom', added_by=self.alice
+        )
+        membership.remove(phone_row, self.alice, block=True)
+        self.assertEqual(
+            inbound.handle_inbound(self.group, '+639170000009', 'JOIN').action,
+            'refused_blocked',
+        )
+
+        self.assertSuccess(self.unblock(phone_row))
+
+        self.assertEqual(
+            inbound.handle_inbound(self.group, '+639170000009', 'JOIN').action,
+            'joined',
+        )
+
+    def test_a_plain_member_cannot_unblock(self):
+        self.client.force_authenticate(self.carol)
+        self.assertFailure(self.unblock(self.bob_row))
+
+        self.bob_row.refresh_from_db()
+        self.assertEqual(self.bob_row.status, Participant.Status.BLOCKED)
+
+    def test_only_a_blocked_member_can_be_unblocked(self):
+        # Otherwise "unblock" would be a way to take somebody out of a group.
+        self.assertFailure(self.unblock(self.carol_row))
+
+        self.carol_row.refresh_from_db()
+        self.assertEqual(self.carol_row.status, Participant.Status.ACTIVE)
+
+
 class MembershipGuardTests(EnvelopeAssertions, APITestCase):
     """Guards that stop a group being stranded or a thread being lost."""
 
