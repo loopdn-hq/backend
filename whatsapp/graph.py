@@ -151,6 +151,12 @@ def granted_waba_ids(token):
     any WABA not in the answer. Without it, a tenant could post another
     tenant's WABA id alongside their own valid code and take over its inbound
     traffic.
+
+    Returns None when Meta lists a WhatsApp scope with no `target_ids`, which is
+    how it reports a grant that is not limited to particular assets. There is
+    then no list to check against, and the caller relies on the next step -
+    reading the WABA with this very token, which Meta refuses for an account
+    the token does not cover.
     """
     app_token = f'{settings.WHATSAPP_APP_ID}|{settings.WHATSAPP_APP_SECRET}'
     data = _request(
@@ -169,7 +175,9 @@ def granted_waba_ids(token):
             'whatsapp_business_management',
             'whatsapp_business_messaging',
         ):
-            granted.update(str(t) for t in scope.get('target_ids') or [])
+            if not scope.get('target_ids'):
+                return None
+            granted.update(str(t) for t in scope['target_ids'])
     return granted
 
 
