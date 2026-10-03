@@ -62,6 +62,8 @@ class FakeGraph:
                 {'scope': 'whatsapp_business_management', 'target_ids': self.granted},
             ]}}
         if path.endswith('/phone_numbers'):
+            if getattr(self, 'numbers_error', None) is not None:
+                raise self.numbers_error
             return {'data': [{'id': n} for n in self.numbers]}
         if path.endswith('/subscribed_apps') or path.endswith('/register'):
             return {'success': True}
@@ -169,6 +171,20 @@ class ConnectTests(WhatsAppTestBase):
         self.graph.granted = ['9999']
         body = self.assertFailure(self.connect(), 400)
         self.assertEqual(body['data']['reason'], 'waba_not_granted')
+        self.assertFalse(WhatsAppConnection.objects.exists())
+
+    def test_a_grant_not_limited_to_assets_is_accepted(self):
+        # Meta omits target_ids for such a grant; reading the WABA with the
+        # token is then the proof.
+        self.graph.granted = []
+        self.assertSuccess(self.connect(), 201)
+
+    def test_an_unlisted_grant_still_cannot_reach_a_waba_meta_refuses(self):
+        from whatsapp.graph import WhatsAppError
+
+        self.graph.granted = []
+        self.graph.numbers_error = WhatsAppError('no access', code=100)
+        self.assertFailure(self.connect(), 503)
         self.assertFalse(WhatsAppConnection.objects.exists())
 
     def test_a_number_outside_the_waba_is_refused(self):

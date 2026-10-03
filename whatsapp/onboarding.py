@@ -49,7 +49,8 @@ def connect(user, *, code, waba_id, phone_number_id, business_id=''):
     exchanged = graph.exchange_code(code)
     token = exchanged['access_token']
 
-    if waba_id not in graph.granted_waba_ids(token):
+    granted = graph.granted_waba_ids(token)
+    if granted is not None and waba_id not in granted:
         # Not a user error worth explaining in detail: either the browser was
         # tampered with or the flow was completed for a different account.
         logger.warning('Embedded Signup token does not cover WABA %s (user %s)',
