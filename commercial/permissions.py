@@ -4,8 +4,8 @@ from rbac.resolver import require
 
 
 class CanUseCommercial(BasePermission):
-    """Every commercial route needs `ads.access`: the commercial role has it,
-    a standard account does not.
+    """Every commercial route needs `commercial.access`: the commercial role
+    has it, a standard account does not.
 
     This is the feature gate, and a 403 with the feature's own sentence. It
     is not the access control on any one company: that is the queryset,
@@ -14,5 +14,5 @@ class CanUseCommercial(BasePermission):
     """
 
     def has_permission(self, request, view):
-        require(request.user, 'ads.access')
+        require(request.user, 'commercial.access')
         return True

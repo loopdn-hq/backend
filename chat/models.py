@@ -265,6 +265,27 @@ class Conversation(models.Model):
         related_name='conversations_created',
     )
 
+    # Groups only. What kind of group this is and where it is, as its admin
+    # declares them: the only two facts about a group that advertising may
+    # target on (§13), and never worked out from anything anybody wrote.
+    #
+    # Both start empty. An undeclared group matches a campaign that targets
+    # "any", never one that names a category or a region
+    # (docs/campaigns_final_plan.md, slice 1); the group's settings let an
+    # admin set them in slice 4.
+    #
+    # PROTECT: a category is retired with `active=False`, never deleted.
+    category = models.ForeignKey(
+        GroupCategory,
+        on_delete=models.PROTECT,
+        related_name='conversations',
+        null=True,
+        blank=True,
+    )
+    # ISO 3166: a country ("PH") or a country and its first-level subdivision
+    # ("PH-10"). Never finer - a city on a small group is not aggregate.
+    region = models.CharField(max_length=6, blank=True, default='', db_default='')
+
     # -------------------------
     # SMS SETTINGS
     # -------------------------
@@ -296,6 +317,23 @@ class Conversation(models.Model):
         db_default=True,
     )
 
+    # Photos and every other file. Separate from voice, which has its own
+    # switch above: a group can want voice notes and no pictures, or the
+    # reverse. Like voice, it holds for everybody, admins included.
+    media_enabled = models.BooleanField(
+        default=True,
+        db_default=True,
+    )
+
+    # Emoji reactions on messages. Off stops anybody adding one, admins
+    # included; reactions already left stay where they are and stay visible -
+    # the switch is about what happens next, not a way to erase what members
+    # already said.
+    reactions_enabled = models.BooleanField(
+        default=True,
+        db_default=True,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     # Touched on every new message so the conversation list can sort by it
     # without a join.
@@ -303,6 +341,18 @@ class Conversation(models.Model):
 
     class Meta:
         ordering = ['-updated_at']
+        indexes = [
+            # Matching a campaign's audience (commercial/services/reach.py):
+            # a region named outright, or every region of a country by prefix
+            # ("PH-%"). The pattern opclass is what lets Postgres use the
+            # index for the prefix as well as for equality. `category` needs
+            # none of its own: its foreign key is indexed already.
+            models.Index(
+                fields=['region'],
+                name='chat_conversation_region_idx',
+                opclasses=['varchar_pattern_ops'],
+            ),
+        ]
 
     def __str__(self):
         return self.name or f'{self.get_kind_display()} #{self.pk}'
@@ -918,6 +968,25 @@ class Participant(models.Model):
     # not an ordering of messages against each other.
     cleared_at = models.DateTimeField(null=True, blank=True)
 
+    # Messages at or before this id are not this member's to see: the admin
+    # who added them chose "Only show new messages". Null means they see the
+    # whole history, which is also what everybody who joined any other way
+    # gets.
+    #
+    # Separate from `cleared_before_message` although both start the history
+    # later, because they mean different things. A clear is the member's own
+    # tidying, and it takes the conversation out of their list until something
+    # arrives; this is somebody else's decision about what they may read, and
+    # the group must appear in their list the moment they are added. It is also
+    # a privacy line where a clear is not, so it is checked on every route a
+    # message can reach them by - see `Participant.sees_message`.
+    #
+    # A plain integer rather than a ForeignKey, unlike the clear: SET_NULL on a
+    # deleted message would quietly hand them the whole history.
+    history_after_message_id = models.PositiveBigIntegerField(
+        null=True, blank=True
+    )
+
     # Tidied out of this member's own list. Theirs alone - nobody else can
     # tell, and it neither leaves the group nor stops anything being
     # delivered. That last part matters here more than in a pure chat app:
@@ -977,6 +1046,18 @@ class Participant(models.Model):
     @property
     def is_admin(self):
         return self.role == self.Role.ADMIN
+
+    def sees_message(self, message_id):
+        """Whether this member may read the message with this id.
+
+        False only for what came before they were added with "Only show new
+        messages". The one question every route that hands a member a message
+        asks, so the line is drawn the same way everywhere.
+        """
+        return (
+            self.history_after_message_id is None
+            or message_id > self.history_after_message_id
+        )
 
     @property
     def is_phone_only(self):

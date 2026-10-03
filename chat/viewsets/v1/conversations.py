@@ -14,6 +14,8 @@
     GET  /api/v1/chat/conversations/<id>/requests/ admin: who is waiting
     POST /api/v1/chat/conversations/<id>/requests/ admin: approve or decline
     POST /api/v1/chat/conversations/<id>/remove/   admin removes or blocks
+    GET  /api/v1/chat/conversations/<id>/blocked/  admin: who is blocked
+    POST /api/v1/chat/conversations/<id>/unblock/  admin lifts a block
     POST /api/v1/chat/conversations/<id>/delivery/ mute it, or turn its texts
                                                    or emails off
     POST /api/v1/chat/conversations/<id>/role/     admin promotes or demotes
@@ -41,6 +43,7 @@ non-member gets a 404 from every route here and cannot even learn that a
 conversation exists.
 """
 from django.db.models import (
+    BigIntegerField,
     Count,
     IntegerField,
     OuterRef,
@@ -62,7 +65,7 @@ from rest_framework.pagination import PageNumberPagination
 from django.utils import timezone
 
 from chat import membership
-from chat.models import Conversation, Message, MessageReaction, Participant
+from chat.models import Conversation, GroupCategory, Message, MessageReaction, Participant
 from chat.serializers import (
     ADMIN_ONLY_SETTINGS,
     MESSAGE_PREFETCH_RELATED,
@@ -87,10 +90,12 @@ from chat.serializers import (
     RenameMemberSerializer,
     ParticipantSerializer,
     NudgeMemberSerializer,
+    ParticipantActionSerializer,
     RemoveMemberSerializer,
     member_candidates,
 )
 from chat.services import broadcast_conversation_updated, broadcast_message_updated
+from utils import regions
 
 
 class ParticipantPagination(PageNumberPagination):
@@ -127,6 +132,7 @@ class ConversationViewSet(
         'join': JoinGroupSerializer,
         'requests': JoinRequestDecisionSerializer,
         'remove': RemoveMemberSerializer,
+        'unblock': ParticipantActionSerializer,
         'nudge': NudgeMemberSerializer,
         'delivery': DeliveryPreferenceSerializer,
         'read': MarkReadSerializer,
@@ -153,6 +159,8 @@ class ConversationViewSet(
         'requests:GET': 'Pending requests fetched.',
         'requests:POST': 'Request handled.',
         'remove': 'Member removed.',
+        'blocked': 'Blocked members fetched.',
+        'unblock': 'Member unblocked.',
         'search_members': 'Search complete.',
         'nudge': 'Reminder sent.',
         'delivery': 'Delivery settings saved.',
@@ -166,6 +174,7 @@ class ConversationViewSet(
         'join_code:GET': 'Join code fetched.',
         'join_code:POST': 'New join code issued.',
         'provision_number': 'Number ready.',
+        'group_options': 'Group options fetched.',
     }
 
     def get_serializer_class(self):
@@ -195,6 +204,13 @@ class ConversationViewSet(
             floor=Greatest(
                 Coalesce('last_read_message_id', Value(0)),
                 Coalesce('cleared_before_message_id', Value(0)),
+                # Messages from before they were added, for somebody added
+                # with "Only show new messages": they cannot be read, so they
+                # must not wait to be.
+                Coalesce('history_after_message_id', Value(0)),
+                # Named because the cutoff is a plain integer and the other
+                # two are message ids, which Django will not mix unasked.
+                output_field=BigIntegerField(),
             )
         ).values('floor')[:1]
 
@@ -227,6 +243,8 @@ class ConversationViewSet(
             .select_related(
                 'sms_number',
                 'created_by__profile',
+                # Its slug is in every row's settings.
+                'category',
                 # The pinned message is serialized in full on every row. One
                 # join chain for the page, not a query per conversation.
                 *(f'pinned_message__{path}' for path in MESSAGE_SELECT_RELATED),
@@ -384,20 +402,51 @@ class ConversationViewSet(
         if not conversation.may_edit_group(request.user):
             raise PermissionDenied('You cannot edit this group.')
 
+        serializer = self.get_serializer(conversation, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+
         # The policy settings stay with admins even where members may edit the
         # name and photo, or a member could simply grant themselves the rest.
-        asked_for = set((request.data.get('settings') or {}))
+        #
+        # Read from what the serializer parsed, not from `request.data`. A photo
+        # makes the request multipart, where the nested object arrives as
+        # `settings.join_mode` keys and `request.data['settings']` is absent -
+        # so checking the raw body let those keys through unchecked.
+        asked_for = set(serializer.validated_data.get('settings') or {})
         if asked_for & ADMIN_ONLY_SETTINGS and not conversation.is_admin(request.user):
             raise PermissionDenied('Only a group admin can change group settings.')
 
-        serializer = self.get_serializer(conversation, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
         conversation = serializer.save()
 
         # No re-fetch, unlike `members`: this writes the conversation row
         # itself, so get_object()'s participant and message prefetches are
         # still current.
         return Response(self._as_conversation(conversation))
+
+    @action(detail=False, methods=['get'], url_path='group-options', url_name='group-options')
+    def group_options(self, request):
+        """What a group may say about itself: the kinds of group, and the places.
+
+        The choices behind `settings.category` and `settings.region`. Every
+        signed-in person may read them - they are the same for every group.
+        """
+        return Response({
+            'categories': [
+                {'slug': category.slug, 'label': category.label}
+                for category in GroupCategory.objects.filter(active=True)
+            ],
+            'countries': [
+                {
+                    'code': code,
+                    'name': name,
+                    'regions': [
+                        {'code': region, 'name': region_name}
+                        for region, region_name in regions.REGIONS[code]
+                    ],
+                }
+                for code, name in regions.COUNTRIES.items()
+            ],
+        })
 
     # -- membership --------------------------------------------------------
 
@@ -629,6 +678,39 @@ class ConversationViewSet(
             request.user,
             block=serializer.validated_data['block'],
         )
+        return Response(ParticipantSerializer(participant).data)
+
+    @action(detail=True, methods=['get'])
+    def blocked(self, request, pk=None):
+        """Who an admin has blocked from this group. Admins only.
+
+        One row per blocked identity. A person blocked under both their account
+        and their number appears twice, and both have to be lifted - either one
+        alone still keeps them out.
+        """
+        conversation = self.get_object()
+
+        if not conversation.is_admin(request.user):
+            raise PermissionDenied('Only a group admin can see who is blocked.')
+
+        # Participant.objects for the reason `requests` gives: the queryset
+        # above prefetches only ACTIVE rows, so the relation would be empty.
+        rows = Participant.objects.filter(
+            conversation=conversation, status=Participant.Status.BLOCKED
+        ).select_related('user__profile')
+        return Response(ParticipantSerializer(rows, many=True).data)
+
+    @action(detail=True, methods=['post'])
+    def unblock(self, request, pk=None):
+        """Lift a block. They are out of the group but may come back."""
+        conversation = self.get_object()
+        serializer = self.get_serializer(
+            data=request.data,
+            context={**self.get_serializer_context(), 'conversation': conversation},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        participant = membership.unblock(serializer.participant, request.user)
         return Response(ParticipantSerializer(participant).data)
 
     @action(detail=True, methods=['post'])
@@ -924,6 +1006,11 @@ class ConversationViewSet(
         if cleared_before is not None:
             history = history.filter(pk__gt=cleared_before)
 
+        # And everything before they were added, when the admin who added them
+        # chose "Only show new messages".
+        if own is not None and own.history_after_message_id is not None:
+            history = history.filter(pk__gt=own.history_after_message_id)
+
         if after_id is not None:
             try:
                 cursor = int(after_id)
@@ -964,7 +1051,14 @@ class ConversationViewSet(
             .filter(pk=message_id)
             .first()
         )
-        if message is None:
+        # A message from before the caller was added with "Only show new
+        # messages" is answered exactly as one that does not exist. Every
+        # action here replies with the message in full, so reacting to an old
+        # id would otherwise be a way to read it.
+        own = Participant.objects.filter(
+            conversation=conversation, user=self.request.user
+        ).first()
+        if message is None or (own is not None and not own.sees_message(message.pk)):
             raise NotFound('No such message in this conversation.')
         return message
 
@@ -1123,6 +1217,12 @@ class ConversationViewSet(
                 emoji=serializer.validated_data['emoji'],
             ).delete()
             return self._message_response(message)
+
+        # The group's "Reactions" switch. Only adding is refused: taking your
+        # own reaction away is harmless, and a member should not be stuck with
+        # one because the switch moved after they left it.
+        if not conversation.reactions_enabled:
+            raise PermissionDenied('Reactions are turned off in this group.')
 
         serializer = MessageReactionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

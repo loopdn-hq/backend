@@ -1,4 +1,6 @@
 """Helpers for inspecting uploaded attachments."""
+from pathlib import PurePosixPath
+
 from PIL import Image
 
 from chat.models import Attachment
@@ -38,3 +40,26 @@ def image_dimensions(upload):
     finally:
         # The file still has to be readable by the storage backend.
         upload.seek(0)
+
+
+# Audio by name, for an upload whose declared type says nothing useful - an
+# audio file sent as application/octet-stream is still audio. `.webm` is left
+# out on purpose: it is as often a video, and the app's own recordings declare
+# audio/webm, so the type catches those.
+AUDIO_EXTENSIONS = frozenset({
+    '.aac', '.amr', '.flac', '.m4a', '.mp3', '.oga', '.ogg', '.opus', '.wav',
+    '.weba',
+})
+
+
+def is_audio(content_type, name):
+    """Whether a file is a voice note or other audio.
+
+    The same test the web app uses to play one inline - a declared `audio/*`
+    type - plus the extension, for an upload whose declared type is generic.
+    Deliberately a declared-type check: a file disguised as something else does
+    not play as a voice note either, it shows as a plain file.
+    """
+    if (content_type or '').lower().startswith('audio/'):
+        return True
+    return PurePosixPath(name or '').suffix.lower() in AUDIO_EXTENSIONS

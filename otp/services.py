@@ -151,29 +151,74 @@ def start_phone_verification(user, phone_number=None):
     # passes through it. Raised as OtpError so that SmsError keeps meaning
     # exactly one thing: the provider failed.
     if not is_allowed_destination(number):
+        _log_code_text(user, number, 'country')
         raise OtpError('We cannot send codes to that country.')
 
     # Checked before issuing, so a request that is over the ceiling does not
     # also burn the resend cooldown.
-    _enforce_send_limits('sms', profile, number)
+    try:
+        _enforce_send_limits('sms', profile, number)
+    except OtpError:
+        # The clearest sign of somebody trying to run up the bill, so it is
+        # on record even though nothing was sent.
+        _log_code_text(user, number, 'limited', 'hourly or daily limit')
+        raise
 
     # `code` is deliberately empty: under the Verify API there is no local code
     # to store. The row exists for the resend clock, the attempt count, and
     # `phone_no` - which is what a later verify is checked against, so a code
     # sent to one number can never confirm another.
-    otp = SmsOtp.issue(profile, code='', phone_no=number)
+    try:
+        otp = SmsOtp.issue(profile, code='', phone_no=number)
+    except OtpError:
+        _log_code_text(user, number, 'limited', 'resend cooldown')
+        raise
 
     try:
-        send_verification_code(number)
-    except SmsError:
+        verification_id = send_verification_code(number)
+    except SmsError as exc:
         # The provider failed, not the user. Dropping the row releases the
         # cooldown, so they can retry immediately instead of being locked out
         # for a minute over something that was our fault.
         otp.delete()
+        _log_code_text(user, number, 'failed', str(exc))
         raise
 
     _record_send('sms', profile, number)
+    _log_code_text(
+        user, number, 'sent',
+        # None means no provider is configured - a laptop or the test suite -
+        # so nothing was texted and nothing will be billed.
+        '' if verification_id is not None else 'no provider configured; not texted',
+    )
     return otp
+
+
+def _log_code_text(user, number, outcome, reason=''):
+    """Put a code text on record: its outcome, never the code.
+
+    For what code texts cost, which ones fail, and abuse - see
+    sms.models.VerificationText. The number is kept as SmsDelivery keeps one,
+    a hash and the last four digits, and the hash is the same one, which is
+    what Telnyx's records are matched on later.
+
+    Never allowed to fail the request: a person must not be unable to sign up
+    because a log line could not be written.
+    """
+    try:
+        from sms.models import VerificationText
+        from sms.provisioning import country_for_number
+
+        VerificationText.objects.create(
+            user=user,
+            country=country_for_number(number) or '',
+            counterpart_last4=number[-4:],
+            counterpart_hash=hashlib.sha256(number.strip().encode()).hexdigest(),
+            outcome=outcome,
+            reason=reason[:255],
+        )
+    except Exception:
+        logger.exception('Could not record a verification text')
 
 
 def verify_phone(user, code):

@@ -35,6 +35,7 @@ without group SMS, or the other way round.
 import json
 import logging
 import urllib.error
+from decimal import Decimal, InvalidOperation
 import urllib.parse
 import urllib.request
 
@@ -201,10 +202,16 @@ def send_text(*, to, from_number, text):
 def search_numbers(country, *, limit=5):
     """SMS-capable numbers available to buy in this country.
 
-    Returns a list of E.164 strings, best candidate first. More than one,
-    deliberately: a search does NOT reserve anything, so another Telnyx
-    customer can take a number in the gap between finding it and ordering it.
-    The caller walks the list rather than failing on the first collision.
+    Returns a list of candidates, best first, each `{'phone_number',
+    'upfront_cost', 'monthly_cost', 'currency'}`. More than one, deliberately: a
+    search does NOT reserve anything, so another Telnyx customer can take a
+    number in the gap between finding it and ordering it. The caller walks the
+    list rather than failing on the first collision.
+
+    The price is Telnyx's `cost_information`, the only place it tells us what a
+    number costs - the order and the inventory say nothing - so it is kept here
+    for the rental record (sms.models.NumberLease). Decimals, or None where it
+    gave none.
     """
     query = [
         ('filter[country_code]', country),
@@ -232,8 +239,25 @@ def search_numbers(country, *, limit=5):
         # would look exactly like "no numbers available".
         features = {f.get('name') for f in candidate.get('features') or []}
         if 'sms' in features and candidate.get('phone_number'):
-            numbers.append(candidate['phone_number'])
+            cost = candidate.get('cost_information') or {}
+            numbers.append({
+                'phone_number': candidate['phone_number'],
+                'upfront_cost': _price(cost.get('upfront_cost')),
+                'monthly_cost': _price(cost.get('monthly_cost')),
+                'currency': str(cost.get('currency') or '')[:3].upper(),
+            })
     return numbers
+
+
+def _price(value):
+    """A provider price string ("1.00") as a Decimal, or None if there is none."""
+    if value in (None, ''):
+        return None
+    try:
+        price = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return price if price.is_finite() else None
 
 
 def order_number(phone_number, *, reference=''):
@@ -271,6 +295,41 @@ def get_number_order(order_id):
         failure_message='We could not check that number order.',
         timeout=settings.SMS_NUMBER_REQUEST_TIMEOUT,
     )
+
+
+def message_records_since(since, *, page_size=100, max_pages=20):
+    """Telnyx's own record of every text since `since`, newest first.
+
+    Its message detail records are the only place Telnyx reports what a
+    verification code text cost and whether it arrived - the Verify API and
+    its webhooks carry neither. Read-only. Each record carries, among others,
+    `id`, `cld` (the number texted), `created_at`, `direction`, `status`,
+    `cost` (a string), `currency`, `errors` (a list of code strings) and
+    `profile_id`.
+
+    Bounded by `max_pages`: this runs on a schedule, and a backlog it cannot
+    finish in one go is finished on the next run rather than in one long call.
+    """
+    records = []
+    for page in range(1, max_pages + 1):
+        query = urllib.parse.urlencode([
+            ('filter[record_type]', 'messaging'),
+            ('filter[created_at][gte]', since.strftime('%Y-%m-%dT%H:%M:%SZ')),
+            ('sort', '-created_at'),
+            ('page[number]', str(page)),
+            ('page[size]', str(page_size)),
+        ])
+        data = _request(
+            'GET',
+            f'{TELNYX_API_ROOT}/detail_records?{query}',
+            failure_message='We could not read the message records just now.',
+        ) or {}
+        batch = data.get('data') or []
+        records.extend(batch)
+        total_pages = (data.get('meta') or {}).get('total_pages') or 0
+        if not batch or page >= total_pages:
+            break
+    return records
 
 
 def find_owned_number(phone_number):

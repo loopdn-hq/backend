@@ -29,16 +29,23 @@ is not what stops them". Read the two together, which is what `can()` does.
 
 WHAT IS DELIBERATELY ABSENT
 ---------------------------
-No campaign or company-scope features yet. The `commercial` app's API so far
-is companies (slice 0 of `docs/campaigns_final_plan.md`), and a row for
-`ads.campaign.publish` before campaigns exist would be a promise with no check
-behind it - exactly what the catalogue-in-code rule exists to prevent. They
-arrive with the campaign API (step 9 and `docs/campaigns_final_plan.md`).
+No campaign or company-scope features yet. The `commercial` app's API is
+companies and building and submitting a campaign (slices 0 and 1 of
+`docs/campaigns_final_plan.md`), and every route of it is behind
+`commercial.access` alone. A company has one person managing it, its owner, so
+there is nobody yet for a finer feature to tell apart; a row such as
+`ads.campaign.publish` now would be a switch an operator turns off expecting
+something to stop, when the owner can do everything anyway. Per-action
+features (`ads.campaign.*`, granted to `commercial`) arrive with several people
+per company (step 9). Reviewing campaigns is an admin feature,
+`platform.campaign.review`, on the admin site (slice 2).
 
-`ads.access` is the one exception. It gates the whole commercial API
-(`commercial.permissions.CanUseCommercial`) and the menu item step 6 adds.
-When the campaign features do arrive, `commercial` is the role that gets them -
-confirmed, not assumed.
+`commercial.access` is the one exception. It is the door to the commercial
+account's dashboard - the whole commercial API
+(`commercial.permissions.CanUseCommercial`) and the site itself. Named for the
+area, not a role, like every key here. What happens inside it keeps its own
+prefix: advertising is one thing a commercial account does. Was `ads.access`
+until rbac/0010.
 """
 
 #: `Feature.axis` values, repeated here so the registry reads without the model.
@@ -126,9 +133,10 @@ ACCOUNT_FEATURES = [
         grants={ADMIN: True, COMMERCIAL: True, STANDARD: True},
     ),
     dict(
-        key='ads.access', label='Open the advertising area', area='Advertising',
-        description='Reach the Advertise section. The campaign features '
-                    'themselves arrive with the ads app.',
+        key='commercial.access', label='Use the commercial dashboard',
+        area='Commercial',
+        description='Reach the commercial dashboard and its API: companies '
+                    'now, campaigns and billing as they arrive.',
         sort_order=50,
         grants={ADMIN: True, COMMERCIAL: True, STANDARD: False},
     ),
@@ -136,6 +144,23 @@ ACCOUNT_FEATURES = [
     # Platform tools. default_allowed=False on every one: these are where
     # allow-by-default would fail OPEN, and a feature added later that forgets
     # to opt out is granted to everybody the moment its migration runs.
+    dict(
+        key='platform.access', label='Open the admin site',
+        area='Platform', sort_order=55, default_allowed=False,
+        description="The door to Loopd'n's own admin site (admin.loopdn.com) "
+                    'and every admin endpoint, alongside each one\'s own feature. '
+                    'Not lockable: opening the site grants nothing by itself, '
+                    'and a support role reading the permissions matrix needs it.',
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: False},
+    ),
+    dict(
+        key='platform.campaign.review', label='Review campaigns',
+        area='Platform', sort_order=57, default_allowed=False, is_lockable=True,
+        description='Approve or reject the campaigns companies submit, on the '
+                    'admin site (docs/campaigns_final_plan.md, slice 2). '
+                    'Lockable: approving is what lets an ad reach members.',
+        grants={ADMIN: True, COMMERCIAL: False, STANDARD: False},
+    ),
     dict(
         key='platform.permissions.view', label='View the permissions matrix',
         area='Platform', sort_order=60, default_allowed=False,

@@ -129,8 +129,9 @@ def _send(participant, template, what):
     """
     from mail.outbound import (
         _conversation_label, _headers_for, address_for, from_header,
+        reply_to_header,
     )
-    from mail.tokens import reply_address, unsubscribe_url
+    from mail.tokens import unsubscribe_url
     from mail import commands
 
     address = address_for(participant)
@@ -159,7 +160,7 @@ def _send(participant, template, what):
             # the From address, which takes no mail - so a YES sent in answer
             # to the reminder that asks for one was lost, and after YES,
             # "reply to these emails" pointed at nowhere.
-            reply_to=reply_address(participant),
+            reply_to=reply_to_header(participant, conversation),
             headers=_headers_for(conversation, stop_url),
         )
     except EmailError:

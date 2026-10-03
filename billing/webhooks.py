@@ -104,6 +104,8 @@ class StripeWebhook(APIView):
     def _handle(self, event_type, data_object):
         if event_type == 'checkout.session.completed':
             self._handle_checkout_completed(data_object)
+        elif event_type == 'checkout.session.async_payment_succeeded':
+            self._handle_async_payment_succeeded(data_object)
         elif event_type in ('customer.subscription.updated', 'customer.subscription.created'):
             self._handle_subscription_updated(data_object)
         elif event_type == 'customer.subscription.deleted':
@@ -518,8 +520,27 @@ class StripeWebhook(APIView):
             return subscription.user if subscription else None
         return None
 
+    def _handle_async_payment_succeeded(self, session):
+        """A checkout whose payment cleared after it completed (bank transfers,
+        some wallets). Only a company top-up waits for this today; the plan
+        and credit checkouts take cards, which clear at completion.
+        """
+        from commercial.services import payments as commercial_payments
+
+        if commercial_payments.is_funds_checkout(session):
+            commercial_payments.handle_checkout_completed(session)
+        else:
+            logger.info('Async payment succeeded for checkout %s (unhandled)', session.get('id'))
+
     def _handle_checkout_completed(self, session):
+        from commercial.services import payments as commercial_payments
         from enterprise import services as enterprise_services
+
+        if commercial_payments.is_funds_checkout(session):
+            # A company adding to its ad balance (commercial app), not a
+            # person's plan or credits: its own customer, its own ledger.
+            commercial_payments.handle_checkout_completed(session)
+            return
 
         if enterprise_services.is_enterprise_checkout(session):
             # A dynamic, catalog-driven configuration, not a single Plan

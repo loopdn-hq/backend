@@ -22,7 +22,14 @@ class Creative(models.Model):
     """What a sponsored message actually says and shows.
 
     Only `approved` creatives are ever selected, and that is a queryset filter
-    in commercial/services.py rather than a check anybody can forget (plan, Stage 4).
+    in commercial/services/serving.py (slice 5) rather than a check anybody can
+    forget. `status` follows the campaign through review: submitting sends
+    every creative to `pending_review`, withdrawing brings them back to `draft`
+    (services/transitions.py).
+
+    Saved whole, never half: the builder's draft may be incomplete, but a
+    creative is added with its button and its destination, which is what lets
+    the constraint below stay.
 
     A call or text CTA carries no number of its own. It uses the campaign's
     tracking number (plan 2c), so no creative can route a response around the
@@ -33,9 +40,12 @@ class Creative(models.Model):
     class CtaKind(models.TextChoices):
         CALL = 'call', 'Call'
         TEXT = 'text', 'Text'
-        # A web address - the website, a booking page, a lead form.
+        # A web address - the website, a booking page.
         LINK = 'link', 'Open a link'
         GROUP_JOIN = 'group_join', 'Join a group'
+        # Loopd'n's own lead form (slice 7): the member chooses what to send
+        # the company, without leaving the app. No address of its own.
+        LEAD_FORM = 'lead_form', 'Open a form'
 
     class Status(models.TextChoices):
         DRAFT = 'draft', 'Draft'
@@ -52,7 +62,8 @@ class Creative(models.Model):
 
     cta_label = models.CharField(max_length=30)
     cta_kind = models.CharField(max_length=16, choices=CtaKind.choices)
-    # The URL for a link, the join link for a group. Blank for call and text.
+    # The URL for a link, the join link for a group. Blank for call, text and
+    # a lead form.
     cta_target = models.CharField(max_length=500, blank=True, default='', db_default='')
 
     # Sponsored SMS only (plan, Stage 5), which is gated; nothing sends it yet.
@@ -74,7 +85,7 @@ class Creative(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=(
-                    Q(cta_kind__in=['call', 'text'], cta_target='')
+                    Q(cta_kind__in=['call', 'text', 'lead_form'], cta_target='')
                     | (Q(cta_kind__in=['link', 'group_join']) & ~Q(cta_target=''))
                 ),
                 name='commercial_creative_cta_target_matches_kind',

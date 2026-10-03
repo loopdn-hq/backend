@@ -123,10 +123,12 @@ CSRF_TRUSTED_ORIGINS = [
 # exactly like a server that is not there. Set it wherever ALLOWED_HOSTS is
 # set, with the scheme included: matching is on scheme, host and port.
 #
-# commercial.localhost is the commercial site in development: the same frontend,
-# told apart by hostname (frontend-web/src/lib/config/site.ts).
+# commercial.localhost and admin.localhost are the commercial and admin sites in
+# development: the same frontend, told apart by hostname
+# (frontend-web/src/lib/config/site.ts).
 _default_cors_origins = (
-    'http://localhost:3000,http://127.0.0.1:3000,http://commercial.localhost:3000'
+    'http://localhost:3000,http://127.0.0.1:3000,http://commercial.localhost:3000,'
+    'http://admin.localhost:3000'
     if DEBUG else ''
 )
 CORS_ALLOWED_ORIGINS = [
@@ -205,9 +207,11 @@ INSTALLED_APPS = [
     # media - see calls/livekit.py.
     'calls',
     # What a commercial user does: companies, campaigns, their money and results.
-    # Models only so far - nothing reads these tables yet; see
-    # docs/advertising_integration_plan.md and docs/commercial_rename_plan.md.
+    # See docs/campaigns_final_plan.md.
     'commercial',
+    # The admin site's API (admin.loopdn.com): Loopd'n's own tools, over the
+    # other apps' services. No models of its own.
+    'platform_admin',
     # WhatsApp over each group owner's OWN WhatsApp Business number, connected
     # through Meta's Embedded Signup - see whatsapp/models.py.
     'whatsapp',
@@ -765,6 +769,12 @@ SMS_PROVISION_BATCH = int(os.environ.get('SMS_PROVISION_BATCH', '10'))
 # and it records who texts which private group. Not something to keep forever.
 SMS_RETENTION_DAYS = int(os.environ.get('SMS_RETENTION_DAYS', '90'))
 
+# When the daily SMS report flags sign-up code texts as possible abuse: this
+# many requests stopped by our limits in a day, or codes to this many
+# different numbers. Both are far above what real sign-ups produce today.
+VERIFICATION_ALERT_LIMITED = int(os.environ.get('VERIFICATION_ALERT_LIMITED', '20'))
+VERIFICATION_ALERT_NUMBERS = int(os.environ.get('VERIFICATION_ALERT_NUMBERS', '100'))
+
 # Where the daily spend report goes. Unset, it only goes to the log.
 SMS_REPORT_EMAIL = os.environ.get('SMS_REPORT_EMAIL', '')
 
@@ -823,6 +833,9 @@ MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024
 # what an admin may upload on behalf of a whole group - and the tests lower
 # these ceilings to reach the failure path, one app at a time.
 MAX_GROUP_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024
+
+# A campaign creative's image: shown as a card in chat, so the same ceiling.
+MAX_CREATIVE_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024
 
 # Chat attachments. The ceiling is per file, and the count is per message,
 # so one request can carry at most 10 x 25MB.
@@ -1017,6 +1030,27 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'sms.requeue_stalled_deliveries',
         'schedule': 600.0,
     },
+    # Campaigns start and end on their dates (commercial/services/schedule.py).
+    # Every minute, so "as soon as it's approved" means about a minute. Without
+    # a beat running, approved campaigns never start and ended ones keep their
+    # money reserved.
+    'commercial-run-campaign-schedule': {
+        'task': 'commercial.run_campaign_schedule',
+        'schedule': 60.0,
+    },
+    # Charge what was seen, then roll the day's totals up for reports
+    # (commercial/services/settlement.py, stats.py). Every five minutes: the
+    # most a campaign can be seen past its money is five minutes' worth, and
+    # that is recorded, never charged.
+    'commercial-settle-and-roll-up': {
+        'task': 'commercial.settle_and_roll_up',
+        'schedule': 300.0,
+    },
+    # Per-view rows past SPONSORED_VIEW_RETENTION_DAYS.
+    'commercial-prune-views': {
+        'task': 'commercial.prune_views',
+        'schedule': 86400.0,
+    },
     # OFF (2026-09-25, Yul's call). This sweep buys a real number, from a real
     # provider, for every group that has not got one - and a laptop running the
     # staging env file has live Telnyx credentials, so starting the stack bought
@@ -1048,6 +1082,20 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'sms.daily_spend_report',
         'schedule': 86400.0,
     },
+    # Roll the delivery log up into monthly billing totals that outlive its
+    # 90-day purge - see sms/maintenance.py:summarize_usage. Daily, so this
+    # month's totals are never more than a day behind.
+    'sms-summarize-usage': {
+        'task': 'sms.summarize_usage',
+        'schedule': 86400.0,
+    },
+    # What each sign-up code text cost and whether it arrived, read from
+    # Telnyx's records - see sms/maintenance.py:reconcile_verification_texts.
+    # Hourly, so the admin list is never more than an hour behind.
+    'sms-reconcile-verification-texts': {
+        'task': 'sms.reconcile_verification_texts',
+        'schedule': 3600.0,
+    },
     # The same three jobs for email - see mail/maintenance.py.
     'mail-retry-failed-deliveries': {
         'task': 'mail.retry_failed_deliveries',
@@ -1076,6 +1124,43 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 86400.0,
     },
 }
+
+
+# Campaigns: the privacy floors (docs/campaigns_final_plan.md, decision 12)
+#
+# Provisional values, chosen for slice 1's reach estimate and to be settled by
+# slice 5, when ads are first served. Environment-tunable so that settling them
+# is not a deploy.
+#
+# A group smaller than this never carries an ad and is never counted in reach:
+# in a group of four, "a member saw this" is close to naming the member.
+MIN_GROUP_SIZE_FOR_ADS = int(os.environ.get('MIN_GROUP_SIZE_FOR_ADS', '3'))
+# Below either, an audience is "too small" and no number is given at all. A
+# range over two groups narrows down to the groups, and §13 forbids naming one.
+MIN_ELIGIBLE_GROUPS = int(os.environ.get('MIN_ELIGIBLE_GROUPS', '5'))
+MIN_ELIGIBLE_MEMBERS = int(os.environ.get('MIN_ELIGIBLE_MEMBERS', '3'))
+
+# Campaigns: serving and measurement (slice 5)
+#
+# Frequency caps (decision 13), per person, per calendar day: how often one
+# person may see one campaign (on the campaign's day, its company's time zone),
+# and sponsored cards at all (on their own day: their verified phone's
+# country's time zone, UTC when unknown).
+SPONSORED_VIEWS_PER_CAMPAIGN_PER_DAY = int(
+    os.environ.get('SPONSORED_VIEWS_PER_CAMPAIGN_PER_DAY', '3')
+)
+SPONSORED_VIEWS_PER_DAY = int(os.environ.get('SPONSORED_VIEWS_PER_DAY', '10'))
+# How long a served card's token may be reported as seen. A card left on
+# screen longer than this is not counted.
+SPONSORED_TOKEN_MAX_AGE_SECONDS = int(os.environ.get('SPONSORED_TOKEN_MAX_AGE_SECONDS', '3600'))
+# How long a card's button counts a click (slice 6). Older, the button still
+# opens its destination; the click is just not counted.
+SPONSORED_CLICK_TOKEN_MAX_AGE_SECONDS = int(
+    os.environ.get('SPONSORED_CLICK_TOKEN_MAX_AGE_SECONDS', '86400')
+)
+# Per-view rows are deleted after this many days (decision 15); the daily
+# totals are kept for good.
+SPONSORED_VIEW_RETENTION_DAYS = int(os.environ.get('SPONSORED_VIEW_RETENTION_DAYS', '90'))
 
 
 # Stripe (payments and webhooks)

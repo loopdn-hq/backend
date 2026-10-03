@@ -60,6 +60,16 @@ class Plan(models.Model):
     # until somebody deletes it.
     call_recording_retention_days = models.PositiveIntegerField(null=True, blank=True)
 
+    # Whether its holder's groups may carry ads (docs/campaigns_final_plan.md:
+    # a group is allowed ads by its OWNER's plan, the same rule as its member
+    # cap). Free does; the paid plans are ad-free, which is part of what they
+    # sell. False by default, so a custom Enterprise plan is ad-free unless
+    # somebody decides otherwise.
+    #
+    # The viewer's own plan is a separate question (decision 14): somebody on
+    # an ad-free plan sees no ads in anybody's group. Serving asks both.
+    shows_ads = models.BooleanField(default=False, db_default=False)
+
     has_whatsapp = models.BooleanField(default=False, db_default=False)
     has_telegram = models.BooleanField(default=False, db_default=False)
 

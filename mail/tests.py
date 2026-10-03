@@ -17,6 +17,8 @@ import hmac
 import json
 import time
 from contextlib import contextmanager
+from email.header import decode_header, make_header
+from email.utils import parseaddr
 from unittest import mock
 
 from django.conf import settings
@@ -89,6 +91,12 @@ def authenticated(domain='example.com'):
             f'dmarc=pass header.from={domain}'
         ),
     }
+
+
+def display_name(header):
+    """The name in front of an address, decoded the way a mail client shows it."""
+    name, _ = parseaddr(header)
+    return str(make_header(decode_header(name)))
 
 
 @contextmanager
@@ -194,6 +202,67 @@ class ReplyAddressTests(TestCase):
     @override_settings(MAIL_REPLY_DOMAIN='')
     def test_with_no_reply_domain_there_is_no_address(self):
         self.assertIsNone(reply_address(self.bob_row))
+
+
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, EMAIL_PRODUCT_NAME='Loopd')
+class ReplyToHeaderTests(TestCase):
+    """The reply address says which group it is for, before anybody sends.
+
+    Somebody in two groups holds two addresses that differ only in digits. The
+    name is what their mail client shows in the To line and in its address
+    suggestions - and Resend refuses many quoted names, so no form may quote.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+
+    def header_for(self, name):
+        group = Conversation.start_group(self.alice, name=name)
+        group.add_participant(self.bob)
+        row = Participant.objects.get(conversation=group, user=self.bob)
+        return outbound.reply_to_header(row, group), row
+
+    def test_it_names_the_group_and_still_resolves(self):
+        header, row = self.header_for('Family')
+
+        self.assertEqual(header, f'Family via Loopd <{reply_address(row)}>')
+        self.assertEqual(participant_id_from(header), row.pk)
+
+    def test_a_name_that_would_need_quotes_is_encoded_instead(self):
+        for name in ['Smith, Jane', "St. Mary's", 'Família 🏠', 'Team "A"',
+                     'a@b.com <c@d.com>']:
+            with self.subTest(name=name):
+                header, row = self.header_for(name)
+
+                self.assertNotIn('"', header)
+                self.assertEqual(display_name(header), f'{name} via Loopd')
+                self.assertEqual(participant_id_from(header), row.pk)
+
+    def test_a_long_name_is_split_into_words_a_decoder_accepts(self):
+        # 119 characters, most of them two bytes: far past the 75 one encoded
+        # word may hold, so it has to be several.
+        name = ' '.join(['Família'] * 15)
+        header, row = self.header_for(name)
+
+        phrase = header.rpartition(' <')[0]
+        self.assertGreater(len(phrase.split()), 1)
+        for word in phrase.split():
+            self.assertLessEqual(len(word), 75)
+        self.assertEqual(display_name(header), f'{name} via Loopd')
+        self.assertEqual(participant_id_from(header), row.pk)
+
+    def test_a_new_line_in_the_name_never_reaches_the_header(self):
+        header, row = self.header_for('Evil\nBcc: x@example.com')
+
+        self.assertNotIn('\n', header)
+        self.assertEqual(participant_id_from(header), row.pk)
+
+    @override_settings(MAIL_REPLY_DOMAIN='')
+    def test_with_no_reply_domain_there_is_no_header(self):
+        header, _ = self.header_for('Family')
+
+        self.assertIsNone(header)
 
 
 class QuotedReplyTests(TestCase):
@@ -1597,6 +1666,95 @@ class EmailKeywordTests(TestCase):
         )
 
 
+@override_settings(MAIL_REPLY_DOMAIN=REPLY_DOMAIN, API_PUBLIC_URL=API_URL)
+class ReplyRoutingTests(TestCase):
+    """A reply lands in the group its address names, and in no other.
+
+    Bob is in two groups, so he holds two reply addresses. Nothing but the
+    address decides where his reply goes - not the subject, not the sender,
+    not which group he last wrote in.
+    """
+
+    def setUp(self):
+        self.alice = make_user('alice')
+        self.bob = make_user('bob')
+        self.family = Conversation.start_group(self.alice, name='Family')
+        self.work = Conversation.start_group(self.alice, name='Work')
+        self.family.add_participant(self.bob)
+        self.work.add_participant(self.bob)
+        self.bob_family = Participant.objects.get(
+            conversation=self.family, user=self.bob
+        )
+        self.bob_work = Participant.objects.get(
+            conversation=self.work, user=self.bob
+        )
+
+    def reply(self, to_address, body, subject=''):
+        return inbound.handle_inbound(
+            to_address, 'bob@example.com', body,
+            headers=authenticated(), subject=subject,
+        )
+
+    def texts(self, conversation):
+        return list(conversation.messages.values_list('text', flat=True))
+
+    def test_a_reply_posts_only_to_the_group_it_was_addressed_to(self):
+        self.reply(reply_address(self.bob_family), 'Dinner at 7?')
+
+        self.assertEqual(self.texts(self.family), ['Dinner at 7?'])
+        self.assertEqual(self.texts(self.work), [])
+
+    def test_and_the_other_address_only_to_the_other_group(self):
+        self.reply(reply_address(self.bob_family), 'Dinner at 7?')
+        self.reply(reply_address(self.bob_work), 'Running late')
+
+        self.assertEqual(self.texts(self.family), ['Dinner at 7?'])
+        self.assertEqual(self.texts(self.work), ['Running late'])
+
+    def test_the_named_address_a_reply_comes_back_to_routes_the_same_way(self):
+        # What really arrives: the To line of a reply carries the name we put
+        # in front of the Reply-To.
+        self.reply(outbound.reply_to_header(self.bob_work, self.work), 'Running late')
+
+        self.assertEqual(self.texts(self.work), ['Running late'])
+        self.assertEqual(self.texts(self.family), [])
+
+    def test_the_subject_does_not_route_a_reply(self):
+        result = self.reply(
+            reply_address(self.bob_work), 'Running late',
+            subject='Re: New message in Family',
+        )
+
+        self.assertEqual(result.message.conversation, self.work)
+        self.assertEqual(self.texts(self.family), [])
+
+    def test_one_email_to_both_groups_is_routed_to_one(self):
+        # Never fanned into two groups: the first of our addresses wins.
+        event = provider.parse_event({
+            'type': 'email.received',
+            'data': {
+                'email_id': 'abc',
+                'to': [outbound.reply_to_header(self.bob_family, self.family)],
+                'cc': [reply_address(self.bob_work)],
+            },
+        })
+
+        self.assertEqual(participant_id_from(event.to_address), self.bob_family.pk)
+
+    def test_each_groups_email_carries_its_own_named_address(self):
+        with capture_sent() as sent:
+            outbound.fan_out(create_message(self.family, self.alice, text='Dinner'))
+            outbound.fan_out(create_message(self.work, self.alice, text='Standup'))
+
+        family_email, work_email = sent
+        self.assertTrue(family_email['reply_to'].startswith('Family via '))
+        self.assertTrue(work_email['reply_to'].startswith('Work via '))
+        self.assertEqual(
+            participant_id_from(family_email['reply_to']), self.bob_family.pk
+        )
+        self.assertEqual(participant_id_from(work_email['reply_to']), self.bob_work.pk)
+
+
 class UnsubscribeConfirmationTests(TransactionTestCase):
     """The one path that gets an email back, and the ones that do not.
 
@@ -2496,6 +2654,16 @@ class BridgeConsentTests(TransactionTestCase):
         self.assertEqual(len(self.last_sent), 1, self.last_sent)
         self.assertNotIn('still playing tomorrow', self.last_sent[0]['text'])
 
+    def test_the_acknowledgement_names_who_they_are_talking_to(self):
+        # Not "You're all set on Loopd" - the same subject for every thread,
+        # which a mail client would gather into one.
+        self.open_bridge()
+
+        self.reply('YES')
+
+        self.assertIn('yul', self.last_sent[0]['subject'].lower())
+        self.assertIn('yul via', self.last_sent[0]['reply_to'].lower())
+
     def test_yes_tells_the_sender(self):
         self.open_bridge()
 
@@ -2691,17 +2859,22 @@ class GroupInvitationByEmailTests(APITestCase):
         self.client.force_authenticate(self.alice)
         self.url = reverse('chat:conversation-members', args=[self.group.pk])
 
-    def invite(self, *addresses, members=()):
+    def invite(self, *addresses, members=(), group=None):
+        url = self.url if group is None else reverse(
+            'chat:conversation-members', args=[group.pk]
+        )
         with capture_sent() as sent, self.captureOnCommitCallbacks(execute=True):
             response = self.client.post(
-                self.url,
+                url,
                 {'members': list(members), 'invite_email': list(addresses)},
                 format='json',
             )
         return response, sent
 
-    def row(self, address='ana@example.com'):
-        return Participant.objects.get(conversation=self.group, email=address)
+    def row(self, address='ana@example.com', group=None):
+        return Participant.objects.get(
+            conversation=group or self.group, email=address
+        )
 
     def answer(self, body, row=None):
         row = row or self.row()
@@ -2735,6 +2908,7 @@ class GroupInvitationByEmailTests(APITestCase):
         _, sent = self.invite('ana@example.com')
 
         self.assertEqual(participant_id_from(sent[0]['reply_to']), self.row().pk)
+        self.assertTrue(sent[0]['reply_to'].startswith('Family via '))
         self.assertTrue(sent[0]['from'].startswith('Family via '))
 
     def test_it_carries_a_way_out(self):
@@ -2808,6 +2982,24 @@ class GroupInvitationByEmailTests(APITestCase):
 
         self.assertEqual(result.action, 'consent_declined')
         self.assertIn('will not email you about Family again', sent[0]['text'])
+        self.assertIn('Family', sent[0]['subject'])
+
+    def test_each_groups_confirmation_has_its_own_subject(self):
+        # Two identical subjects from one sender address get threaded together,
+        # and Reply in that thread answers whichever group's email is selected.
+        work = Conversation.start_group(self.alice, name='Work')
+        self.invite('ana@example.com')
+        self.invite('ana@example.com', group=work)
+
+        _, family_sent = self.answer('YES')
+        _, work_sent = self.answer('YES', row=self.row(group=work))
+
+        self.assertIn('Family', family_sent[0]['subject'])
+        self.assertIn('Work', work_sent[0]['subject'])
+        self.assertTrue(work_sent[0]['reply_to'].startswith('Work via '))
+        self.assertEqual(
+            participant_id_from(work_sent[0]['reply_to']), self.row(group=work).pk
+        )
 
     def test_the_reminder_can_itself_be_answered(self):
         # It asks for a YES; before, the reply to it went to an address that

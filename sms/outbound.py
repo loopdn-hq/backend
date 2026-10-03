@@ -314,8 +314,17 @@ def _record(message, participant, status, *, reason='', segment_count=0, encodin
     )
 
 
-def record_inbound(conversation, participant, message, number, provider=''):
-    """Log a text that arrived. Inbound costs money too, and it is evidence."""
+def record_inbound(conversation, participant, message, number, provider='', *,
+                   text=None, provider_message_id='', cost=None):
+    """Log a text that arrived. Inbound costs money too, and it is evidence.
+
+    `message` is None for a text that posted nothing - JOIN, STOP, HELP - which
+    is logged all the same, because it was billed all the same. `text` is what
+    was actually sent, for counting its segments when there is no message to
+    read them off; `cost` is the provider's `(amount, currency)`, or None.
+    """
+    body = text if text is not None else (message.text if message else '')
+    amount, currency = cost if cost is not None else (None, '')
     return SmsDelivery.objects.create(
         direction=SmsDelivery.Direction.INBOUND,
         conversation=conversation,
@@ -325,8 +334,11 @@ def record_inbound(conversation, participant, message, number, provider=''):
         counterpart_last4=(number or '')[-4:],
         counterpart_hash=_hash_number(number or ''),
         status=SmsDelivery.Status.RECEIVED,
-        segments=segments.count_segments(message.text if message else '')[0],
+        segments=segments.count_segments(body)[0],
         provider=provider,
+        provider_message_id=provider_message_id,
+        cost=amount,
+        cost_currency=currency,
     )
 
 

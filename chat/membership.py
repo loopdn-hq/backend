@@ -339,6 +339,29 @@ def remove(participant, by, *, block=False):
 
 
 @transaction.atomic
+def unblock(participant, by):
+    """An admin lifts a block, so the person may come back.
+
+    Lands on REMOVED, not ACTIVE. Unblocking says they MAY return, not that
+    they have: they come back the way anybody outside the group does - an admin
+    adds them again, or they use the code or text JOIN as the group's join mode
+    allows. Putting them straight back in would add somebody to a group without
+    asking them, which nothing else here does.
+
+    Re-read under a row lock, like `approve`, so an unblock and a fresh block
+    racing on the same row cannot both act on a stale copy.
+    """
+    _require_admin(participant.conversation, by)
+    participant = _locked(participant)
+    if participant.status != Participant.Status.BLOCKED:
+        raise JoinRefused('That person is not blocked from this group.')
+
+    participant.status = Participant.Status.REMOVED
+    participant.save(update_fields=['status'])
+    return participant
+
+
+@transaction.atomic
 def set_role(participant, role, by):
     """Promote somebody to admin, or demote them back to a member.
 
@@ -1331,8 +1354,8 @@ def _email_invitation(conversation, participant, by):
     from django.template.loader import render_to_string
 
     from mail import commands
-    from mail.outbound import _headers_for, from_header
-    from mail.tokens import reply_address, unsubscribe_url
+    from mail.outbound import _headers_for, from_header, reply_to_header
+    from mail.tokens import unsubscribe_url
     from utils.mail import GROUP_INVITATION, EmailError, send_templated_email
 
     address = participant.email
@@ -1340,7 +1363,7 @@ def _email_invitation(conversation, participant, by):
         return
 
     inviter = getattr(getattr(by, 'profile', None), 'display_label', None)
-    reply_to = reply_address(participant)
+    reply_to = reply_to_header(participant, conversation)
     stop_url = unsubscribe_url(participant)
     context = {
         'group_name': conversation.name,
@@ -1483,7 +1506,10 @@ def claim_email_invitations(user):
             continue
         if existing.status != Participant.Status.ACTIVE:
             existing.status = Participant.Status.ACTIVE
-            existing.save(update_fields=['status'])
+            # Coming back in on THIS invitation, so what it allowed them to
+            # read - "Only show new messages", or everything - comes with it.
+            existing.history_after_message_id = row.history_after_message_id
+            existing.save(update_fields=['status', 'history_after_message_id'])
         claimed += 1
         _announce_membership(existing)
 

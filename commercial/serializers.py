@@ -1,10 +1,31 @@
 """Shapes for the commercial API. They validate input; commercial/services decides."""
 from django.conf import settings
+from django.urls import reverse
 from rest_framework import serializers
 
-from commercial.markets import Country, Currency, DEFAULT_CURRENCY
-from commercial.models import Company, Industry
+from billing.serializers import _validate_redirect_url
+from chat.models import GroupCategory
+from commercial.markets import (
+    Country,
+    Currency,
+    DEFAULT_CURRENCY,
+    MAX_TOP_UP_CENTS,
+    MIN_TOP_UP_CENTS,
+    REGIONS,
+)
+from commercial.models import (
+    AdTransaction,
+    Campaign,
+    CampaignEvent,
+    Company,
+    Creative,
+    Industry,
+    Lead,
+)
 from user.models import phone_number_validator
+
+#: The most a budget field holds: Campaign's columns are 32-bit.
+MAX_BUDGET_CENTS = 2_000_000_000
 
 
 class IndustrySerializer(serializers.ModelSerializer):
@@ -65,6 +86,7 @@ class CompanySerializer(serializers.ModelSerializer):
             'logo_url',
             'status',
             'balance_cents',
+            'reserved_cents',
             'created_at',
             'updated_at',
         ]
@@ -72,6 +94,7 @@ class CompanySerializer(serializers.ModelSerializer):
             'id',
             'status',
             'balance_cents',
+            'reserved_cents',
             'created_at',
             'updated_at',
         ]
@@ -113,10 +136,11 @@ class ActiveCompanySerializer(serializers.Serializer):
 
 
 def market_options():
-    """The countries a company can be in, each with the currency it starts with.
+    """The countries a company can be in, each with the currency it starts with
+    and the regions its campaigns can target.
 
-    Served rather than written into the setup form, so launching a market is
-    a change to commercial/markets.py and nothing else.
+    Served rather than written into the setup form and the builder, so
+    launching a market is a change to commercial/markets.py and nothing else.
     """
     return {
         'countries': [
@@ -124,10 +148,387 @@ def market_options():
                 'code': country.value,
                 'name': country.label,
                 'default_currency': DEFAULT_CURRENCY[country].value,
+                'regions': [
+                    {'code': code, 'name': name} for code, name in REGIONS[country]
+                ],
             }
             for country in Country
         ],
         'currencies': [
-            {'code': currency.value, 'name': currency.label} for currency in Currency
+            {
+                'code': currency.value,
+                'name': currency.label,
+                'min_top_up_cents': MIN_TOP_UP_CENTS[currency],
+            }
+            for currency in Currency
         ],
     }
+
+
+# -- campaigns -------------------------------------------------------------------
+
+
+class GroupCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GroupCategory
+        fields = ['slug', 'label']
+        read_only_fields = fields
+
+
+class AudienceSerializer(serializers.Serializer):
+    """An audience, as the builder's step 2 saves it and step 3 estimates it.
+
+    Each part may be left empty, meaning "any". Categories are slugs; regions
+    are ISO codes, checked against the company's country by the services.
+    """
+
+    categories = serializers.SlugRelatedField(
+        many=True,
+        slug_field='slug',
+        queryset=GroupCategory.objects.filter(active=True),
+        required=False,
+    )
+    regions = serializers.ListField(
+        child=serializers.CharField(max_length=6), required=False, max_length=100
+    )
+    min_group_size = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+    max_group_size = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+
+
+class ReachEstimateSerializer(AudienceSerializer):
+    """POST reach-estimate/: an audience, for one of the caller's companies."""
+
+    company = serializers.IntegerField(min_value=1)
+
+
+class TargetingSerializer(serializers.Serializer):
+    """A campaign's saved audience, as the builder reads it back."""
+
+    categories = serializers.SlugRelatedField(many=True, slug_field='slug', read_only=True)
+    regions = serializers.ListField(child=serializers.CharField(), read_only=True)
+    min_group_size = serializers.IntegerField(read_only=True)
+    max_group_size = serializers.IntegerField(read_only=True)
+
+
+class CreativeSerializer(serializers.ModelSerializer):
+    """One version of the ad: what it says, shows, and where its button goes.
+
+    `image` is write-only and `image_url` read-only, like a company's logo.
+    `cta_kind` may be left out: each objective has one button, and the
+    services fill it in. `status` and `review_notes` belong to review.
+    """
+
+    image = serializers.ImageField(write_only=True, required=False, allow_null=True)
+    image_url = serializers.SerializerMethodField()
+    cta_kind = serializers.ChoiceField(choices=Creative.CtaKind.choices, required=False)
+    cta_target = serializers.CharField(max_length=500, required=False, allow_blank=True)
+
+    class Meta:
+        model = Creative
+        fields = [
+            'id',
+            'campaign',
+            'headline',
+            'body',
+            'image',
+            'image_url',
+            'cta_label',
+            'cta_kind',
+            'cta_target',
+            'status',
+            'review_notes',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id',
+            'campaign',
+            'status',
+            'review_notes',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_image_url(self, obj):
+        if not obj.image:
+            return None
+        request = self.context.get('request')
+        return request.build_absolute_uri(obj.image.url) if request else obj.image.url
+
+    def _required_text(self, value, message):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError(message)
+        return value
+
+    def validate_headline(self, value):
+        return self._required_text(value, 'Write a headline.')
+
+    def validate_body(self, value):
+        return self._required_text(value, 'Write what the ad says.')
+
+    def validate_cta_label(self, value):
+        return self._required_text(value, 'Label the button.')
+
+    def validate_image(self, value):
+        limit = settings.MAX_CREATIVE_IMAGE_UPLOAD_BYTES
+        if value and value.size > limit:
+            raise serializers.ValidationError(
+                f'Keep the image under {limit // (1024 * 1024)}MB.'
+            )
+        return value
+
+
+class CampaignEventSerializer(serializers.ModelSerializer):
+    """One line of a campaign's history, as its company sees it."""
+
+    kind_label = serializers.CharField(source='get_kind_display', read_only=True)
+    by = serializers.SerializerMethodField()
+
+    #: Done by Loopd'n's reviewers, who are not named to a company.
+    REVIEW_KINDS = {CampaignEvent.Kind.APPROVED, CampaignEvent.Kind.REJECTED}
+
+    class Meta:
+        model = CampaignEvent
+        fields = ['kind', 'kind_label', 'by', 'note', 'created_at']
+        read_only_fields = fields
+
+    def get_by(self, obj):
+        """Who did it: the person, "Loopd'n" for review, or null for the system."""
+        if obj.kind in self.REVIEW_KINDS:
+            return "Loopd'n"
+        return obj.actor_label or None
+
+
+class CampaignSerializer(serializers.ModelSerializer):
+    """A campaign as the list shows it, and as the builder edits a draft.
+
+    Every field may be empty on a draft; submit is what checks the whole.
+    Amounts are minor units of `currency`, the company's, and `country` is the
+    company's too - the market its regions are in. The company, status,
+    placement and money are read-only: a body that names them changes nothing.
+    `cpm_cents` is the price it was submitted at; null on a draft.
+    """
+
+    name = serializers.CharField(max_length=120, required=False, allow_blank=True)
+    total_budget_cents = serializers.IntegerField(
+        min_value=1, max_value=MAX_BUDGET_CENTS, required=False, allow_null=True
+    )
+    daily_budget_cents = serializers.IntegerField(
+        min_value=1, max_value=MAX_BUDGET_CENTS, required=False, allow_null=True
+    )
+    currency = serializers.CharField(source='company.currency', read_only=True)
+    country = serializers.CharField(source='company.country', read_only=True)
+
+    class Meta:
+        model = Campaign
+        fields = [
+            'id',
+            'company',
+            'name',
+            'objective',
+            'placement',
+            'status',
+            'pacing',
+            'total_budget_cents',
+            'daily_budget_cents',
+            'currency',
+            'country',
+            'cpm_cents',
+            'reserved_cents',
+            'spent_cents',
+            'starts_at',
+            'ends_at',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id',
+            'company',
+            'placement',
+            'status',
+            'currency',
+            'country',
+            'cpm_cents',
+            'reserved_cents',
+            'spent_cents',
+            'created_at',
+            'updated_at',
+        ]
+
+
+class CampaignDetailSerializer(CampaignSerializer):
+    """One campaign with everything the builder and the campaign page show."""
+
+    targeting = serializers.SerializerMethodField()
+    creatives = CreativeSerializer(many=True, read_only=True)
+    events = CampaignEventSerializer(many=True, read_only=True)
+    deletable = serializers.SerializerMethodField()
+
+    class Meta(CampaignSerializer.Meta):
+        fields = [
+            *CampaignSerializer.Meta.fields,
+            'targeting',
+            'creatives',
+            'events',
+            'deletable',
+        ]
+        read_only_fields = fields
+
+    def get_deletable(self, obj):
+        """A draft that never moved money - so the page offers Delete only
+        where it would work. A withdrawn campaign keeps its ledger rows.
+        """
+        return obj.status == Campaign.Status.DRAFT and not obj.transactions.exists()
+
+    def get_targeting(self, obj):
+        """Null until the audience step has been saved: "not chosen yet" is not
+        the same as "any", which is a saved audience with nothing narrowed.
+        """
+        try:
+            targeting = obj.targeting
+        except Campaign.targeting.RelatedObjectDoesNotExist:
+            return None
+        return TargetingSerializer(targeting).data
+
+
+class CampaignCreateSerializer(serializers.Serializer):
+    """POST campaigns/: step 1 of the builder, which starts the draft."""
+
+    company = serializers.IntegerField(min_value=1)
+    objective = serializers.ChoiceField(choices=Campaign.Objective.choices)
+    name = serializers.CharField(max_length=120, required=False, allow_blank=True)
+
+
+# -- money ---------------------------------------------------------------------
+
+
+class TransactionSerializer(serializers.ModelSerializer):
+    """One line of a company's ledger, as its Billing page lists it."""
+
+    kind_label = serializers.CharField(source='get_kind_display', read_only=True)
+    campaign_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AdTransaction
+        fields = [
+            'id',
+            'kind',
+            'kind_label',
+            'campaign',
+            'campaign_name',
+            'amount_cents',
+            'balance_after_cents',
+            'reserved_change_cents',
+            'reserved_after_cents',
+            'description',
+            'created_at',
+        ]
+        read_only_fields = fields
+
+    def get_campaign_name(self, obj):
+        if obj.campaign_id is None:
+            return None
+        return obj.campaign.name or 'Untitled campaign'
+
+
+class CheckoutSerializer(serializers.Serializer):
+    """POST companies/{id}/checkout/: how much to add, and where Stripe returns.
+
+    The return addresses are checked against the origins this API already
+    trusts, as billing's are: Stripe redirects a just-paid customer there.
+    """
+
+    amount_cents = serializers.IntegerField(min_value=1, max_value=MAX_TOP_UP_CENTS)
+    success_url = serializers.URLField(validators=[_validate_redirect_url])
+    cancel_url = serializers.URLField(validators=[_validate_redirect_url])
+
+
+class BudgetIncreaseSerializer(serializers.Serializer):
+    """POST campaigns/{id}/budget/: the new, larger total."""
+
+    total_budget_cents = serializers.IntegerField(min_value=1, max_value=MAX_BUDGET_CENTS)
+
+
+class ServedCardSerializer(serializers.Serializer):
+    """GET serve/: the card a member is shown - the creative, its company's
+    name and logo, the token to report the view with, and the button's
+    address. Nothing about the campaign's audience, budget or the company's
+    other details.
+
+    The button goes through `click_url`, /c/{token}/ (slice 6), which counts
+    the click and sends the member on; the destination itself is not given,
+    so no client can skip the count. A lead form's button has `form_token`
+    instead (slice 7a): it opens Loopd'n's own form.
+    """
+
+    def to_representation(self, served):
+        creative = served.creative
+        company = creative.campaign.company
+        request = self.context.get('request')
+
+        def url(field):
+            if not field:
+                return None
+            return request.build_absolute_uri(field.url) if request else field.url
+
+        card = {
+            'token': served.token,
+            'placement': creative.campaign.placement,
+            'company': {'name': company.name, 'logo_url': url(company.logo)},
+            'creative': {
+                'headline': creative.headline,
+                'body': creative.body,
+                'image_url': url(creative.image),
+                'cta_label': creative.cta_label,
+                'cta_kind': creative.cta_kind,
+            },
+        }
+        if creative.cta_kind == Creative.CtaKind.LEAD_FORM:
+            # The button opens Loopd'n's own form (lead-form/, leads/), which
+            # takes the click token itself.
+            card['form_token'] = served.click_token
+        else:
+            click_path = reverse('campaign-click', args=[served.click_token])
+            card['click_url'] = (
+                request.build_absolute_uri(click_path) if request else click_path
+            )
+        return card
+
+
+class ImpressionSerializer(serializers.Serializer):
+    """POST impressions/: the token the card was served with."""
+
+    token = serializers.CharField(max_length=500)
+
+
+class LeadFormSerializer(serializers.Serializer):
+    """POST lead-form/: the card's click token."""
+
+    token = serializers.CharField(max_length=500)
+
+
+class LeadSendSerializer(serializers.Serializer):
+    """POST leads/: what the member chose to send. Shape only - whether it is
+    enough (a name, and a phone or an email) is services/leads.py's to say."""
+
+    token = serializers.CharField(max_length=500)
+    name = serializers.CharField(max_length=120, required=False, allow_blank=True)
+    phone = serializers.CharField(max_length=32, required=False, allow_blank=True)
+    email = serializers.CharField(max_length=254, required=False, allow_blank=True)
+    message = serializers.CharField(max_length=500, required=False, allow_blank=True)
+
+
+class CompanyLeadSerializer(serializers.ModelSerializer):
+    """A lead as its company sees it: what the member sent, and which campaign.
+    Never the member's account, nor the group the ad was seen in."""
+
+    campaign_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Lead
+        fields = ['id', 'campaign', 'campaign_name', 'name', 'phone', 'email', 'message', 'created_at']
+        read_only_fields = fields
+
+    def get_campaign_name(self, obj):
+        return obj.campaign.name or 'Untitled campaign'

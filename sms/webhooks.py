@@ -32,6 +32,7 @@ before DRF parses anything, so unsigned bytes never reach a parser.
 """
 import json
 import logging
+from decimal import Decimal, InvalidOperation
 
 from django.utils import timezone
 from rest_framework import status
@@ -144,16 +145,22 @@ class InboundSmsWebhook(APIView):
             group_number.conversation, from_number, text
         )
 
-        if result.message is not None:
-            from sms.outbound import record_inbound
+        # Every text to a group's number, not only the ones that became a
+        # message: JOIN, STOP and HELP are billed exactly like "dinner at 7",
+        # and were missing from the record that is supposed to add up to the
+        # bill.
+        from sms.outbound import record_inbound
 
-            record_inbound(
-                group_number.conversation,
-                result.participant,
-                result.message,
-                from_number,
-                provider=group_number.provider,
-            )
+        record_inbound(
+            group_number.conversation,
+            result.participant,
+            result.message,
+            from_number,
+            provider=group_number.provider,
+            text=text,
+            provider_message_id=payload.get('id') or '',
+            cost=_cost(payload),
+        )
 
         if result.reply:
             self._reply(group_number, from_number, result.reply)
@@ -172,12 +179,17 @@ class InboundSmsWebhook(APIView):
             'delivered': SmsDelivery.Status.DELIVERED,
             'delivery_failed': SmsDelivery.Status.FAILED,
             'failed': SmsDelivery.Status.FAILED,
+            # Refused before it left the provider - a 10DLC block arrives like
+            # this - and gave up on. Both were read as nothing at all, which
+            # left a text that never went anywhere marked "sent".
+            'sending_failed': SmsDelivery.Status.FAILED,
+            'expired': SmsDelivery.Status.FAILED,
         }
         new_status = mapping.get(provider_status)
-        if new_status is None:
-            return
 
-        fields = {'status': new_status}
+        fields = {}
+        if new_status is not None:
+            fields['status'] = new_status
         if new_status == SmsDelivery.Status.DELIVERED:
             fields['delivered_at'] = timezone.now()
         parts = payload.get('parts')
@@ -185,6 +197,19 @@ class InboundSmsWebhook(APIView):
             # The provider's count is authoritative; ours was an estimate.
             fields['segments'] = parts
 
+        # Read whatever the status: the price can ride an event whose status
+        # says nothing new, and the last event to carry one is the final word.
+        cost = _cost(payload)
+        if cost is not None:
+            fields['cost'], fields['cost_currency'] = cost
+        if new_status == SmsDelivery.Status.FAILED:
+            code, detail = _error(payload)
+            if code or detail:
+                fields['error_code'] = code
+                fields['error_detail'] = detail
+
+        if not fields:
+            return
         SmsDelivery.objects.filter(provider_message_id=message_id).update(**fields)
 
     def _reply(self, group_number, to_number, text):
@@ -204,6 +229,47 @@ class InboundSmsWebhook(APIView):
             # the inbound message is already stored, and a non-2xx would make
             # the provider send the whole thing again.
             logger.exception('Could not reply to ...%s', to_number[-4:])
+
+
+def _cost(payload):
+    """(amount, currency) from a provider payload, or None when it gave none.
+
+    Telnyx sends `cost: {"amount": "0.0051", "currency": "USD"}` - the amount a
+    STRING, so it is read straight into a Decimal and never through a float.
+    Null, missing or unreadable is None: "not priced", never zero.
+    """
+    cost = payload.get('cost')
+    if not isinstance(cost, dict):
+        return None
+    try:
+        amount = Decimal(str(cost.get('amount')))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite():
+        return None
+    return amount, str(cost.get('currency') or '')[:3].upper()
+
+
+def _error(payload):
+    """(code, detail) of the first error a provider payload carries.
+
+    Telnyx puts them in `errors: [{"code", "title", "detail"}]`; some events
+    carry them on the recipient (`to[0].errors`) instead, so both are read.
+    The title is the short reason ("Not 10DLC registered"); the detail is used
+    only when there is no title.
+    """
+    errors = payload.get('errors')
+    if not errors:
+        to_entries = payload.get('to') or []
+        first = to_entries[0] if to_entries and isinstance(to_entries[0], dict) else {}
+        errors = first.get('errors')
+    if not isinstance(errors, list) or not errors or not isinstance(errors[0], dict):
+        return '', ''
+    error = errors[0]
+    return (
+        str(error.get('code') or '')[:16],
+        str(error.get('title') or error.get('detail') or '')[:255],
+    )
 
 
 def _first_to(payload):
