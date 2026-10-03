@@ -44,6 +44,7 @@ Two conventions worth knowing before reading the code:
 | [otp/](otp/) | One-time passcodes: issue, verify, rate-limit, expire |
 | [chat/](chat/) | Conversations, participants, messages, attachments, websocket consumer |
 | [calls/](calls/) | Calls, participants, recordings, the LiveKit wrapper and webhook; plan limits are read from [billing/](billing/) |
+| [whatsapp/](whatsapp/) | Optional WhatsApp channel over each group owner's own WhatsApp Business number: Embedded Signup, group attachment, invitations, fan-out, Meta webhook |
 
 ## Tech stack
 
@@ -200,6 +201,44 @@ person leaving, and the last person leaving (which ends the call).
 | `403` "This call is full" | The plan's participant limit — see above |
 | `404` on a call you can see in the UI | You are not an active member of that conversation |
 | `database is locked` | Fixed in `loopd/settings.py` for SQLite (`transaction_mode: IMMEDIATE`); restart `runserver` if you still see it |
+
+### WhatsApp (optional, bring-your-own business number)
+
+A group owner connects **their own** WhatsApp Business Account; messages to the
+groups they attach it to go out on that number and Meta bills them, not us.
+Connecting is never part of signup or login - the web app offers it in two
+places:
+
+| Entrance | Calls |
+| --- | --- |
+| Profile settings → "Connect WhatsApp Business" | `GET /api/v1/whatsapp/config/` for `app_id` / `config_id`, run `FB.login` (Embedded Signup), then `POST /api/v1/whatsapp/connections/` with `{code, waba_id, phone_number_id}` |
+| A group → "Invite by WhatsApp" | `POST /api/v1/whatsapp/groups/<id>/invite/` with `{phone_number, display_name}` or `{participant}`. A `400` with `data.reason == "whatsapp_not_connected"` means: run the connect flow, then retry |
+
+Members opt in by tapping the invitation, sending `START` to the business
+number (the group screen's `join_link` does that), or from the app with
+`PUT /api/v1/whatsapp/groups/<id>/consent/`. Nothing is sent without that
+opt-in. One number can carry many groups; a member in several of them picks one
+with `#keyword`, by swipe-replying to a message, or by continuing where they
+left off. `GROUPS`, `HELP`, `STOP` and `START` work on the number itself.
+
+Outside WhatsApp's 24-hour window only approved templates may be sent, so each
+tenant needs two UTILITY templates approved on their own WABA and named on the
+connection (or in the env fallbacks): a group message (`{{1}}` group,
+`{{2}}` sender, `{{3}}` text) and an invitation (`{{1}}` inviter, `{{2}}` group,
+a `START` quick-reply button).
+
+| Variable | What |
+| --- | --- |
+| `WHATSAPP_APP_ID`, `WHATSAPP_APP_SECRET` | The Meta app. The secret verifies webhooks and exchanges signup codes |
+| `WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID` | The Embedded Signup configuration from the app dashboard |
+| `WHATSAPP_WEBHOOK_VERIFY_TOKEN` | Any string; paste the same into the dashboard with the callback URL `<API>/api/v1/whatsapp/webhooks/meta/` |
+| `WHATSAPP_TOKEN_KEYS` | Fernet key(s) encrypting stored business tokens, newest first. Required outside DEBUG |
+| `WHATSAPP_DEFAULT_TEMPLATE_NAME`, `WHATSAPP_INVITE_TEMPLATE_NAME` | Template fallbacks |
+
+With none of it set, sending is logged instead of performed, as for SMS.
+Before launch the Meta app needs Advanced Access to
+`whatsapp_business_management` and `whatsapp_business_messaging` (App Review),
+and the business must be a verified Tech Provider.
 
 ### The full stack, in Docker
 

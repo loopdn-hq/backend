@@ -58,6 +58,9 @@ urlpatterns = [
     path('api/v1/push/', include('notification.push.urls')),
 
     path('api/v1/billing/', include('billing.urls')),
+    # Connecting a WhatsApp Business number (optional, from profile settings or
+    # a group's invite screen) and Meta's webhook - signed, like the others.
+    path('api/v1/whatsapp/', include('whatsapp.urls')),
     path('api/v1/enterprise/', include('enterprise.urls')),
     # The commercial dashboard (commercial.loopdn.com): companies today,
     # campaigns next. Never "ads" in the address - see commercial/urls.py.
