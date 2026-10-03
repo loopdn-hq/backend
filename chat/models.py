@@ -317,6 +317,23 @@ class Conversation(models.Model):
         db_default=True,
     )
 
+    # Photos and every other file. Separate from voice, which has its own
+    # switch above: a group can want voice notes and no pictures, or the
+    # reverse. Like voice, it holds for everybody, admins included.
+    media_enabled = models.BooleanField(
+        default=True,
+        db_default=True,
+    )
+
+    # Emoji reactions on messages. Off stops anybody adding one, admins
+    # included; reactions already left stay where they are and stay visible -
+    # the switch is about what happens next, not a way to erase what members
+    # already said.
+    reactions_enabled = models.BooleanField(
+        default=True,
+        db_default=True,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     # Touched on every new message so the conversation list can sort by it
     # without a join.
@@ -951,6 +968,25 @@ class Participant(models.Model):
     # not an ordering of messages against each other.
     cleared_at = models.DateTimeField(null=True, blank=True)
 
+    # Messages at or before this id are not this member's to see: the admin
+    # who added them chose "Only show new messages". Null means they see the
+    # whole history, which is also what everybody who joined any other way
+    # gets.
+    #
+    # Separate from `cleared_before_message` although both start the history
+    # later, because they mean different things. A clear is the member's own
+    # tidying, and it takes the conversation out of their list until something
+    # arrives; this is somebody else's decision about what they may read, and
+    # the group must appear in their list the moment they are added. It is also
+    # a privacy line where a clear is not, so it is checked on every route a
+    # message can reach them by - see `Participant.sees_message`.
+    #
+    # A plain integer rather than a ForeignKey, unlike the clear: SET_NULL on a
+    # deleted message would quietly hand them the whole history.
+    history_after_message_id = models.PositiveBigIntegerField(
+        null=True, blank=True
+    )
+
     # Tidied out of this member's own list. Theirs alone - nobody else can
     # tell, and it neither leaves the group nor stops anything being
     # delivered. That last part matters here more than in a pure chat app:
@@ -1010,6 +1046,18 @@ class Participant(models.Model):
     @property
     def is_admin(self):
         return self.role == self.Role.ADMIN
+
+    def sees_message(self, message_id):
+        """Whether this member may read the message with this id.
+
+        False only for what came before they were added with "Only show new
+        messages". The one question every route that hands a member a message
+        asks, so the line is drawn the same way everywhere.
+        """
+        return (
+            self.history_after_message_id is None
+            or message_id > self.history_after_message_id
+        )
 
     @property
     def is_phone_only(self):

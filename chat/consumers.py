@@ -57,6 +57,11 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
         self.user = user
         self.subscribed = set()
+        # Per conversation, the id at or before which this account was not
+        # given the history - "Only show new messages". Loaded on first need;
+        # it is fixed when they are added, so it changes only on a re-add,
+        # which `conversation_added` clears it for.
+        self.history_floors = {}
 
         # Subscribe BEFORE accepting. `accept()` is what fires `open` on the
         # client, and a client that hears `open` starts sending and expects to
@@ -252,7 +257,37 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
     # -- outbound (channel layer event -> socket) -------------------------
 
     async def message_new(self, event):
-        await self.send_json({'type': 'message.new', 'message': event['message']})
+        message = event['message']
+        if await self.hidden_from_me(message.get('conversation'), message):
+            return
+        await self.send_json({'type': 'message.new', 'message': message})
+
+    async def hidden_from_me(self, conversation_id, message):
+        """Whether this payload is a message this account may not read.
+
+        Every member's socket is in the conversation's group and is sent the
+        same frame, built once for all of them. So an edit or a reaction on a
+        message from before somebody was added with "Only show new messages" -
+        or that message riding along as the group's pin - would reach them in
+        full. This is where it stops: each socket knows whose it is.
+        """
+        if not message or conversation_id is None:
+            return False
+        if conversation_id not in self.history_floors:
+            self.history_floors[conversation_id] = await self.history_floor(
+                conversation_id
+            )
+        floor = self.history_floors[conversation_id]
+        return floor is not None and (message.get('id') or 0) <= floor
+
+    async def visible_conversation(self, conversation):
+        """The conversation payload with the messages this account may not
+        read taken out of it - its preview and its pin are history too."""
+        conversation = dict(conversation)
+        for key in ('last_message', 'pinned_message'):
+            if await self.hidden_from_me(conversation.get('id'), conversation.get(key)):
+                conversation[key] = None
+        return conversation
 
     async def conversation_consent(self, event):
         """The far side of an external thread answered YES or NO.
@@ -274,9 +309,10 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         The whole message is sent, and the client replaces the one it holds
         with the same id. It must NOT append: this is not a new message.
         """
-        await self.send_json(
-            {'type': 'message.updated', 'message': event['message']}
-        )
+        message = event['message']
+        if await self.hidden_from_me(message.get('conversation'), message):
+            return
+        await self.send_json({'type': 'message.updated', 'message': message})
 
     async def conversation_request(self, event):
         """Somebody is waiting to be let into a group this socket administers."""
@@ -298,6 +334,7 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         await self.channel_layer.group_discard(
             conversation_group(event['conversation_id']), self.channel_name
         )
+        self.history_floors.pop(event['conversation_id'], None)
         await self.send_json(
             {
                 'type': 'conversation.removed',
@@ -308,9 +345,12 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
     async def conversation_added(self, event):
         # Join it now, so messages start arriving without a reconnect.
         await self.subscribe(conversation_group(event['conversation_id']))
-        await self.send_json(
-            {'type': 'conversation.added', 'conversation': event['conversation']}
-        )
+        # Re-read: being added again can change what they may see.
+        self.history_floors.pop(event['conversation_id'], None)
+        await self.send_json({
+            'type': 'conversation.added',
+            'conversation': await self.visible_conversation(event['conversation']),
+        })
 
     async def conversation_updated(self, event):
         """The group's settings changed - mode, join mode, permissions.
@@ -322,7 +362,9 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
             {
                 'type': 'conversation.updated',
                 'conversation_id': event['conversation_id'],
-                'conversation': event['conversation'],
+                'conversation': await self.visible_conversation(
+                    event['conversation']
+                ),
             }
         )
 
@@ -486,6 +528,16 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         groups, payload = await self.presence_change(online=online)
         for group in groups:
             await self.channel_layer.group_send(group, payload)
+
+    @database_sync_to_async
+    def history_floor(self, conversation_id):
+        return (
+            Participant.objects.filter(
+                conversation_id=conversation_id, user=self.user
+            )
+            .values_list('history_after_message_id', flat=True)
+            .first()
+        )
 
     @database_sync_to_async
     def beat(self):

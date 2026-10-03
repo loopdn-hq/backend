@@ -43,6 +43,7 @@ non-member gets a 404 from every route here and cannot even learn that a
 conversation exists.
 """
 from django.db.models import (
+    BigIntegerField,
     Count,
     IntegerField,
     OuterRef,
@@ -203,6 +204,13 @@ class ConversationViewSet(
             floor=Greatest(
                 Coalesce('last_read_message_id', Value(0)),
                 Coalesce('cleared_before_message_id', Value(0)),
+                # Messages from before they were added, for somebody added
+                # with "Only show new messages": they cannot be read, so they
+                # must not wait to be.
+                Coalesce('history_after_message_id', Value(0)),
+                # Named because the cutoff is a plain integer and the other
+                # two are message ids, which Django will not mix unasked.
+                output_field=BigIntegerField(),
             )
         ).values('floor')[:1]
 
@@ -998,6 +1006,11 @@ class ConversationViewSet(
         if cleared_before is not None:
             history = history.filter(pk__gt=cleared_before)
 
+        # And everything before they were added, when the admin who added them
+        # chose "Only show new messages".
+        if own is not None and own.history_after_message_id is not None:
+            history = history.filter(pk__gt=own.history_after_message_id)
+
         if after_id is not None:
             try:
                 cursor = int(after_id)
@@ -1038,7 +1051,14 @@ class ConversationViewSet(
             .filter(pk=message_id)
             .first()
         )
-        if message is None:
+        # A message from before the caller was added with "Only show new
+        # messages" is answered exactly as one that does not exist. Every
+        # action here replies with the message in full, so reacting to an old
+        # id would otherwise be a way to read it.
+        own = Participant.objects.filter(
+            conversation=conversation, user=self.request.user
+        ).first()
+        if message is None or (own is not None and not own.sees_message(message.pk)):
             raise NotFound('No such message in this conversation.')
         return message
 
@@ -1197,6 +1217,12 @@ class ConversationViewSet(
                 emoji=serializer.validated_data['emoji'],
             ).delete()
             return self._message_response(message)
+
+        # The group's "Reactions" switch. Only adding is refused: taking your
+        # own reaction away is harmless, and a member should not be stuck with
+        # one because the switch moved after they left it.
+        if not conversation.reactions_enabled:
+            raise PermissionDenied('Reactions are turned off in this group.')
 
         serializer = MessageReactionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

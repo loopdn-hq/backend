@@ -344,6 +344,12 @@ class MessageCreateSerializer(serializers.Serializer):
         parent = Message.objects.filter(
             pk=value, conversation=conversation
         ).first()
+        # And from before the replier was added with "Only show new messages":
+        # the excerpt would hand them its text just the same.
+        if parent is not None and not _sees(
+            self.context.get('request'), conversation, parent
+        ):
+            parent = None
         if parent is None:
             # Deliberately not "no such message": distinguishing "does not
             # exist" from "exists somewhere you cannot see" is the oracle this
@@ -379,6 +385,12 @@ class MessageCreateSerializer(serializers.Serializer):
             .prefetch_related('attachments')
             .first()
         )
+        # A message from before they were added with "Only show new messages"
+        # is out of reach too - a forward copies its words and files.
+        if original is not None and not _sees(
+            request, original.conversation, original
+        ):
+            original = None
         if original is None:
             # Same refusal whether it does not exist or exists out of reach.
             raise serializers.ValidationError(
@@ -652,6 +664,8 @@ class GroupSettingsFieldsSerializer(serializers.Serializer):
     sms_delivery_enabled = serializers.BooleanField(required=False)
     sms_replies_enabled = serializers.BooleanField(required=False)
     voice_messages_enabled = serializers.BooleanField(required=False)
+    media_enabled = serializers.BooleanField(required=False)
+    reactions_enabled = serializers.BooleanField(required=False)
 
     # What kind of group this is and where it is - the only two facts about a
     # group advertising may target on (Conversation.category). A category's
@@ -684,6 +698,8 @@ ADMIN_ONLY_SETTINGS = {
     'sms_delivery_enabled',
     'sms_replies_enabled',
     'voice_messages_enabled',
+    'media_enabled',
+    'reactions_enabled',
     # Which ads the group can carry follows from these two.
     'category',
     'region',
@@ -908,6 +924,8 @@ class ConversationSerializer(serializers.ModelSerializer):
             'sms_delivery_enabled': obj.sms_delivery_enabled,
             'sms_replies_enabled': obj.sms_replies_enabled,
             'voice_messages_enabled': obj.voice_messages_enabled,
+            'media_enabled': obj.media_enabled,
+            'reactions_enabled': obj.reactions_enabled,
             'category': obj.category.slug if obj.category_id else None,
             'region': obj.region,
         }
@@ -957,7 +975,7 @@ class ConversationSerializer(serializers.ModelSerializer):
         message = prefetched[0] if prefetched else None
         if prefetched is None:
             message = obj.messages.first()
-        if message is None:
+        if message is None or not self._viewer_sees(obj, message):
             return None
         return MessageSerializer(message, context=self.context).data
 
@@ -971,7 +989,19 @@ class ConversationSerializer(serializers.ModelSerializer):
         message = obj.pinned_message
         if message is None or message.is_deleted:
             return None
+        if not self._viewer_sees(obj, message):
+            return None
         return MessageSerializer(message, context=self.context).data
+
+    def _viewer_sees(self, obj, message):
+        """False for a message from before the viewer was added with "Only
+        show new messages" - the preview and the pin are history too.
+
+        A payload with no viewer (a broadcast) keeps the message; each socket
+        drops what its own account may not see - see ChatConsumer.
+        """
+        participant = self._own_participation(obj)
+        return participant is None or participant.sees_message(message.pk)
 
     def _viewer(self):
         request = self.context.get('request')
@@ -1516,6 +1546,12 @@ class AddMembersSerializer(serializers.Serializer):
         child=serializers.EmailField(), required=False, default=list,
         max_length=20,
     )
+    # What the people being added may read: everything said before, or only
+    # what is said from now on. The admin's choice, asked when they add
+    # somebody; "all" is what every other way into a group gives.
+    history = serializers.ChoiceField(
+        choices=['all', 'new'], required=False, default='all',
+    )
 
     def validate(self, attrs):
         if not attrs.get('members') and not attrs.get('invite_email'):
@@ -1592,20 +1628,62 @@ class AddMembersSerializer(serializers.Serializer):
             from billing.limits import check_can_add_members
             check_can_add_members(conversation, len(added) + len(new_invites))
 
-        for user in added:
-            conversation.add_participant(user)
+        # Who is already in, so the history choice below lands only on the
+        # people this request actually brings in. An address that turns out to
+        # be a current member's, or one already invited, must keep what they
+        # can read rather than lose it to somebody else's add.
+        already_in = set(
+            Participant.objects.filter(
+                conversation=conversation, status=Participant.Status.ACTIVE
+            ).values_list('pk', flat=True)
+        )
+
+        rows = [conversation.add_participant(user) for user in added]
 
         # Inside the same transaction, so a refused address undoes the whole
         # add rather than leaving half of it done - the rule above. The emails
         # themselves go out on commit, so a rollback sends none of them.
         adder = getattr(self.context.get('request'), 'user', None)
         for address in addresses:
-            membership.invite_by_email(conversation, address, adder)
+            rows.append(membership.invite_by_email(conversation, address, adder))
+
+        # Set for "all" too, not only "new": somebody coming back may carry a
+        # cutoff from an earlier membership, and this add is the one that says
+        # what they may read now. Before the announcement below, so the first
+        # thing their app is sent already respects it.
+        joining = [r.pk for r in rows if r is not None and r.pk not in already_in]
+        if joining:
+            cutoff = None
+            if self.validated_data['history'] == 'new':
+                cutoff = (
+                    Message.objects.filter(conversation=conversation)
+                    .order_by('-pk')
+                    .values_list('pk', flat=True)
+                    .first()
+                )
+            Participant.objects.filter(pk__in=joining).update(
+                history_after_message_id=cutoff
+            )
 
         if added:
             announce_added_to_conversation(conversation, added)
 
         return conversation
+
+
+def _sees(request, conversation, message):
+    """Whether the account behind this request may read this message.
+
+    The history line drawn by "Only show new messages", for the write paths
+    that would otherwise copy an old message's text back to its sender. True
+    for anybody without a membership row here: those callers are refused for
+    other reasons, by the checks around this one.
+    """
+    user = getattr(request, 'user', None)
+    if user is None or not user.is_authenticated:
+        return True
+    own = Participant.objects.filter(conversation=conversation, user=user).first()
+    return own is None or own.sees_message(message.pk)
 
 
 def validate_group_image(value):

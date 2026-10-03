@@ -906,6 +906,42 @@ class ChatWebsocketTests(TransactionTestCase):
 
         await communicator.disconnect()
 
+    async def test_an_old_message_does_not_reach_somebody_added_without_it(self):
+        """Every member's socket gets the same frame, built once for all.
+
+        So an edit to a message from before Carol was added with "Only show
+        new messages" would reach her in full unless her own socket drops it.
+        """
+
+        @database_sync_to_async
+        def setup():
+            old = create_message(self.group, self.alice, text='the old plan')
+            row = self.group.add_participant(self.carol)
+            row.history_after_message_id = old.pk
+            row.save(update_fields=['history_after_message_id'])
+            return old
+
+        old = await setup()
+        communicator = self.connect_as(self.carol)
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        @database_sync_to_async
+        def edit_old_then_post_new():
+            old.text = 'the old plan, revised'
+            old.edited_at = timezone.now()
+            old.save(update_fields=['text', 'edited_at'])
+            broadcast_message_updated(old)
+            create_message(self.group, self.alice, text='the new plan')
+
+        await edit_old_then_post_new()
+
+        # The first frame she gets is the new message: the edit never came.
+        frame = await communicator.receive_json_from(timeout=3)
+        self.assertEqual(frame['type'], 'message.new')
+        self.assertEqual(frame['message']['text'], 'the new plan')
+        await communicator.disconnect()
+
     async def test_an_edited_message_reaches_the_socket(self):
         """The same dropped-frame trap, for `message.updated`.
 
@@ -5244,6 +5280,354 @@ class PinMessageTests(MessageActionRouteMixin, EnvelopeAssertions, APITestCase):
         self.client.force_authenticate(self.bob)
 
         self.assertSuccess(self.client.post(self.message_url(message, 'pin/')))
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class VoiceMessagesSwitchTests(EnvelopeAssertions, APITestCase):
+    """The group's "Voice Messages" switch, which used to save and do nothing."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.bob)
+
+    def voice_off(self, conversation=None):
+        conversation = conversation or self.group
+        conversation.voice_messages_enabled = False
+        conversation.save(update_fields=['voice_messages_enabled'])
+
+    def send(self, payload, conversation=None):
+        return self.client.post(
+            reverse(
+                'chat:conversation-messages',
+                args=[(conversation or self.group).id],
+            ),
+            payload,
+            format='multipart',
+        )
+
+    def voice_note(self, name='voice-message-1.webm', content_type='audio/webm'):
+        return SimpleUploadedFile(name, b'\x1aE\xdf\xa3 not really', content_type)
+
+    def test_a_voice_note_goes_through_while_it_is_on(self):
+        self.assertSuccess(
+            self.send({'attachments': self.voice_note()}), status.HTTP_201_CREATED
+        )
+
+    def test_a_voice_note_is_refused_once_it_is_off(self):
+        self.voice_off()
+        self.assertFailure(
+            self.send({'attachments': self.voice_note()}), status.HTTP_403_FORBIDDEN
+        )
+        self.assertFalse(Message.objects.filter(conversation=self.group).exists())
+
+    def test_so_is_audio_sent_under_a_generic_type(self):
+        self.voice_off()
+        self.assertFailure(
+            self.send({
+                'attachments': self.voice_note(
+                    'memo.m4a', 'application/octet-stream'
+                ),
+            }),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_it_holds_for_an_admin_too(self):
+        # A choice about the group, not about who is asking: an admin who
+        # wants voice notes turns the switch back on.
+        self.voice_off()
+        self.client.force_authenticate(self.alice)
+        self.assertFailure(
+            self.send({'attachments': self.voice_note()}), status.HTTP_403_FORBIDDEN
+        )
+
+    def test_words_and_photos_are_untouched_by_it(self):
+        self.voice_off()
+        self.assertSuccess(self.send({'text': 'hello'}), status.HTTP_201_CREATED)
+        self.assertSuccess(
+            self.send({'attachments': make_image_upload('photo.png')}),
+            status.HTTP_201_CREATED,
+        )
+
+    def test_forwarding_a_voice_note_in_is_no_way_round_it(self):
+        elsewhere = Conversation.start_group(self.alice, name='Work')
+        elsewhere.add_participant(self.bob)
+        original = create_message(
+            elsewhere, self.alice, uploads=[self.voice_note()]
+        )
+        self.voice_off()
+
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-messages', args=[self.group.id]),
+                {'forward_from': original.pk},
+                format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class MediaAndReactionsSwitchTests(
+    MessageActionRouteMixin, EnvelopeAssertions, APITestCase
+):
+    """The group's "Photos & Files" and "Reactions" switches."""
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.client.force_authenticate(self.bob)
+
+    def switch_off(self, field):
+        setattr(self.group, field, False)
+        self.group.save(update_fields=[field])
+
+    def send(self, payload):
+        return self.client.post(
+            reverse('chat:conversation-messages', args=[self.group.id]),
+            payload,
+            format='multipart',
+        )
+
+    # --- photos and files ---------------------------------------------------
+
+    def test_photos_and_files_are_refused_once_it_is_off(self):
+        self.switch_off('media_enabled')
+        document = SimpleUploadedFile('notes.pdf', b'%PDF-1.4', 'application/pdf')
+
+        self.assertFailure(
+            self.send({'attachments': make_image_upload('photo.png')}),
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertFailure(
+            self.send({'attachments': document}), status.HTTP_403_FORBIDDEN
+        )
+        self.assertFalse(Message.objects.filter(conversation=self.group).exists())
+
+    def test_it_holds_for_an_admin_too(self):
+        self.switch_off('media_enabled')
+        self.client.force_authenticate(self.alice)
+        self.assertFailure(
+            self.send({'attachments': make_image_upload('photo.png')}),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_words_and_voice_notes_are_untouched_by_it(self):
+        # Voice notes have their own switch, which is still on.
+        self.switch_off('media_enabled')
+        voice = SimpleUploadedFile('voice-message-1.webm', b'\x1aE', 'audio/webm')
+
+        self.assertSuccess(self.send({'text': 'hello'}), status.HTTP_201_CREATED)
+        self.assertSuccess(
+            self.send({'attachments': voice}), status.HTTP_201_CREATED
+        )
+
+    def test_forwarding_a_photo_in_is_no_way_round_it(self):
+        elsewhere = Conversation.start_group(self.alice, name='Work')
+        elsewhere.add_participant(self.bob)
+        original = create_message(
+            elsewhere, self.alice, uploads=[make_image_upload('photo.png')]
+        )
+        self.switch_off('media_enabled')
+
+        self.assertFailure(
+            self.client.post(
+                reverse('chat:conversation-messages', args=[self.group.id]),
+                {'forward_from': original.pk},
+                format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    # --- reactions ----------------------------------------------------------
+
+    def test_no_reaction_can_be_added_once_it_is_off_by_anybody(self):
+        message = create_message(self.group, self.alice, text='dinner at 7')
+        self.switch_off('reactions_enabled')
+
+        for who in (self.bob, self.alice):
+            self.client.force_authenticate(who)
+            self.assertFailure(
+                self.client.post(
+                    self.message_url(message, 'reactions/'),
+                    {'emoji': THUMBS_UP},
+                    format='json',
+                ),
+                status.HTTP_403_FORBIDDEN,
+            )
+        self.assertFalse(MessageReaction.objects.exists())
+
+    def test_reactions_already_left_stay_and_can_be_taken_back(self):
+        message = create_message(self.group, self.alice, text='dinner at 7')
+        url = self.message_url(message, 'reactions/')
+        self.assertSuccess(
+            self.client.post(url, {'emoji': THUMBS_UP}, format='json')
+        )
+        self.switch_off('reactions_enabled')
+
+        history = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-messages', args=[self.group.id])
+            )
+        )
+        self.assertEqual(history['results'][0]['reactions'][0]['emoji'], THUMBS_UP)
+
+        # Taking your own back is still allowed.
+        self.assertSuccess(self.client.delete(f'{url}?emoji={THUMBS_UP}'))
+        self.assertFalse(MessageReaction.objects.exists())
+
+    def test_an_admin_turns_both_off_and_every_member_is_told(self):
+        self.client.force_authenticate(self.alice)
+        data = self.assertSuccess(
+            self.client.patch(
+                reverse('chat:conversation-settings', args=[self.group.id]),
+                {'settings': {'media_enabled': False, 'reactions_enabled': False}},
+                format='json',
+            )
+        )
+        self.assertFalse(data['settings']['media_enabled'])
+        self.assertFalse(data['settings']['reactions_enabled'])
+
+    def test_a_member_cannot_turn_them_off_even_where_members_edit_details(self):
+        self.group.edit_group_permission = 'members'
+        self.group.save(update_fields=['edit_group_permission'])
+        self.assertFailure(
+            self.client.patch(
+                reverse('chat:conversation-settings', args=[self.group.id]),
+                {'settings': {'reactions_enabled': False}},
+                format='json',
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+
+class OnlyNewMessagesTests(
+    MessageActionRouteMixin, EnvelopeAssertions, APITestCase
+):
+    """An admin adds somebody and chooses "Only show new messages".
+
+    The line has to hold on every route a message reaches a member by, not
+    just the thread: the list preview, the pin, the unread count, and every
+    per-message action - each of which answers with the message in full.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = make_user('alice', '+639170000001')
+        self.bob = make_user('bob', '+639170000002')
+        self.carol = make_user('carol', '+639170000003')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.add_participant(self.bob)
+        self.old = create_message(self.group, self.alice, text='the old plan')
+        self.client.force_authenticate(self.alice)
+
+    def add_carol(self, history=None):
+        payload = {'members': ['carol']}
+        if history is not None:
+            payload['history'] = history
+        return self.assertSuccess(
+            self.client.post(
+                reverse('chat:conversation-members', args=[self.group.id]),
+                payload,
+                format='json',
+            )
+        )
+
+    def history_as(self, user):
+        self.client.force_authenticate(user)
+        data = self.assertSuccess(
+            self.client.get(
+                reverse('chat:conversation-messages', args=[self.group.id])
+            )
+        )
+        return [row['text'] for row in data['results']]
+
+    def test_by_default_a_new_member_sees_everything(self):
+        self.add_carol()
+        self.assertEqual(self.history_as(self.carol), ['the old plan'])
+
+    def test_only_new_hides_what_came_before_and_shows_what_comes_after(self):
+        self.add_carol('new')
+        self.assertEqual(self.history_as(self.carol), [])
+
+        create_message(self.group, self.alice, text='the new plan')
+        self.assertEqual(self.history_as(self.carol), ['the new plan'])
+
+    def test_nobody_already_in_the_group_loses_anything(self):
+        # Bob is named again alongside Carol; he was already a member, so the
+        # choice is not his.
+        self.client.post(
+            reverse('chat:conversation-members', args=[self.group.id]),
+            {'members': ['carol', 'bob'], 'history': 'new'},
+            format='json',
+        )
+        self.assertEqual(self.history_as(self.bob), ['the old plan'])
+
+    def test_the_list_shows_no_old_preview_and_nothing_unread(self):
+        self.add_carol('new')
+        self.client.force_authenticate(self.carol)
+        rows = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-list'))
+        )['results']
+        row = next(r for r in rows if r['id'] == self.group.id)
+        self.assertIsNone(row['last_message'])
+        self.assertEqual(row['unread_count'], 0)
+
+    def test_an_old_pinned_message_is_not_shown_to_them(self):
+        self.group.pinned_message = self.old
+        self.group.save(update_fields=['pinned_message'])
+        self.add_carol('new')
+
+        self.client.force_authenticate(self.carol)
+        data = self.assertSuccess(
+            self.client.get(reverse('chat:conversation-detail', args=[self.group.id]))
+        )
+        self.assertIsNone(data['pinned_message'])
+
+    def test_an_old_message_cannot_be_reached_by_its_id(self):
+        # Reacting answers with the message in full, so this would be a way to
+        # read it. It must look exactly like a message that does not exist.
+        self.add_carol('new')
+        self.client.force_authenticate(self.carol)
+        self.assertFailure(
+            self.client.post(
+                self.message_url(self.old, 'reactions/'),
+                {'emoji': THUMBS_UP},
+                format='json',
+            ),
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_nor_by_replying_to_it_or_forwarding_it(self):
+        self.add_carol('new')
+        self.client.force_authenticate(self.carol)
+        url = reverse('chat:conversation-messages', args=[self.group.id])
+
+        self.assertFailure(
+            self.client.post(
+                url, {'text': 'what?', 'reply_to': self.old.pk}, format='json'
+            )
+        )
+        self.assertFailure(
+            self.client.post(url, {'forward_from': self.old.pk}, format='json')
+        )
+
+    def test_an_email_invitation_carries_the_choice(self):
+        self.client.post(
+            reverse('chat:conversation-members', args=[self.group.id]),
+            {'invite_email': ['dana@example.com'], 'history': 'new'},
+            format='json',
+        )
+        row = Participant.objects.get(
+            conversation=self.group, email='dana@example.com'
+        )
+        self.assertEqual(row.history_after_message_id, self.old.pk)
 
 
 class ForwardMessageTests(

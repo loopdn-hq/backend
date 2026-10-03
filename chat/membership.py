@@ -1506,7 +1506,10 @@ def claim_email_invitations(user):
             continue
         if existing.status != Participant.Status.ACTIVE:
             existing.status = Participant.Status.ACTIVE
-            existing.save(update_fields=['status'])
+            # Coming back in on THIS invitation, so what it allowed them to
+            # read - "Only show new messages", or everything - comes with it.
+            existing.history_after_message_id = row.history_after_message_id
+            existing.save(update_fields=['status', 'history_after_message_id'])
         claimed += 1
         _announce_membership(existing)
 

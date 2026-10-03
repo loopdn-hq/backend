@@ -16,7 +16,7 @@ from chat.models import (
     Participant,
     PostingNotAllowed,
 )
-from chat.utils import describe_upload
+from chat.utils import describe_upload, is_audio
 
 
 def conversation_group(conversation_id):
@@ -76,6 +76,24 @@ def create_message(conversation, sender=None, text='', uploads=None, *,
     # of them.
     if not conversation.allows_posting_by(participant):
         raise PostingNotAllowed('Only admins can post in this group.')
+
+    # The group's "Voice Messages" and "Photos & Files" switches, held here for
+    # the same reason as the broadcast check above. Every attachment is one or
+    # the other: audio answers to the voice switch, anything else to media.
+    # For everybody, admins included: it is a choice about the group, and an
+    # admin who wants them turns the switch back on. A forward counts too, or
+    # forwarding would be the way round it.
+    attached_audio = [
+        is_audio(getattr(upload, 'content_type', ''), getattr(upload, 'name', ''))
+        for upload in uploads or []
+    ] + [
+        is_audio(original.content_type, original.original_name)
+        for original in copy_attachments or []
+    ]
+    if not conversation.voice_messages_enabled and any(attached_audio):
+        raise PostingNotAllowed('Voice messages are turned off in this group.')
+    if not conversation.media_enabled and not all(attached_audio):
+        raise PostingNotAllowed('Photos and files are turned off in this group.')
 
     if client_id:
         # A retry of something already stored. Returned rather than re-created,
