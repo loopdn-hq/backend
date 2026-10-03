@@ -61,6 +61,7 @@ import time
 from django.conf import settings
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 
 from sms.client import (
     SmsError,
@@ -71,7 +72,7 @@ from sms.client import (
     search_numbers,
 )
 from sms.client import order_number as order_number_at_provider
-from sms.models import GroupNumber
+from sms.models import GroupNumber, NumberLease
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +279,13 @@ def _assign(conversation, country):
                 spare.conversation = conversation
                 spare.status = GroupNumber.Status.ACTIVE
                 spare.save(update_fields=['conversation', 'status', 'updated_at'])
+                # Its rental now belongs to this group's bill.
+                NumberLease.objects.filter(
+                    number=spare.number, released_at__isnull=True
+                ).update(
+                    conversation=conversation,
+                    conversation_name=conversation.name[:120],
+                )
                 return spare
     except IntegrityError:
         return GroupNumber.objects.filter(conversation=conversation).first()
@@ -306,9 +314,36 @@ def _assign(conversation, country):
             'Conversation %s already had a number when %s was bought for it; '
             'releasing the new one', conversation.pk, bought.number,
         )
-        release_number(bought)
+        # Bought and paid for even so - the upfront charge is real - so it is
+        # on record, closed if the release went through and open if it did not.
+        lease = _open_lease(bought, ordered, None)
+        if release_number(bought):
+            _close_lease(lease.number)
         return GroupNumber.objects.filter(conversation=conversation).first()
+    _open_lease(bought, ordered, conversation)
     return bought
+
+
+def _open_lease(group_number, ordered, conversation):
+    """Start the rental record for a number just bought. See NumberLease."""
+    return NumberLease.objects.create(
+        number=group_number.number,
+        provider=group_number.provider,
+        provider_number_id=group_number.provider_number_id,
+        country=group_number.country,
+        conversation=conversation,
+        conversation_name=conversation.name[:120] if conversation else '',
+        upfront_cost=ordered.get('upfront_cost'),
+        monthly_cost=ordered.get('monthly_cost'),
+        cost_currency=ordered.get('cost_currency') or '',
+    )
+
+
+def _close_lease(number):
+    """The provider has confirmed the release: the rental stops here."""
+    NumberLease.objects.filter(number=number, released_at__isnull=True).update(
+        released_at=timezone.now()
+    )
 
 
 def _disable_sms(conversation):
@@ -387,6 +422,9 @@ def release_for(conversation):
         return
 
     if release_number(number):
+        # Closed before the row goes: the lease, not the row, is the record of
+        # what this number cost, and it stays.
+        _close_lease(number.number)
         number.delete()
         return
 
@@ -449,8 +487,15 @@ def order_number(country):
         return None
 
     for candidate in candidates:
-        result = _buy(candidate, country)
+        result = _buy(candidate['phone_number'], country)
         if result is not None:
+            # What the search quoted for it - the only place the price appears,
+            # and what the rental record keeps.
+            result.update(
+                upfront_cost=candidate.get('upfront_cost'),
+                monthly_cost=candidate.get('monthly_cost'),
+                cost_currency=candidate.get('currency') or '',
+            )
             return result
 
     logger.error('Every candidate number in %s was taken before we could buy it', country)

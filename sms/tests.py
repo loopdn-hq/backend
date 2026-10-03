@@ -69,7 +69,19 @@ from sms import (
     segments,
     signature,
 )
-from sms.models import GroupNumber, SmsDelivery, SmsSettings, SmsWebhookEvent
+from sms.models import (
+    GroupNumber,
+    NumberLease,
+    NumberRentalMonth,
+    SmsDelivery,
+    SmsSettings,
+    SmsUsageMonth,
+    SmsWebhookEvent,
+    VerificationText,
+)
+import hashlib
+from decimal import Decimal
+from datetime import date, datetime, timezone as dt_timezone
 
 
 class SmsErrorIdentityTests(TestCase):
@@ -667,6 +679,497 @@ class InboundWebhookTests(APITestCase):
             self.url, 'not json at all', content_type='application/json'
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class BillingRecordTests(APITestCase):
+    """What a text cost, why it failed, and every billed text being on record.
+
+    Payload shapes are Telnyx's own: `cost` with the amount as a STRING, and
+    `errors` as a list of {code, title, detail}.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.alice = User.objects.create_user(username='alice', password='x')
+        self.group = Conversation.start_group(self.alice, name='Family')
+        self.group.join_mode = Conversation.JoinMode.OPEN
+        self.group.save(update_fields=['join_mode'])
+        GroupNumber.objects.create(
+            number='+14155551001',
+            conversation=self.group,
+            status=GroupNumber.Status.ACTIVE,
+        )
+        self.url = reverse('sms:inbound-webhook')
+        self.row = SmsDelivery.objects.create(
+            direction=SmsDelivery.Direction.OUTBOUND,
+            conversation=self.group,
+            user=self.alice,
+            status=SmsDelivery.Status.SENT,
+            provider_message_id='msg_42',
+            segments=1,
+        )
+
+    def event(self, event_type, payload, event_id='evt_1'):
+        return self.client.post(
+            self.url,
+            {'data': {'id': event_id, 'event_type': event_type, 'payload': payload}},
+            format='json',
+        )
+
+    def test_the_cost_the_provider_reports_is_kept_exactly(self):
+        self.event('message.finalized', {
+            'id': 'msg_42',
+            'to': [{'status': 'delivered'}],
+            'cost': {'amount': '0.0051', 'currency': 'USD'},
+        })
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.cost, Decimal('0.0051'))
+        self.assertEqual(self.row.cost_currency, 'USD')
+
+    def test_a_later_event_without_a_price_does_not_erase_it(self):
+        self.event('message.sent', {
+            'id': 'msg_42', 'to': [{'status': 'sent'}],
+            'cost': {'amount': '0.0051', 'currency': 'USD'},
+        }, event_id='evt_sent')
+        self.event('message.finalized', {
+            'id': 'msg_42', 'to': [{'status': 'delivered'}], 'cost': None,
+        }, event_id='evt_final')
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.cost, Decimal('0.0051'))
+
+    def test_a_failure_keeps_the_providers_reason(self):
+        self.event('message.finalized', {
+            'id': 'msg_42',
+            'to': [{'status': 'delivery_failed'}],
+            'errors': [{'code': '40010', 'title': 'Not 10DLC registered',
+                        'detail': 'The sending number is not 10DLC-registered.'}],
+        })
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, SmsDelivery.Status.FAILED)
+        self.assertEqual(self.row.error_code, '40010')
+        self.assertEqual(self.row.error_detail, 'Not 10DLC registered')
+
+    def test_a_text_refused_before_it_left_is_failed_not_sent(self):
+        # `sending_failed` used to be read as nothing at all, so a text that
+        # never went anywhere stayed "sent".
+        self.event('message.finalized', {
+            'id': 'msg_42', 'to': [{'status': 'sending_failed'}],
+        })
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, SmsDelivery.Status.FAILED)
+
+    def test_a_command_text_is_on_record_with_its_cost(self):
+        # JOIN posts nothing to the group, but it was billed like any text.
+        self.event('message.received', {
+            'id': 'msg_in_1',
+            'from': {'phone_number': '+639171111111'},
+            'to': [{'phone_number': '+14155551001'}],
+            'text': 'JOIN',
+            'cost': {'amount': '0.0040', 'currency': 'USD'},
+        })
+        row = SmsDelivery.objects.get(direction=SmsDelivery.Direction.INBOUND)
+        self.assertIsNone(row.message)
+        self.assertEqual(row.cost, Decimal('0.0040'))
+        self.assertEqual(row.provider_message_id, 'msg_in_1')
+        self.assertEqual(row.counterpart_last4, '1111')
+
+
+class UsageSummaryTests(TestCase):
+    """Monthly billing totals, kept after the delivery log is purged."""
+
+    def setUp(self):
+        self.alice = User.objects.create_user(username='alice', password='x')
+        self.group = Conversation.start_group(self.alice, name='Family')
+
+    def delivery(self, when, **fields):
+        row = SmsDelivery.objects.create(
+            direction=fields.pop('direction', SmsDelivery.Direction.OUTBOUND),
+            conversation=self.group,
+            user=self.alice,
+            **fields,
+        )
+        # auto_now_add ignores what is passed in, so the date is set after.
+        SmsDelivery.objects.filter(pk=row.pk).update(created_at=when)
+        return row
+
+    def test_a_month_is_totalled_per_group_account_and_direction(self):
+        now = timezone.now()
+        self.delivery(now, status=SmsDelivery.Status.DELIVERED, segments=2,
+                      cost=Decimal('0.0080'), cost_currency='USD')
+        self.delivery(now, status=SmsDelivery.Status.FAILED, segments=1,
+                      cost=Decimal('0.0040'), cost_currency='USD')
+        self.delivery(now, status=SmsDelivery.Status.SKIPPED, segments=1)
+
+        maintenance.summarize_usage()
+
+        row = SmsUsageMonth.objects.get(direction=SmsDelivery.Direction.OUTBOUND)
+        self.assertEqual(row.month, now.date().replace(day=1))
+        self.assertEqual(row.conversation_name, 'Family')
+        self.assertEqual(row.user, self.alice)
+        self.assertEqual(
+            (row.texts, row.segments, row.delivered, row.failed, row.skipped),
+            (3, 4, 1, 1, 1),
+        )
+        self.assertEqual(row.cost, Decimal('0.0120'))
+        self.assertEqual(row.cost_currency, 'USD')
+        # The skipped text was never sent, so never priced.
+        self.assertEqual(row.priced, 2)
+
+    def test_running_it_twice_changes_nothing(self):
+        self.delivery(timezone.now(), segments=1, cost=Decimal('0.0040'),
+                      cost_currency='USD')
+        maintenance.summarize_usage()
+        maintenance.summarize_usage()
+        self.assertEqual(SmsUsageMonth.objects.get().texts, 1)
+
+    def test_a_late_price_is_picked_up_on_the_next_run(self):
+        row = self.delivery(timezone.now(), segments=1)
+        maintenance.summarize_usage()
+        SmsDelivery.objects.filter(pk=row.pk).update(
+            cost=Decimal('0.0040'), cost_currency='USD'
+        )
+        maintenance.summarize_usage()
+        self.assertEqual(SmsUsageMonth.objects.get().cost, Decimal('0.0040'))
+
+    def test_the_totals_outlive_the_purge(self):
+        long_ago = timezone.now() - timedelta(days=settings.SMS_RETENTION_DAYS + 40)
+        self.delivery(long_ago, segments=3, cost=Decimal('0.0120'),
+                      cost_currency='USD')
+        # Summarised while the detail was still there...
+        maintenance.summarize_usage(today=long_ago.date())
+
+        maintenance.purge_old_deliveries()
+        self.assertFalse(SmsDelivery.objects.exists())
+
+        # ...the month is still on record, and today's run leaves it alone
+        # rather than overwriting it from detail that is gone.
+        maintenance.summarize_usage()
+        row = SmsUsageMonth.objects.get()
+        self.assertEqual((row.texts, row.segments), (1, 3))
+        self.assertEqual(row.cost, Decimal('0.0120'))
+
+    def test_a_deleted_group_keeps_its_billing_history(self):
+        self.delivery(timezone.now(), segments=1)
+        maintenance.summarize_usage()
+        self.group.delete()
+
+        row = SmsUsageMonth.objects.get()
+        self.assertIsNone(row.conversation)
+        self.assertEqual(row.conversation_name, 'Family')
+
+    def test_the_daily_report_says_what_it_cost_and_why_things_failed(self):
+        now = timezone.now()
+        self.delivery(now, status=SmsDelivery.Status.DELIVERED, segments=1,
+                      cost=Decimal('0.0040'), cost_currency='USD')
+        self.delivery(now, status=SmsDelivery.Status.FAILED, segments=1,
+                      cost=Decimal('0.0040'), cost_currency='USD',
+                      error_code='40010', error_detail='Not 10DLC registered')
+
+        body = maintenance.daily_spend_report()
+
+        self.assertIn('0.0080 USD', body)
+        self.assertIn('40010 Not 10DLC registered', body)
+
+
+@override_settings(TELNYX_API_KEY='k', TELNYX_MESSAGING_PROFILE_ID='p')
+class NumberRentalTests(TestCase):
+    """What each group number costs to rent, kept after the number is gone."""
+
+    # Telnyx's own shape: prices are strings, in `cost_information`.
+    SEARCH = {'data': [{
+        'phone_number': '+14155550001',
+        'features': [{'name': 'sms'}],
+        'cost_information': {
+            'upfront_cost': '1.00', 'monthly_cost': '1.00', 'currency': 'USD',
+        },
+    }]}
+    ORDER_OK = {'data': {'id': 'order-1', 'status': 'success'}}
+    INVENTORY = {'data': [{'id': '1234567890', 'phone_number': '+14155550001'}]}
+
+    def setUp(self):
+        cache.clear()
+        self.alice = User.objects.create_user(username='alice', password='x')
+        self.group = Conversation.start_group(self.alice, name='Family')
+
+    def telnyx(self, method, url, **kwargs):
+        if 'available_phone_numbers' in url:
+            return self.SEARCH
+        if method == 'POST' and 'number_orders' in url:
+            return self.ORDER_OK
+        if 'phone_numbers' in url:
+            return self.INVENTORY
+        raise AssertionError(url)
+
+    def buy(self):
+        with mock.patch('sms.client._request', side_effect=self.telnyx):
+            return provisioning._assign(self.group, 'US')
+
+    def test_buying_a_number_records_its_price(self):
+        self.buy()
+        lease = NumberLease.objects.get()
+        self.assertEqual(lease.number, '+14155550001')
+        self.assertEqual(lease.conversation, self.group)
+        self.assertEqual(lease.monthly_cost, Decimal('1.00'))
+        self.assertEqual(lease.upfront_cost, Decimal('1.00'))
+        self.assertEqual(lease.cost_currency, 'USD')
+        self.assertIsNone(lease.released_at)
+
+    def test_a_released_number_closes_its_rental_and_keeps_the_record(self):
+        self.buy()
+        with mock.patch('sms.provisioning.release_number', return_value=True):
+            self.group.delete()
+
+        self.assertFalse(GroupNumber.objects.exists())
+        lease = NumberLease.objects.get()
+        self.assertIsNotNone(lease.released_at)
+        # The group is gone; which group it was is not.
+        self.assertIsNone(lease.conversation)
+        self.assertEqual(lease.conversation_name, 'Family')
+
+    def test_a_release_that_failed_leaves_the_rental_open(self):
+        # The number is still being billed, so the record must say so.
+        self.buy()
+        with mock.patch('sms.provisioning.release_number', return_value=False):
+            provisioning.release_for(self.group)
+        self.assertIsNone(NumberLease.objects.get().released_at)
+
+    def test_a_spare_number_bills_to_the_group_it_is_given_to(self):
+        GroupNumber.objects.create(
+            number='+14155550009', status=GroupNumber.Status.AVAILABLE, country='US'
+        )
+        NumberLease.objects.create(number='+14155550009', country='US')
+
+        provisioning._assign(self.group, 'US')
+
+        lease = NumberLease.objects.get()
+        self.assertEqual(lease.conversation, self.group)
+        self.assertEqual(lease.conversation_name, 'Family')
+
+    def test_each_month_gets_a_rental_line_and_the_first_its_upfront_charge(self):
+        today = timezone.now().astimezone(dt_timezone.utc).date()
+        this_month = today.replace(day=1)
+        last_month = (this_month - timedelta(days=1)).replace(day=1)
+        bought = datetime(
+            last_month.year, last_month.month, 1, 12, tzinfo=dt_timezone.utc
+        )
+        held = NumberLease.objects.create(
+            number='+14155550001', conversation=self.group,
+            conversation_name='Family', leased_at=bought,
+            upfront_cost=Decimal('1.00'), monthly_cost=Decimal('1.00'),
+            cost_currency='USD',
+        )
+        # Released before last month began: on nobody's bill now.
+        NumberLease.objects.create(
+            number='+14155550002', leased_at=bought - timedelta(days=90),
+            released_at=bought - timedelta(days=40),
+        )
+
+        maintenance.summarize_usage()
+
+        rows = {row.month: row for row in NumberRentalMonth.objects.all()}
+        self.assertEqual(set(rows), {last_month, this_month})
+        self.assertEqual(rows[last_month].lease, held)
+        self.assertEqual(rows[last_month].upfront_cost, Decimal('1.00'))
+        self.assertIsNone(rows[this_month].upfront_cost)
+        self.assertEqual(rows[this_month].monthly_cost, Decimal('1.00'))
+        self.assertEqual(rows[this_month].conversation_name, 'Family')
+
+    def test_numbers_already_held_get_their_rental_record(self):
+        # Migration 0005's backfill, on the numbers a database already has.
+        import importlib
+        from django.apps import apps
+
+        backfill = importlib.import_module(
+            'sms.migrations.0005_number_rental_records'
+        ).open_leases_for_numbers_already_held
+        GroupNumber.objects.create(
+            number='+14155550001', conversation=self.group,
+            status=GroupNumber.Status.ACTIVE, country='US',
+        )
+        # A release that failed: still billed, so still held.
+        GroupNumber.objects.create(
+            number='+14155550002', status=GroupNumber.Status.RELEASED, country='US',
+        )
+
+        backfill(apps, None)
+
+        leases = {lease.number: lease for lease in NumberLease.objects.all()}
+        self.assertEqual(set(leases), {'+14155550001', '+14155550002'})
+        self.assertEqual(leases['+14155550001'].conversation_name, 'Family')
+        self.assertTrue(all(l.released_at is None for l in leases.values()))
+        # Never guessed: the price was not kept for these.
+        self.assertTrue(all(l.monthly_cost is None for l in leases.values()))
+
+    def test_the_daily_report_says_what_the_numbers_cost(self):
+        NumberLease.objects.create(
+            number='+14155550001', monthly_cost=Decimal('1.00'), cost_currency='USD'
+        )
+        NumberLease.objects.create(number='+14155550002')
+
+        body = maintenance.daily_spend_report()
+
+        self.assertIn('1.00 USD a month', body)
+        self.assertIn('1 with no known price', body)
+
+
+@override_settings(
+    SMS_ALLOWED_COUNTRY_PREFIXES=['+1', '+63'],
+    OTP_RESEND_COOLDOWN=timedelta(seconds=0),
+)
+class VerificationTextTests(TestCase):
+    """Sign-up and login code texts on record: cost, failures, and abuse.
+
+    Never the code - Telnyx makes and checks it, and this system never has it.
+    """
+
+    NUMBER = '+639171234567'
+
+    def setUp(self):
+        from otp.services import start_phone_verification
+
+        cache.clear()
+        self.start = start_phone_verification
+        self.user = User.objects.create_user(username='alice', password='x')
+        self.user.profile.phone_number = self.NUMBER
+        self.user.profile.save(update_fields=['phone_number', 'updated_at'])
+
+    def test_a_code_text_is_recorded_without_the_code(self):
+        self.start(self.user)
+
+        row = VerificationText.objects.get()
+        self.assertEqual(row.outcome, VerificationText.Outcome.SENT)
+        self.assertEqual(row.user, self.user)
+        self.assertEqual(row.country, 'PH')
+        self.assertEqual(row.counterpart_last4, '4567')
+        # The same hash SmsDelivery keeps, never the number itself.
+        self.assertEqual(
+            row.counterpart_hash, hashlib.sha256(self.NUMBER.encode()).hexdigest()
+        )
+        # No provider in the test suite, so nothing was really texted - and
+        # the row says so rather than claiming a text that never went.
+        self.assertIn('not texted', row.reason)
+
+    def test_a_text_telnyx_refused_is_recorded_as_failed(self):
+        with mock.patch(
+            'otp.services.send_verification_code',
+            side_effect=sms.client.SmsError('Telnyx said no'),
+        ):
+            with self.assertRaises(sms.client.SmsError):
+                self.start(self.user)
+        row = VerificationText.objects.get()
+        self.assertEqual(row.outcome, VerificationText.Outcome.FAILED)
+        self.assertEqual(row.reason, 'Telnyx said no')
+
+    @override_settings(OTP_MAX_SENDS_PER_HOUR=1)
+    def test_requests_stopped_by_our_limits_are_recorded(self):
+        from otp.models import OtpError
+
+        self.start(self.user)
+        with self.assertRaises(OtpError):
+            self.start(self.user)
+        stopped = VerificationText.objects.get(
+            outcome=VerificationText.Outcome.LIMITED
+        )
+        self.assertEqual(stopped.reason, 'hourly or daily limit')
+
+    @override_settings(SMS_ALLOWED_COUNTRY_PREFIXES=['+1'])
+    def test_a_country_we_do_not_text_is_recorded(self):
+        from otp.models import OtpError
+
+        with self.assertRaises(OtpError):
+            self.start(self.user)
+        self.assertEqual(
+            VerificationText.objects.get().outcome,
+            VerificationText.Outcome.BLOCKED_COUNTRY,
+        )
+
+    def test_a_record_that_cannot_be_written_never_stops_a_sign_up(self):
+        with mock.patch.object(
+            VerificationText.objects, 'create', side_effect=RuntimeError('db')
+        ):
+            self.assertIsNotNone(self.start(self.user))
+
+    @override_settings(TELNYX_API_KEY='k', TELNYX_MESSAGING_PROFILE_ID='group-profile')
+    def test_cost_and_delivery_are_filled_in_from_telnyx_records(self):
+        self.start(self.user)
+        row = VerificationText.objects.get()
+        sent_at = row.created_at.astimezone(dt_timezone.utc)
+        stamp = sent_at.strftime('%Y-%m-%dT%H:%M:%SZ')
+        records = [
+            # A group text to the same number at the same time: not a code.
+            {'id': 'grp-1', 'direction': 'outbound', 'cld': self.NUMBER,
+             'created_at': stamp, 'profile_id': 'group-profile',
+             'status': 'delivered', 'cost': '0.0040', 'currency': 'USD',
+             'errors': []},
+            # Telnyx's own shape: cost a string, errors a list of codes.
+            {'id': 'mdr-1', 'direction': 'outbound', 'cld': self.NUMBER,
+             'created_at': stamp, 'profile_id': '2fa-profile',
+             'status': 'failed', 'cost': '0.2252', 'currency': 'USD',
+             'errors': ['40008']},
+        ]
+
+        with mock.patch('sms.client.message_records_since', return_value=records):
+            maintenance.reconcile_verification_texts()
+
+        row.refresh_from_db()
+        self.assertEqual(row.provider_record_id, 'mdr-1')
+        self.assertEqual(row.delivery_status, 'failed')
+        # A failed text is still billed.
+        self.assertEqual(row.cost, Decimal('0.2252'))
+        self.assertEqual(row.error_code, '40008')
+        self.assertEqual(row.error_detail, 'Undeliverable')
+
+        # A record already paired is refreshed, not paired again.
+        records[1].update(status='delivered', errors=[])
+        with mock.patch('sms.client.message_records_since', return_value=records):
+            maintenance.reconcile_verification_texts()
+        row.refresh_from_db()
+        self.assertEqual(row.delivery_status, 'delivered')
+        self.assertEqual(row.error_code, '')
+
+    @override_settings(TELNYX_API_KEY='k')
+    def test_a_record_far_from_any_request_is_not_ours(self):
+        self.start(self.user)
+        hours_away = (timezone.now() + timedelta(hours=3)).astimezone(dt_timezone.utc)
+        records = [{
+            'id': 'mdr-9', 'direction': 'outbound', 'cld': self.NUMBER,
+            'created_at': hours_away.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'status': 'delivered', 'cost': '0.2252', 'currency': 'USD',
+            'errors': [],
+        }]
+        with mock.patch('sms.client.message_records_since', return_value=records):
+            maintenance.reconcile_verification_texts()
+        self.assertEqual(VerificationText.objects.get().provider_record_id, '')
+
+    @override_settings(VERIFICATION_ALERT_LIMITED=2, OTP_MAX_SENDS_PER_HOUR=1)
+    def test_the_daily_report_shows_cost_failures_and_possible_abuse(self):
+        from otp.models import OtpError
+
+        self.start(self.user)
+        for _ in range(2):
+            with self.assertRaises(OtpError):
+                self.start(self.user)
+        VerificationText.objects.filter(outcome='sent').update(
+            delivery_status='failed', cost=Decimal('0.2252'),
+            cost_currency='USD', error_code='40008', error_detail='Undeliverable',
+        )
+
+        body = maintenance.daily_spend_report()
+
+        self.assertIn('sign-up and login codes', body)
+        self.assertIn('stopped by limits 2', body)
+        self.assertIn('0.2252 USD', body)
+        self.assertIn('PH 3', body)
+        self.assertIn('40008 Undeliverable', body)
+        self.assertIn('possible abuse', body)
+
+    def test_the_record_goes_with_the_rest_after_the_retention_period(self):
+        self.start(self.user)
+        VerificationText.objects.update(
+            created_at=timezone.now() - timedelta(days=settings.SMS_RETENTION_DAYS + 1)
+        )
+        maintenance.purge_old_deliveries()
+        self.assertFalse(VerificationText.objects.exists())
 
 
 class NumberPrivacyTests(TestCase):

@@ -19,6 +19,7 @@ So there is no `telnyx_` prefix on any column: `provider` names who it was and
 from django.conf import settings
 from django.core.cache import cache
 from django.db import models
+from django.utils import timezone
 
 from chat.models import Conversation, Message, Participant
 from user.models import phone_number_validator
@@ -212,6 +213,27 @@ class SmsDelivery(models.Model):
         max_length=128, blank=True, default='', db_default='', db_index=True
     )
 
+    # What the provider charged, as it said - read off its status updates, or
+    # off the text itself for one that arrived. Null until it says, which is a
+    # different fact from free. A Decimal kept to the provider's own precision
+    # (its breakdowns run to five places), never a float: these are summed into
+    # bills. `segments` says how much was sent; this says what it cost, and the
+    # two differ by destination by a factor of fifty.
+    cost = models.DecimalField(max_digits=12, decimal_places=5, null=True, blank=True)
+    cost_currency = models.CharField(
+        max_length=3, blank=True, default='', db_default=''
+    )
+
+    # Why the provider or a carrier refused it, in its words: the code
+    # ("40010") and title ("Not 10DLC registered"). Not `reason`, which is OUR
+    # decision not to send - muted, over budget - and drives what is retried.
+    # Without these a failure only says "failed", and the cause is findable
+    # only in the provider's portal.
+    error_code = models.CharField(max_length=16, blank=True, default='', db_default='')
+    error_detail = models.CharField(
+        max_length=255, blank=True, default='', db_default=''
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
@@ -235,6 +257,261 @@ class SmsDelivery(models.Model):
 
     def __str__(self):
         return f'{self.direction} {self.status} ...{self.counterpart_last4}'
+
+
+class SmsUsageMonth(models.Model):
+    """One month of texts for one group, one account and one direction.
+
+    The billing summary - what is left when the detail is gone. SmsDelivery
+    rows are deleted after SMS_RETENTION_DAYS because together they are a record
+    of who texts which private group; billing needs the totals for far longer
+    than that, and the totals need none of the people. So the detail is rolled
+    up here every day and these rows are kept: no numbers, no message, nothing
+    but counts and money against a group and the account that caused them.
+
+    Written by `sms.maintenance.summarize_usage`, which recomputes the current
+    and the previous month from the detail each day. Recomputing rather than
+    adding means a late status update or a retry is counted correctly however
+    late it lands, and running it twice changes nothing.
+
+    `conversation` and `user` are SET_NULL so a deleted group or account does
+    not take its billing history with it; `conversation_name` says which group
+    it was once the link is gone.
+    """
+
+    month = models.DateField(help_text='The first day of the month, UTC.')
+    conversation = models.ForeignKey(
+        Conversation,
+        on_delete=models.SET_NULL,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
+    conversation_name = models.CharField(
+        max_length=120, blank=True, default='', db_default=''
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
+    direction = models.CharField(
+        max_length=8, choices=SmsDelivery.Direction.choices
+    )
+
+    texts = models.PositiveIntegerField(default=0, db_default=0)
+    segments = models.PositiveIntegerField(default=0, db_default=0)
+    delivered = models.PositiveIntegerField(default=0, db_default=0)
+    failed = models.PositiveIntegerField(default=0, db_default=0)
+    skipped = models.PositiveIntegerField(default=0, db_default=0)
+
+    # The sum of what the provider reported, and how many texts it reported a
+    # price for. `priced` below `texts` means some are not priced yet (or never
+    # will be: a skipped text was never sent), so `cost` is a floor until then.
+    cost = models.DecimalField(
+        max_digits=14, decimal_places=5, default=0, db_default=0
+    )
+    cost_currency = models.CharField(
+        max_length=3, blank=True, default='', db_default=''
+    )
+    priced = models.PositiveIntegerField(default=0, db_default=0)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-month', 'conversation_name']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['month', 'conversation', 'user', 'direction'],
+                name='one_sms_usage_row_per_month_group_user_direction',
+            ),
+        ]
+        indexes = [models.Index(fields=['user', '-month'])]
+
+    def __str__(self):
+        return f'{self.month:%Y-%m} {self.direction} {self.conversation_name}'
+
+
+class NumberLease(models.Model):
+    """One phone number we rented, for as long as we rented it.
+
+    The rental record. A GroupNumber row is deleted the moment its number is
+    released, so it cannot also be the record of what was paid for it; this is
+    kept for good. It holds nothing about any person - the number is ours, not
+    a member's - so there is no privacy reason to purge it.
+
+    Opened when a number is bought, pointed at whichever group it serves, and
+    closed only once the provider has confirmed the release: a release that
+    failed leaves it open, because the number is still being billed.
+
+    The price is what the provider quoted when we bought it (`cost_information`
+    on the number search). Null for numbers bought before this record existed,
+    whose price was never kept - see migration 0005.
+    """
+
+    number = models.CharField(max_length=16, db_index=True)
+    provider = models.CharField(max_length=32, blank=True, default='', db_default='')
+    provider_number_id = models.CharField(
+        max_length=64, blank=True, default='', db_default=''
+    )
+    country = models.CharField(max_length=2, blank=True, default='', db_default='')
+
+    # The group it serves, or last served. SET_NULL so the record outlives a
+    # deleted group, with the name kept to say which one it was.
+    conversation = models.ForeignKey(
+        Conversation,
+        on_delete=models.SET_NULL,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
+    conversation_name = models.CharField(
+        max_length=120, blank=True, default='', db_default=''
+    )
+
+    upfront_cost = models.DecimalField(
+        max_digits=12, decimal_places=5, null=True, blank=True
+    )
+    monthly_cost = models.DecimalField(
+        max_digits=12, decimal_places=5, null=True, blank=True
+    )
+    cost_currency = models.CharField(
+        max_length=3, blank=True, default='', db_default=''
+    )
+
+    leased_at = models.DateTimeField(default=timezone.now)
+    released_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-leased_at']
+        indexes = [models.Index(fields=['released_at'])]
+
+    def __str__(self):
+        held = 'held' if self.released_at is None else 'released'
+        return f'{self.number} ({held})'
+
+
+class NumberRentalMonth(models.Model):
+    """One rented number in one month: the rental line of a monthly bill.
+
+    Written beside SmsUsageMonth by `sms.maintenance.summarize_usage`, for
+    every number held at any point in the month. `monthly_cost` is the
+    number's monthly price; `upfront_cost` only in the month it was bought.
+    Rebuilt from NumberLease, which is never purged, so any month can be
+    recomputed.
+    """
+
+    month = models.DateField(help_text='The first day of the month, UTC.')
+    lease = models.ForeignKey(
+        NumberLease, on_delete=models.CASCADE, related_name='months'
+    )
+    number = models.CharField(max_length=16)
+    conversation = models.ForeignKey(
+        Conversation,
+        on_delete=models.SET_NULL,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
+    conversation_name = models.CharField(
+        max_length=120, blank=True, default='', db_default=''
+    )
+    monthly_cost = models.DecimalField(
+        max_digits=12, decimal_places=5, null=True, blank=True
+    )
+    upfront_cost = models.DecimalField(
+        max_digits=12, decimal_places=5, null=True, blank=True
+    )
+    cost_currency = models.CharField(
+        max_length=3, blank=True, default='', db_default=''
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-month', 'number']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['month', 'lease'], name='one_rental_row_per_lease_month'
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.month:%Y-%m} {self.number}'
+
+
+class VerificationText(models.Model):
+    """One sign-up or login code text: asked for, refused, or sent.
+
+    What it cost, whether it arrived, and the shape of the traffic - which is
+    how abuse shows. Never the code: Telnyx's Verify API makes, sends and checks
+    it, and this system never sees one (sms/verification.py).
+
+    Written in two halves. The asking half is ours, at the moment of the
+    request (otp/services.py): who asked, which country, and whether it was
+    sent, refused by Telnyx, or stopped by our own limits - the last being the
+    clearest sign of somebody trying to run up the bill. The delivery half is
+    Telnyx's, filled in by `sms.maintenance.reconcile_verification_texts` from
+    its message records, which is the only place it reports a code text's
+    price and fate (Verify's own webhooks carry neither).
+
+    The number is kept the way SmsDelivery keeps one - a hash and the last four
+    digits - and the row is purged after SMS_RETENTION_DAYS like that table.
+    """
+
+    class Outcome(models.TextChoices):
+        # Handed to Telnyx. Whether it arrived is `delivery_status`.
+        SENT = 'sent', 'Sent'
+        # Telnyx refused the request or could not be reached.
+        FAILED = 'failed', 'Failed'
+        # Stopped by our own ceilings or resend cooldown before costing a thing.
+        LIMITED = 'limited', 'Stopped by limits'
+        # A destination we do not text at all.
+        BLOCKED_COUNTRY = 'country', 'Country not allowed'
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
+    country = models.CharField(max_length=2, blank=True, default='', db_default='')
+    counterpart_last4 = models.CharField(
+        max_length=4, blank=True, default='', db_default=''
+    )
+    counterpart_hash = models.CharField(
+        max_length=64, blank=True, default='', db_default='', db_index=True
+    )
+    outcome = models.CharField(max_length=8, choices=Outcome.choices)
+    # Ours: which limit, or what Telnyx said when it refused the request.
+    reason = models.CharField(max_length=255, blank=True, default='', db_default='')
+
+    # From Telnyx's message record, once matched: did it arrive, what did it
+    # cost, and if it failed, the carrier's code. A failed text is still billed.
+    delivery_status = models.CharField(
+        max_length=16, blank=True, default='', db_default=''
+    )
+    cost = models.DecimalField(max_digits=12, decimal_places=5, null=True, blank=True)
+    cost_currency = models.CharField(
+        max_length=3, blank=True, default='', db_default=''
+    )
+    error_code = models.CharField(max_length=16, blank=True, default='', db_default='')
+    error_detail = models.CharField(
+        max_length=255, blank=True, default='', db_default=''
+    )
+    # The Telnyx record this was matched to, so no record is counted twice.
+    provider_record_id = models.CharField(
+        max_length=64, blank=True, default='', db_default='', db_index=True
+    )
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.created_at:%Y-%m-%d %H:%M} {self.outcome} ...{self.counterpart_last4}'
 
 
 class SmsSettings(models.Model):

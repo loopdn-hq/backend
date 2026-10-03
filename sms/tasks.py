@@ -76,6 +76,20 @@ def purge_old_deliveries():
     return run()
 
 
+@shared_task(name='sms.summarize_usage')
+def summarize_usage():
+    from sms.maintenance import summarize_usage as run
+
+    return run()
+
+
+@shared_task(name='sms.reconcile_verification_texts')
+def reconcile_verification_texts():
+    from sms.maintenance import reconcile_verification_texts as run
+
+    return run()
+
+
 @shared_task(name='sms.daily_spend_report')
 def daily_spend_report():
     from sms.maintenance import daily_spend_report as run

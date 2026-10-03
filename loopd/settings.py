@@ -765,6 +765,12 @@ SMS_PROVISION_BATCH = int(os.environ.get('SMS_PROVISION_BATCH', '10'))
 # and it records who texts which private group. Not something to keep forever.
 SMS_RETENTION_DAYS = int(os.environ.get('SMS_RETENTION_DAYS', '90'))
 
+# When the daily SMS report flags sign-up code texts as possible abuse: this
+# many requests stopped by our limits in a day, or codes to this many
+# different numbers. Both are far above what real sign-ups produce today.
+VERIFICATION_ALERT_LIMITED = int(os.environ.get('VERIFICATION_ALERT_LIMITED', '20'))
+VERIFICATION_ALERT_NUMBERS = int(os.environ.get('VERIFICATION_ALERT_NUMBERS', '100'))
+
 # Where the daily spend report goes. Unset, it only goes to the log.
 SMS_REPORT_EMAIL = os.environ.get('SMS_REPORT_EMAIL', '')
 
@@ -1067,6 +1073,20 @@ CELERY_BEAT_SCHEDULE = {
     'sms-daily-spend-report': {
         'task': 'sms.daily_spend_report',
         'schedule': 86400.0,
+    },
+    # Roll the delivery log up into monthly billing totals that outlive its
+    # 90-day purge - see sms/maintenance.py:summarize_usage. Daily, so this
+    # month's totals are never more than a day behind.
+    'sms-summarize-usage': {
+        'task': 'sms.summarize_usage',
+        'schedule': 86400.0,
+    },
+    # What each sign-up code text cost and whether it arrived, read from
+    # Telnyx's records - see sms/maintenance.py:reconcile_verification_texts.
+    # Hourly, so the admin list is never more than an hour behind.
+    'sms-reconcile-verification-texts': {
+        'task': 'sms.reconcile_verification_texts',
+        'schedule': 3600.0,
     },
     # The same three jobs for email - see mail/maintenance.py.
     'mail-retry-failed-deliveries': {
