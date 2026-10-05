@@ -728,6 +728,48 @@ BILLING = [
             'level (`none`, `basic`, `advanced`) so clients can guide upgrades '
             'or improvements.'
         )),
+    req('Transaction history', 'GET', '/api/v1/billing/transactions/',
+        query=[{'key': 'range', 'value': '30d'},
+               {'key': 'page', 'value': '1'},
+               {'key': 'page_size', 'value': '20'}],
+        tests=ENVELOPE_TEST,
+        desc=(
+            'What the caller has paid, newest first: plan subscription '
+            'payments (the first invoice and every renewal), custom Enterprise '
+            'plan payments, and credit top-ups. Wallet usage is not here - '
+            'this lists money paid, not credits spent.\n\n'
+            '`range` is `7d`, `15d`, `30d` or `custom`, and defaults to `30d` '
+            'when left out. The presets count back from now. For `custom`, see '
+            '*Transaction history: custom range*.\n\n'
+            'Add `kind=plan_subscription`, `kind=enterprise_plan` or '
+            '`kind=credit_purchase` to narrow the list to one kind of payment.\n\n'
+            'Paged: `data` carries `count`, `next`, `previous` and `results`. '
+            '`page_size` defaults to 20 and is capped at 100.\n\n'
+            'Each result has `id`, `kind`, `kind_label`, `amount_cents`, '
+            '`currency`, `description`, `stripe_reference`, `receipt_url` and '
+            '`paid_at`. `amount_cents` is what Stripe charged - for a top-up, '
+            'the package\'s price, not the credit it bought. `receipt_url` is '
+            'Stripe\'s hosted invoice or receipt page and can be an empty '
+            'string.\n\n'
+            'Payments are recorded as Stripe reports them, so an account that '
+            'paid before this endpoint existed shows nothing older until '
+            '`python manage.py backfill_billing_payments` has been run.'
+        )),
+    req('Transaction history: custom range', 'GET', '/api/v1/billing/transactions/',
+        query=[{'key': 'range', 'value': 'custom'},
+               {'key': 'start_date', 'value': '2026-09-01'},
+               {'key': 'end_date', 'value': '2026-09-30'}],
+        tests=ENVELOPE_TEST,
+        desc=(
+            'The same list as *Transaction history*, between two dates of the '
+            'caller\'s choosing.\n\n'
+            '`start_date` and `end_date` are `YYYY-MM-DD` and both are '
+            'required when `range=custom`. Both days are included in full, in '
+            'the server\'s timezone.\n\n'
+            '**400** if either date is missing, is not a date, or `end_date` '
+            'is before `start_date` - `data` names the field at fault. An '
+            'unknown `range` is a 400 too.'
+        )),
     req('Checkout: subscribe to a plan', 'POST', '/api/v1/billing/checkout/plan/',
         body={'plan_code': 'premium',
               'success_url': 'https://loopdn.com/billing/success',

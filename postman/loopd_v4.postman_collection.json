@@ -1839,6 +1839,104 @@
           }
         },
         {
+          "name": "Transaction history",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/billing/transactions/?range=30d&page=1&page_size=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "billing",
+                "transactions",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "range",
+                  "value": "30d"
+                },
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "page_size",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "What the caller has paid, newest first: plan subscription payments (the first invoice and every renewal), custom Enterprise plan payments, and credit top-ups. Wallet usage is not here - this lists money paid, not credits spent.\n\n`range` is `7d`, `15d`, `30d` or `custom`, and defaults to `30d` when left out. The presets count back from now. For `custom`, see *Transaction history: custom range*.\n\nAdd `kind=plan_subscription`, `kind=enterprise_plan` or `kind=credit_purchase` to narrow the list to one kind of payment.\n\nPaged: `data` carries `count`, `next`, `previous` and `results`. `page_size` defaults to 20 and is capped at 100.\n\nEach result has `id`, `kind`, `kind_label`, `amount_cents`, `currency`, `description`, `stripe_reference`, `receipt_url` and `paid_at`. `amount_cents` is what Stripe charged - for a top-up, the package's price, not the credit it bought. `receipt_url` is Stripe's hosted invoice or receipt page and can be an empty string.\n\nPayments are recorded as Stripe reports them, so an account that paid before this endpoint existed shows nothing older until `python manage.py backfill_billing_payments` has been run."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Transaction history: custom range",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/billing/transactions/?range=custom&start_date=2026-09-01&end_date=2026-09-30",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "billing",
+                "transactions",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "range",
+                  "value": "custom"
+                },
+                {
+                  "key": "start_date",
+                  "value": "2026-09-01"
+                },
+                {
+                  "key": "end_date",
+                  "value": "2026-09-30"
+                }
+              ]
+            },
+            "description": "The same list as *Transaction history*, between two dates of the caller's choosing.\n\n`start_date` and `end_date` are `YYYY-MM-DD` and both are required when `range=custom`. Both days are included in full, in the server's timezone.\n\n**400** if either date is missing, is not a date, or `end_date` is before `start_date` - `data` names the field at fault. An unknown `range` is a 400 too."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('envelope reports success', function () {",
+                  "    pm.expect(body).to.have.property('code', 1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "name": "Checkout: subscribe to a plan",
           "request": {
             "method": "POST",
