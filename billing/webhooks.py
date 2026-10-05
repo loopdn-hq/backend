@@ -35,7 +35,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from billing import services
-from billing.models import CreditPackage, Plan, StripeWebhookEvent, Subscription
+from billing.models import CreditPackage, Payment, Plan, StripeWebhookEvent, Subscription
 from utils.mail import EmailError, send_templated_email
 
 logger = logging.getLogger(__name__)
@@ -547,6 +547,10 @@ class StripeWebhook(APIView):
             # price - entirely its own entitlement/credit model, so it does
             # not go through the Plan-subscription sync below.
             enterprise_services.handle_checkout_completed(session)
+            services.mark_enterprise_invoice(
+                session.get('invoice'),
+                (session.get('metadata') or {}).get('contract_number') or '',
+            )
             return
 
         user = self._user_for(
@@ -588,17 +592,31 @@ class StripeWebhook(APIView):
                 description=f'Purchased {package.name}',
                 stripe_payment_intent_id=session.get('payment_intent') or '',
             )
+            invoice = self._invoice_summary_for_checkout(session)
+            amount_cents = invoice.get('amount_cents')
+            services.record_payment(
+                user,
+                kind=Payment.Kind.CREDIT_PURCHASE,
+                amount_cents=package.price_cents if amount_cents is None else amount_cents,
+                currency=invoice.get('currency') or session.get('currency'),
+                description=f'Purchased {package.name}',
+                stripe_reference=session.get('payment_intent') or session.get('id') or '',
+                receipt_url=invoice.get('url') or '',
+            )
             self._send_checkout_success_email(
                 user=user,
                 session=session,
                 package=package,
+                invoice=invoice,
             )
 
-    def _send_checkout_success_email(self, *, user, session, stripe_subscription=None, package=None):
+    def _send_checkout_success_email(self, *, user, session, stripe_subscription=None,
+                                     package=None, invoice=None):
         if not user.email:
             return
 
-        invoice = self._invoice_summary_for_checkout(session)
+        if invoice is None:
+            invoice = self._invoice_summary_for_checkout(session)
         amount_cents = invoice.get('amount_cents')
         currency = invoice.get('currency') or str(session.get('currency') or 'usd').lower()
 
@@ -726,6 +744,7 @@ class StripeWebhook(APIView):
     def _handle_invoice_paid(self, invoice):
         from enterprise import services as enterprise_services
         enterprise_services.handle_invoice_paid(invoice)
+        services.record_invoice_payment(invoice)
 
     def _handle_invoice_payment_failed(self, invoice):
         from enterprise import services as enterprise_services

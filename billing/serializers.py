@@ -3,7 +3,7 @@ from urllib.parse import urlsplit
 from django.conf import settings
 from rest_framework import serializers
 
-from billing.models import CreditPackage, Plan, Subscription, Wallet, WalletTransaction
+from billing.models import CreditPackage, Payment, Plan, Subscription, Wallet
 
 
 def _validate_redirect_url(value):
@@ -64,16 +64,16 @@ class WalletSerializer(serializers.ModelSerializer):
         fields = ('balance_cents', 'auto_recharge_enabled', 'auto_recharge_package')
 
 
-class WalletTransactionSerializer(serializers.ModelSerializer):
-    """One line of the caller's wallet ledger, as their Billing page lists it."""
+class PaymentSerializer(serializers.ModelSerializer):
+    """One payment in the caller's transaction history, as their Billing page lists it."""
 
     kind_label = serializers.CharField(source='get_kind_display', read_only=True)
 
     class Meta:
-        model = WalletTransaction
+        model = Payment
         fields = (
-            'id', 'kind', 'kind_label', 'amount_cents', 'balance_after_cents',
-            'description', 'stripe_payment_intent_id', 'created_at',
+            'id', 'kind', 'kind_label', 'amount_cents', 'currency',
+            'description', 'stripe_reference', 'receipt_url', 'paid_at',
         )
         read_only_fields = fields
 
@@ -90,7 +90,7 @@ class TransactionHistoryQuerySerializer(serializers.Serializer):
     range = serializers.ChoiceField(choices=[*RANGE_DAYS, 'custom'], default='30d')
     start_date = serializers.DateField(required=False)
     end_date = serializers.DateField(required=False)
-    kind = serializers.ChoiceField(choices=WalletTransaction.Kind.choices, required=False)
+    kind = serializers.ChoiceField(choices=Payment.Kind.choices, required=False)
 
     def validate(self, attrs):
         if attrs['range'] != 'custom':

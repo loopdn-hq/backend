@@ -1,10 +1,12 @@
 """Tests for wallet ledger arithmetic, plan limits, and the Stripe webhook."""
 import json
+from io import StringIO
 from unittest import mock
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.cache import cache
+from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -13,7 +15,7 @@ from rest_framework.test import APIClient
 
 from billing import services
 from billing.limits import check_can_create_group
-from billing.models import CreditPackage, Plan, Subscription, Wallet, WalletTransaction
+from billing.models import CreditPackage, Payment, Plan, Subscription, Wallet, WalletTransaction
 from chat.models import Conversation, Message, Participant
 
 
@@ -988,17 +990,14 @@ class TransactionHistoryTests(TestCase):
         self.url = reverse('billing:transactions')
 
     def _transaction(self, *, days_ago, amount_cents=500,
-                     kind=WalletTransaction.Kind.CREDIT_PURCHASE, user=None):
-        wallet = services.get_or_create_wallet(user or self.user)
-        row = WalletTransaction.objects.create(
-            wallet=wallet, kind=kind, amount_cents=amount_cents,
-            balance_after_cents=0, description=f'{days_ago} days ago',
+                     kind=Payment.Kind.CREDIT_PURCHASE, user=None):
+        self._references = getattr(self, '_references', 0) + 1
+        return Payment.objects.create(
+            user=user or self.user, kind=kind, amount_cents=amount_cents,
+            description=f'{days_ago} days ago',
+            stripe_reference=f'ref_{self._references}',
+            paid_at=timezone.now() - timezone.timedelta(days=days_ago),
         )
-        # created_at is auto_now_add, so backdating has to go around save().
-        WalletTransaction.objects.filter(pk=row.pk).update(
-            created_at=timezone.now() - timezone.timedelta(days=days_ago)
-        )
-        return row
 
     def _ids(self, **params):
         response = self.client.get(self.url, params)
@@ -1048,9 +1047,12 @@ class TransactionHistoryTests(TestCase):
 
     def test_kind_narrows_the_list(self):
         purchase = self._transaction(days_ago=1)
-        self._transaction(days_ago=2, amount_cents=-100, kind=WalletTransaction.Kind.USAGE_DEBIT)
+        plan = self._transaction(days_ago=2, kind=Payment.Kind.PLAN_SUBSCRIPTION)
+        enterprise = self._transaction(days_ago=3, kind=Payment.Kind.ENTERPRISE_PLAN)
 
+        self.assertEqual(self._ids(range='7d'), [purchase.pk, plan.pk, enterprise.pk])
         self.assertEqual(self._ids(range='7d', kind='credit_purchase'), [purchase.pk])
+        self.assertEqual(self._ids(range='7d', kind='enterprise_plan'), [enterprise.pk])
 
     def test_only_the_callers_own_transactions_are_listed(self):
         other = User.objects.create_user(username='ivan', password='pw')
@@ -1062,3 +1064,159 @@ class TransactionHistoryTests(TestCase):
     def test_signed_out_is_refused(self):
         response = APIClient().get(self.url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class PaymentRecordingTests(TestCase):
+    """Every way Stripe is paid lands one row in the transaction history."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.url = reverse('billing:stripe-webhook')
+        self.user = User.objects.create_user(username='jude', password='pw')
+        subscription = services.get_or_create_subscription(self.user)
+        subscription.stripe_customer_id = 'cus_jude'
+        subscription.save()
+
+    def _post_event(self, event):
+        with mock.patch('stripe.Webhook.construct_event', return_value=event):
+            return self.client.post(
+                self.url, data=json.dumps(event), content_type='application/json',
+                HTTP_STRIPE_SIGNATURE='test',
+            )
+
+    def _invoice_paid(self, event_id, **invoice):
+        return self._post_event({
+            'id': event_id, 'type': 'invoice.paid',
+            'data': {'object': {
+                'customer': 'cus_jude', 'currency': 'usd',
+                'hosted_invoice_url': 'https://invoice.stripe.com/i/test',
+                'status_transitions': {'paid_at': 1790000000},
+                **invoice,
+            }},
+        })
+
+    def _enterprise_contract(self, *, stripe_subscription_id):
+        from enterprise.models import (
+            EnterpriseContract, EnterprisePlanDraft, EnterpriseStripeBilling, PricingCatalogVersion,
+        )
+        configuration = {
+            'limits': {}, 'features': {}, 'credits': {'monthly_messages': 1000},
+        }
+        catalog = PricingCatalogVersion.objects.create(version=9001)
+        draft = EnterprisePlanDraft.objects.create(
+            draft_id='draft_jude', account=self.user, configuration=configuration,
+            catalog_version=catalog, calculated_subtotal_cents=50000,
+            calculated_total_cents=50000,
+        )
+        contract = EnterpriseContract.objects.create(
+            account=self.user, contract_number='ENT-0001', draft=draft,
+            configuration_snapshot=configuration, pricing_snapshot={'total_cents': 50000},
+            catalog_version=catalog, billing_interval='monthly', status='active',
+        )
+        EnterpriseStripeBilling.objects.create(
+            contract=contract, stripe_customer_id='cus_jude',
+            stripe_subscription_id=stripe_subscription_id, status='active',
+        )
+        return contract
+
+    def test_a_paid_plan_invoice_is_recorded(self):
+        Plan.objects.filter(code=Plan.Code.PREMIUM).update(stripe_price_id='price_premium_test')
+
+        response = self._invoice_paid(
+            'evt_inv_1', id='in_1', amount_paid=999, subscription='sub_plan',
+            lines={'data': [{'price': {'id': 'price_premium_test'}}]},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        payment = Payment.objects.get()
+        self.assertEqual(payment.user, self.user)
+        self.assertEqual(payment.kind, Payment.Kind.PLAN_SUBSCRIPTION)
+        self.assertEqual(payment.amount_cents, 999)
+        self.assertEqual(payment.description, 'Premium plan')
+        self.assertEqual(payment.stripe_reference, 'in_1')
+        self.assertEqual(payment.receipt_url, 'https://invoice.stripe.com/i/test')
+        self.assertEqual(int(payment.paid_at.timestamp()), 1790000000)
+
+    def test_a_paid_enterprise_invoice_is_recorded_as_enterprise(self):
+        self._enterprise_contract(stripe_subscription_id='sub_ent')
+
+        # The newer Stripe shape: the subscription sits under `parent`.
+        self._invoice_paid(
+            'evt_inv_2', id='in_2', amount_paid=50000,
+            parent={'subscription_details': {'subscription': 'sub_ent'}},
+        )
+
+        payment = Payment.objects.get()
+        self.assertEqual(payment.user, self.user)
+        self.assertEqual(payment.kind, Payment.Kind.ENTERPRISE_PLAN)
+        self.assertEqual(payment.amount_cents, 50000)
+        self.assertEqual(payment.description, 'Enterprise plan (ENT-0001)')
+
+    def test_an_enterprise_invoice_paid_before_its_checkout_is_relabelled(self):
+        self._invoice_paid('evt_inv_3', id='in_3', amount_paid=50000, subscription='sub_new')
+        self.assertEqual(Payment.objects.get().kind, Payment.Kind.PLAN_SUBSCRIPTION)
+
+        with mock.patch('enterprise.services.handle_checkout_completed'):
+            self._post_event({
+                'id': 'evt_cs_3', 'type': 'checkout.session.completed',
+                'data': {'object': {
+                    'id': 'cs_3', 'mode': 'subscription', 'invoice': 'in_3',
+                    'metadata': {'kind': 'enterprise_contract', 'contract_number': 'ENT-0002'},
+                }},
+            })
+
+        payment = Payment.objects.get()
+        self.assertEqual(payment.kind, Payment.Kind.ENTERPRISE_PLAN)
+        self.assertEqual(payment.description, 'Enterprise plan (ENT-0002)')
+
+    def test_an_invoice_that_charged_nothing_is_not_recorded(self):
+        self._invoice_paid('evt_inv_4', id='in_4', amount_paid=0, subscription='sub_plan')
+        self.assertFalse(Payment.objects.exists())
+
+    def test_a_credit_top_up_is_recorded_at_the_price_paid(self):
+        package = CreditPackage.objects.create(
+            name='Promo Package', price_cents=1000, credit_cents=1200,
+        )
+        self._post_event({
+            'id': 'evt_cs_5', 'type': 'checkout.session.completed',
+            'data': {'object': {
+                'id': 'cs_5', 'mode': 'payment', 'client_reference_id': str(self.user.pk),
+                'metadata': {'credit_package_id': str(package.pk)},
+                'amount_total': 1000, 'currency': 'usd',
+            }},
+        })
+
+        payment = Payment.objects.get()
+        self.assertEqual(payment.kind, Payment.Kind.CREDIT_PURCHASE)
+        # The $10 charged, not the $12 of credit it bought.
+        self.assertEqual(payment.amount_cents, 1000)
+        self.assertEqual(payment.description, 'Purchased Promo Package')
+        self.assertEqual(Wallet.objects.get(user=self.user).balance_cents, 1200)
+
+    def test_backfill_records_past_payments_once(self):
+        services.credit_wallet(
+            self.user, amount_cents=1200, kind=WalletTransaction.Kind.CREDIT_PURCHASE,
+            description='Purchased Promo Package', stripe_payment_intent_id='pi_old',
+        )
+        invoices = mock.Mock()
+        invoices.auto_paging_iter.return_value = [{
+            'id': 'in_old', 'customer': 'cus_jude', 'amount_paid': 999, 'currency': 'usd',
+            'subscription': 'sub_plan', 'created': 1780000000,
+        }]
+        intent = {
+            'id': 'pi_old', 'amount_received': 1000, 'currency': 'usd',
+            'latest_charge': {'receipt_url': 'https://pay.stripe.com/receipts/old'},
+        }
+
+        with mock.patch('stripe.Invoice.list', return_value=invoices), \
+                mock.patch('stripe.PaymentIntent.retrieve', return_value=intent):
+            call_command('backfill_billing_payments', stdout=StringIO())
+            call_command('backfill_billing_payments', stdout=StringIO())
+
+        self.assertEqual(Payment.objects.count(), 2)
+        top_up = Payment.objects.get(stripe_reference='pi_old')
+        self.assertEqual(top_up.amount_cents, 1000)
+        self.assertEqual(top_up.receipt_url, 'https://pay.stripe.com/receipts/old')
+        self.assertEqual(
+            Payment.objects.get(stripe_reference='in_old').kind, Payment.Kind.PLAN_SUBSCRIPTION,
+        )

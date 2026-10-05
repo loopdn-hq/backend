@@ -252,6 +252,52 @@ class WalletTransaction(models.Model):
         return f'{self.kind} {self.amount_cents}c'
 
 
+class Payment(models.Model):
+    """One successful charge Stripe took from a user - the transaction history.
+
+    Covers every way money reaches us through this app: a plan's invoice
+    (first one and each renewal), an Enterprise contract's invoice, and a
+    credit top-up. `WalletTransaction` is not this: it tracks the wallet's
+    balance, including usage that no money changed hands for, and it never
+    sees a plan payment at all.
+
+    Written by the webhook as Stripe reports each payment, and by
+    `backfill_billing_payments` for the ones from before this table existed.
+    """
+
+    class Kind(models.TextChoices):
+        PLAN_SUBSCRIPTION = 'plan_subscription', 'Plan subscription'
+        ENTERPRISE_PLAN = 'enterprise_plan', 'Enterprise plan'
+        CREDIT_PURCHASE = 'credit_purchase', 'Credit purchase'
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='billing_payments',
+    )
+    kind = models.CharField(max_length=20, choices=Kind.choices)
+    amount_cents = models.PositiveIntegerField()
+    currency = models.CharField(max_length=3, default='usd', db_default='usd')
+    description = models.CharField(max_length=200, blank=True, default='', db_default='')
+
+    # Stripe's id for what was paid: the Invoice for a plan, the PaymentIntent
+    # for a top-up. Unique, so the webhook and the backfill can both meet the
+    # same payment without listing it twice.
+    stripe_reference = models.CharField(max_length=255, unique=True)
+    # Stripe's hosted invoice or receipt page, when it gave us one.
+    receipt_url = models.URLField(max_length=500, blank=True, default='', db_default='')
+
+    # When Stripe says it was paid, not when we heard about it - a backfilled
+    # row keeps its real date.
+    paid_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-paid_at', '-id']
+        indexes = [models.Index(fields=['user', '-paid_at'])]
+
+    def __str__(self):
+        return f'{self.kind} {self.amount_cents}c'
+
+
 class StripeWebhookEvent(models.Model):
     """One Stripe event we have already processed.
 

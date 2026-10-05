@@ -12,18 +12,18 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from billing import services
-from billing.models import CreditPackage, Plan, WalletTransaction
+from billing.models import CreditPackage, Payment, Plan, WalletTransaction
 from billing.pagination import TransactionPagination
 from billing.serializers import (
     BillingPortalRequestSerializer,
     CreditCheckoutRequestSerializer,
     CreditPackageSerializer,
+    PaymentSerializer,
     PlanCheckoutRequestSerializer,
     PlanSerializer,
     SubscriptionSerializer,
     TransactionHistoryQuerySerializer,
     WalletSerializer,
-    WalletTransactionSerializer,
 )
 from billing.throttles import BillingPortalRateThrottle, CheckoutRateThrottle
 from chat.models import Conversation, Message, Participant
@@ -312,11 +312,12 @@ class BillingAnalyticsView(APIView):
 
 
 class TransactionHistoryView(APIView):
-    """The caller's wallet ledger over a window, newest first, twenty a page.
+    """What the caller has paid over a window, newest first, twenty a page:
+    plan and Enterprise plan payments, and credit top-ups.
 
     `?range=7d|15d|30d` (default 30d) counts back from now. `?range=custom`
     takes `start_date` and `end_date` (YYYY-MM-DD) instead, both whole days in
-    the server's timezone. `?kind=` narrows to one kind of movement.
+    the server's timezone. `?kind=` narrows to one kind of payment.
     """
 
     permission_classes = [IsAuthenticated]
@@ -326,26 +327,25 @@ class TransactionHistoryView(APIView):
         serializer.is_valid(raise_exception=True)
         params = serializer.validated_data
 
-        wallet = services.get_or_create_wallet(request.user)
-        rows = WalletTransaction.objects.filter(wallet=wallet).order_by('-created_at', '-pk')
+        rows = Payment.objects.filter(user=request.user).order_by('-paid_at', '-pk')
 
         if params['range'] == 'custom':
             # __date compares in the current timezone, so both ends are whole
             # days as the caller wrote them.
             rows = rows.filter(
-                created_at__date__gte=params['start_date'],
-                created_at__date__lte=params['end_date'],
+                paid_at__date__gte=params['start_date'],
+                paid_at__date__lte=params['end_date'],
             )
         else:
             days = TransactionHistoryQuerySerializer.RANGE_DAYS[params['range']]
-            rows = rows.filter(created_at__gte=timezone.now() - timedelta(days=days))
+            rows = rows.filter(paid_at__gte=timezone.now() - timedelta(days=days))
 
         if 'kind' in params:
             rows = rows.filter(kind=params['kind'])
 
         paginator = TransactionPagination()
         page = paginator.paginate_queryset(rows, request, view=self)
-        return paginator.get_paginated_response(WalletTransactionSerializer(page, many=True).data)
+        return paginator.get_paginated_response(PaymentSerializer(page, many=True).data)
 
 
 def _stripe_error_response(exc):

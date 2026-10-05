@@ -14,7 +14,7 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from billing.models import Plan, Subscription, Wallet, WalletTransaction
+from billing.models import Payment, Plan, Subscription, Wallet, WalletTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -280,3 +280,119 @@ def stripe_timestamp_to_datetime(value):
     if value is None:
         return None
     return timezone.datetime.fromtimestamp(value, tz=timezone.get_current_timezone())
+
+
+def record_payment(user, *, kind, amount_cents, stripe_reference, currency='usd',
+                   description='', receipt_url='', paid_at=None):
+    """Append one successful charge to the user's transaction history.
+
+    Keyed on Stripe's own id for the payment, so the webhook hearing about an
+    invoice and the backfill finding the same invoice later leave one row.
+    """
+    payment, _ = Payment.objects.get_or_create(
+        stripe_reference=stripe_reference,
+        defaults={
+            'user': user,
+            'kind': kind,
+            'amount_cents': amount_cents,
+            'currency': (currency or 'usd').lower(),
+            'description': description[:200],
+            'receipt_url': receipt_url or '',
+            'paid_at': paid_at or timezone.now(),
+        },
+    )
+    return payment
+
+
+def _invoice_subscription_id(invoice):
+    """The subscription an invoice bills. Stripe moved it off the Invoice
+    itself and under `parent` in newer API versions; read both."""
+    subscription_id = invoice.get('subscription')
+    if not subscription_id:
+        details = (invoice.get('parent') or {}).get('subscription_details') or {}
+        subscription_id = details.get('subscription')
+    return subscription_id if isinstance(subscription_id, str) else None
+
+
+def _invoice_first_line(invoice):
+    lines = (invoice.get('lines') or {}).get('data') or []
+    return lines[0] if lines else {}
+
+
+def _invoice_price_id(invoice):
+    """The price on an invoice's first line - same move as above: `price` on
+    the line in older API versions, under `pricing` in newer ones."""
+    line = _invoice_first_line(invoice)
+    price = line.get('price')
+    if isinstance(price, dict):
+        return price.get('id')
+    return ((line.get('pricing') or {}).get('price_details') or {}).get('price')
+
+
+def record_invoice_payment(invoice):
+    """Record a paid subscription invoice: a plan's, or an Enterprise contract's.
+
+    Returns None for an invoice with nothing charged (a trial, a fully
+    discounted period) or one whose customer is nobody we know.
+    """
+    # Deferred: `enterprise.services` imports this module at its top level.
+    from enterprise.models import EnterpriseStripeBilling
+
+    invoice_id = invoice.get('id')
+    amount_cents = invoice.get('amount_paid') or 0
+    if not invoice_id or amount_cents <= 0:
+        return None
+
+    subscription_id = _invoice_subscription_id(invoice)
+    enterprise_billing = EnterpriseStripeBilling.objects.filter(
+        stripe_subscription_id=subscription_id
+    ).select_related('contract__account').first() if subscription_id else None
+
+    if enterprise_billing is not None:
+        contract = enterprise_billing.contract
+        user = contract.account
+        kind = Payment.Kind.ENTERPRISE_PLAN
+        description = f'Enterprise plan ({contract.contract_number})'
+    else:
+        customer_id = invoice.get('customer')
+        subscription = Subscription.objects.filter(
+            stripe_customer_id=customer_id
+        ).select_related('user').first() if customer_id else None
+        if subscription is None:
+            logger.error('Paid Stripe invoice %s with no resolvable user', invoice_id)
+            return None
+        user = subscription.user
+        kind = Payment.Kind.PLAN_SUBSCRIPTION
+        price_id = _invoice_price_id(invoice)
+        plan = Plan.objects.filter(stripe_price_id=price_id).first() if price_id else None
+        description = (
+            f'{plan.name} plan' if plan is not None
+            else _invoice_first_line(invoice).get('description') or 'Plan subscription'
+        )
+
+    paid_at = (invoice.get('status_transitions') or {}).get('paid_at') or invoice.get('created')
+    return record_payment(
+        user,
+        kind=kind,
+        amount_cents=amount_cents,
+        currency=invoice.get('currency'),
+        description=description,
+        stripe_reference=invoice_id,
+        receipt_url=invoice.get('hosted_invoice_url') or invoice.get('invoice_pdf') or '',
+        paid_at=stripe_timestamp_to_datetime(paid_at),
+    )
+
+
+def mark_enterprise_invoice(invoice_id, contract_number):
+    """Relabel an invoice's payment as its Enterprise contract's.
+
+    `invoice.paid` can arrive before the `checkout.session.completed` that
+    ties the subscription to its contract; the payment is then recorded as an
+    ordinary plan's. This is the checkout catching up.
+    """
+    if not invoice_id:
+        return
+    Payment.objects.filter(stripe_reference=invoice_id).update(
+        kind=Payment.Kind.ENTERPRISE_PLAN,
+        description=f'Enterprise plan ({contract_number})',
+    )
