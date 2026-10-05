@@ -9,6 +9,7 @@ from billing.viewsets.v1.billing import (
     CreditPackageListView,
     PlanCheckoutSessionView,
     PlanListView,
+    TransactionHistoryView,
 )
 from billing.webhooks import StripeWebhook
 
@@ -21,6 +22,7 @@ urlpatterns = [
     path('credit-packages/', CreditPackageListView.as_view(), name='credit-packages'),
     path('summary/', BillingSummaryView.as_view(), name='summary'),
     path('analytics/', BillingAnalyticsView.as_view(), name='analytics'),
+    path('transactions/', TransactionHistoryView.as_view(), name='transactions'),
     path('checkout/plan/', PlanCheckoutSessionView.as_view(), name='checkout-plan'),
     path('checkout/credits/', CreditCheckoutSessionView.as_view(), name='checkout-credits'),
     path('portal/', BillingPortalSessionView.as_view(), name='portal'),

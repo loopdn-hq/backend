@@ -3,7 +3,7 @@ from urllib.parse import urlsplit
 from django.conf import settings
 from rest_framework import serializers
 
-from billing.models import CreditPackage, Plan, Subscription, Wallet
+from billing.models import CreditPackage, Plan, Subscription, Wallet, WalletTransaction
 
 
 def _validate_redirect_url(value):
@@ -62,6 +62,51 @@ class WalletSerializer(serializers.ModelSerializer):
     class Meta:
         model = Wallet
         fields = ('balance_cents', 'auto_recharge_enabled', 'auto_recharge_package')
+
+
+class WalletTransactionSerializer(serializers.ModelSerializer):
+    """One line of the caller's wallet ledger, as their Billing page lists it."""
+
+    kind_label = serializers.CharField(source='get_kind_display', read_only=True)
+
+    class Meta:
+        model = WalletTransaction
+        fields = (
+            'id', 'kind', 'kind_label', 'amount_cents', 'balance_after_cents',
+            'description', 'stripe_payment_intent_id', 'created_at',
+        )
+        read_only_fields = fields
+
+
+class TransactionHistoryQuerySerializer(serializers.Serializer):
+    """The query string of the transaction history: which window, which kind.
+
+    `range` picks a preset window ending now; `custom` takes `start_date` and
+    `end_date` instead, both inclusive calendar days.
+    """
+
+    RANGE_DAYS = {'7d': 7, '15d': 15, '30d': 30}
+
+    range = serializers.ChoiceField(choices=[*RANGE_DAYS, 'custom'], default='30d')
+    start_date = serializers.DateField(required=False)
+    end_date = serializers.DateField(required=False)
+    kind = serializers.ChoiceField(choices=WalletTransaction.Kind.choices, required=False)
+
+    def validate(self, attrs):
+        if attrs['range'] != 'custom':
+            return attrs
+
+        missing = {
+            field: 'This field is required when range is custom.'
+            for field in ('start_date', 'end_date') if field not in attrs
+        }
+        if missing:
+            raise serializers.ValidationError(missing)
+        if attrs['start_date'] > attrs['end_date']:
+            raise serializers.ValidationError(
+                {'end_date': 'end_date must not be before start_date.'}
+            )
+        return attrs
 
 
 class PlanCheckoutRequestSerializer(serializers.Serializer):

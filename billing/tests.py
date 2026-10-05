@@ -978,3 +978,87 @@ class PlanCheckoutSecurityTests(TestCase):
         response = self.client.post(self.url, payload, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('plan_code', response.json()['data'])
+
+
+class TransactionHistoryTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='hana', password='pw')
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.url = reverse('billing:transactions')
+
+    def _transaction(self, *, days_ago, amount_cents=500,
+                     kind=WalletTransaction.Kind.CREDIT_PURCHASE, user=None):
+        wallet = services.get_or_create_wallet(user or self.user)
+        row = WalletTransaction.objects.create(
+            wallet=wallet, kind=kind, amount_cents=amount_cents,
+            balance_after_cents=0, description=f'{days_ago} days ago',
+        )
+        # created_at is auto_now_add, so backdating has to go around save().
+        WalletTransaction.objects.filter(pk=row.pk).update(
+            created_at=timezone.now() - timezone.timedelta(days=days_ago)
+        )
+        return row
+
+    def _ids(self, **params):
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return [row['id'] for row in response.json()['data']['results']]
+
+    def test_preset_ranges_cut_off_at_their_window(self):
+        recent = self._transaction(days_ago=1)
+        ten = self._transaction(days_ago=10)
+        twenty = self._transaction(days_ago=20)
+        self._transaction(days_ago=40)
+
+        self.assertEqual(self._ids(range='7d'), [recent.pk])
+        self.assertEqual(self._ids(range='15d'), [recent.pk, ten.pk])
+        self.assertEqual(self._ids(range='30d'), [recent.pk, ten.pk, twenty.pk])
+        # No range at all is the last 30 days.
+        self.assertEqual(self._ids(), [recent.pk, ten.pk, twenty.pk])
+
+    def test_custom_range_includes_both_end_days(self):
+        self._transaction(days_ago=1)
+        ten = self._transaction(days_ago=10)
+        forty = self._transaction(days_ago=40)
+        self._transaction(days_ago=50)
+
+        today = timezone.localdate()
+        ids = self._ids(
+            range='custom',
+            start_date=(today - timezone.timedelta(days=40)).isoformat(),
+            end_date=(today - timezone.timedelta(days=10)).isoformat(),
+        )
+        self.assertEqual(ids, [ten.pk, forty.pk])
+
+    def test_custom_range_needs_both_dates_in_order(self):
+        response = self.client.get(self.url, {'range': 'custom', 'start_date': '2026-01-01'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('end_date', response.json()['data'])
+
+        response = self.client.get(self.url, {
+            'range': 'custom', 'start_date': '2026-02-01', 'end_date': '2026-01-01',
+        })
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unknown_range_is_rejected(self):
+        response = self.client.get(self.url, {'range': '90d'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('range', response.json()['data'])
+
+    def test_kind_narrows_the_list(self):
+        purchase = self._transaction(days_ago=1)
+        self._transaction(days_ago=2, amount_cents=-100, kind=WalletTransaction.Kind.USAGE_DEBIT)
+
+        self.assertEqual(self._ids(range='7d', kind='credit_purchase'), [purchase.pk])
+
+    def test_only_the_callers_own_transactions_are_listed(self):
+        other = User.objects.create_user(username='ivan', password='pw')
+        self._transaction(days_ago=1, user=other)
+        mine = self._transaction(days_ago=1)
+
+        self.assertEqual(self._ids(range='7d'), [mine.pk])
+
+    def test_signed_out_is_refused(self):
+        response = APIClient().get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
